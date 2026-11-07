@@ -60,6 +60,41 @@ print(client.chat.completions.create(
 
 任何支持「自定义 OpenAI 兼容 endpoint」的客户端（Cherry Studio、NextChat、Cline、Continue、IDE 插件…）都能接：填 base_url 与 key 即可。
 
+### 一条命令部署到 Linux 服务器
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Acr1mony/workbuddy2api/main/scripts/install.sh | bash
+```
+
+它会：检查/安装 Python 3.9+ → 取源码到 `/opt/workbuddy2api`（非 root 则 `~/.wb2api`）→ 在独立 venv 里安装（**不动系统 Python**）→ 建好数据目录 → 有 systemd 就注册 `wb2api.service` 并启动。
+
+常用参数（写在命令前面即可）：
+
+```bash
+# 换端口、对外监听、跳过 systemd
+curl -fsSL .../install.sh | WB2A_PORT=9000 WB2A_BIND=0.0.0.0 WB2A_SERVICE=0 bash
+
+# 自定义安装目录与数据目录
+curl -fsSL .../install.sh | WB2A_DIR=/srv/wb2a WB2A_DATA_DIR=/var/lib/wb2a bash
+
+# 装指定版本（tag / 分支）
+curl -fsSL .../install.sh | WB2A_REF=v1.2.0 bash
+```
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `WB2A_DIR` | root 为 `/opt/workbuddy2api`，否则 `~/.wb2api` | 代码与 venv 的位置 |
+| `WB2A_DATA_DIR` | `<WB2A_DIR>/data` | 账号、密钥、台账、日志 |
+| `WB2A_PORT` / `WB2A_BIND` | `8788` / `127.0.0.1` | 监听端口与地址 |
+| `WB2A_SERVICE` | `auto` | `1`/`0` 强制装/不装 systemd |
+| `WB2A_REF` | `main` | 分支或 tag |
+| `WB2A_TOKEN` | 空 | **仓库是私有的**时给一个 `contents:read` 的 PAT |
+| `WB2A_SRC` | 空 | 本地源码目录（离线安装/自测，给了就不下载） |
+
+装完它会把面板地址、`wb2a login` 的用法和下一步提示直接打出来。升级＝重跑同一条命令（`data/` 不会被碰）。
+
+> 仓库目前是私有的：`curl` 下载那一行需要带权限的 PAT（`WB2A_TOKEN=ghp_xxx`）；想用纯公开命令，把仓库改成 public 即可。
+
 ### 安装为命令（可选）
 
 ```powershell

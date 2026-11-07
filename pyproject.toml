@@ -8,12 +8,11 @@ version = "1.2.0"
 description = "把 WorkBuddy / CodeBuddy 账号变成 OpenAI 兼容 API 的多账号网关（纯标准库）"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "workbuddy2api contributors" }]
 keywords = ["workbuddy", "codebuddy", "openai", "gateway", "reverse-proxy"]
 classifiers = [
   "Programming Language :: Python :: 3",
-  "License :: OSI Approved :: MIT License",
   "Topic :: Internet :: Proxy Servers",
 ]
 dependencies = []
@@ -27,6 +26,8 @@ Homepage = "https://github.com/ardeyouxipianyi/workbuddy2api-hub"
 
 [tool.setuptools]
 packages = ["wb2api", "wb2api.adapters", "wb2api.web"]
+# 前端资源不是 Python 包，别让 setuptools 去猜：包内只有 .py，static 走下面的 package-data
+include-package-data = false
 
 [tool.setuptools.package-data]
 "wb2api.web" = ["static/*"]

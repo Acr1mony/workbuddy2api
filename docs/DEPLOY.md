@@ -69,7 +69,33 @@ nssm start workbuddy2api
 
 ---
 
-## Linux（systemd）
+## Linux（一条命令）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Acr1mony/workbuddy2api/main/scripts/install.sh | bash
+```
+
+脚本做四件事：确保 Python 3.9+ → 取源码到 `WB2A_DIR`（默认 root 为 `/opt/workbuddy2api`，否则 `~/.wb2api`）→ 建独立 venv 并 `pip install`（**不碰系统 Python，也不改系统 site-packages**）→ 有 systemd 就写 `wb2api.service` 并启动。重复执行＝升级，`data/`（账号、令牌、台账）不动。
+
+它的服务单元比你手写的版本宽松一点：`User` 没设成专用账号，因为脚本要在 `/opt` 下装东西、还要把数据目录留给同一个用户。**要按下面的最小权限写法加固，就手写单元文件**，或者装完再改。
+
+参数：
+
+| 变量 | 默认 | 用途 |
+| --- | --- | --- |
+| `WB2A_DIR` | `/opt/workbuddy2api` 或 `~/.wb2api` | 代码 + venv |
+| `WB2A_DATA_DIR` | `<WB2A_DIR>/data` | 数据目录 |
+| `WB2A_PORT` / `WB2A_BIND` | `8788` / `127.0.0.1` | 监听 |
+| `WB2A_SERVICE` | `auto` | `1` 强制装 systemd，`0` 不装 |
+| `WB2A_REF` | `main` | 分支/tag |
+| `WB2A_TOKEN` | 空 | 私有仓库需要的 PAT（`contents:read`） |
+| `WB2A_SRC` | 空 | 本地源码目录，离线安装/自测 |
+
+装完的输出里会给出面板地址与 `wb2a login` 的实际路径（在 `<WB2A_DIR>/venv/bin/wb2a`）。
+
+已验证：`bash -n` 语法检查 + 在 Git Bash 里用 `WB2A_SRC` 走完整流程（取源码→venv→安装→`wb2a version`→`serve`→`/healthz` 返回 `{"ok": true}`）。**未在真实 Linux 主机上跑过 systemd 分支**——那是本仓库目前唯一没有真机证据的路径。
+
+## Linux（手写 systemd，最小权限）
 
 `/etc/systemd/system/workbuddy2api.service`：
 
@@ -200,12 +226,23 @@ wb.example.com {
 
 ## 升级
 
+用脚本装的（推荐，一条命令，`data/` 不动）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Acr1mony/workbuddy2api/main/scripts/install.sh | bash
+sudo systemctl restart wb2api     # 脚本自己会 restart；手动装的话用这条
+```
+
+从源码目录手装的：
+
 ```bash
 git pull
-python -m wb2api doctor        # 先检查配置是否兼容
-python -m unittest discover -s tests -t .   # 132 个单测
+python -m wb2api doctor        # 先检查配置是否兼容（只报警告时为 0）
+python -m unittest discover -s tests -t .   # 582 个单测
 # 重启服务
 ```
+
+新版本第一次启动时：模型目录会用磁盘缓存（`catalog-<realm>.json`）而不是立刻重打上游；`config.json` 里的新键会回落到 `DEFAULTS`，不用手工补。
 
 配置键兼容策略：域键 `domestic/international` 仍被接受（等价于 `cn/global`），所以老配置文件不需要手改。`config_version` 目前是 1，未来有破坏性变更会 +1。
 
