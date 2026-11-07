@@ -88,13 +88,13 @@ class WindowTests(PoolTestBase):
         self.assertEqual(a.breaker_until, 0.0)
         self.pool.note_failure(a, "502")
         first = a.breaker_until - util.now()
-        self.assertAlmostEqual(first, 3600, delta=2)  # 1800 * 2^1
+        self.assertAlmostEqual(first, 1800, delta=2)  # 首档就是 breaker_cooldown，不再翻倍
 
         a.breaker_until = 0.0
         for _ in range(3):
             a.last_fail_at = util.now()
             self.pool.note_failure(a, "502")
-        self.assertAlmostEqual(a.breaker_until - util.now(), 7200, delta=2)  # 1800 * 2^2
+        self.assertAlmostEqual(a.breaker_until - util.now(), 3600, delta=2)  # 第二档才翻倍
 
     def test_failure_counter_decays(self) -> None:
         a = self.add("a")
@@ -183,6 +183,25 @@ class RestrictionTests(PoolTestBase):
         self.cfg.set("pool.restriction_hold_seconds", 60)
         self.pool.clamp_restriction_holds()
         self.assertLessEqual(self.pool.realm_hold_remaining("cn"), 61)
+
+    def test_waf_is_short_and_does_not_escalate(self) -> None:
+        """内容审核/WAF 跟账号健康无关：只避让一分钟，不写受限、不涨任何阶梯。"""
+        a = self.add("a")
+        for _ in range(3):
+            a.cooldown_until = 0.0
+            self.pool.note_waf(a, "content moderation")
+        self.assertAlmostEqual(a.cooldown_until - util.now(), 60, delta=2)
+        self.assertEqual(a.restricted_until, 0.0)
+        self.assertEqual(a.soft_streak, 0, "WAF 不能喂软限流阶梯")
+        self.assertEqual(a.unscoped_streak, 0)
+        self.assertEqual(a.cooldown_level, "waf")
+
+    def test_waf_does_not_trigger_realm_hold(self) -> None:
+        a = self.add("a")
+        b = self.add("b")
+        self.pool.note_waf(a)
+        self.pool.note_waf(b)
+        self.assertEqual(self.pool.realm_hold_remaining("cn"), 0.0, "WAF 不该让整域停摆")
 
 
 class ModelBlockTests(PoolTestBase):

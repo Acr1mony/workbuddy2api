@@ -125,6 +125,16 @@ class ServiceTest(unittest.TestCase):
         self.assertTrue(sent["stream"])
         self.assertEqual(sent["stream_options"], {"include_usage": True})
 
+    def test_pacing_marks_the_account_used(self):
+        """打过一次之后要记下时间，下一次才知道该等多久。"""
+        svc, client = self.service([ok_stream("hi")])
+        svc.chat_completions(self.request(self.body()))
+        uid = client.calls[0]["headers"]["X-User-Id"]
+        account = svc.store.get_account(uid)
+        self.assertIsNotNone(account)
+        self.assertGreater(account.last_chat_at, 0.0)
+        self.assertGreater(svc.pool.pace_delay(account), 0.0, "默认 200ms 节奏应当生效")
+
     def test_stream_passes_frames_through(self):
         svc, _client = self.service([ok_stream("分块")])
         resp = svc.chat_completions(self.request(self.body(stream=True)))
@@ -249,6 +259,60 @@ class ServiceTest(unittest.TestCase):
         svc.chat_completions(self.request(payload))
         sent = client.calls[0]["body"].decode()
         self.assertNotIn("Anthropic's official CLI for Claude", sent)
+
+    # -- 防封号：403 三路 / 超时 / 出口退避 --------------------------------
+    def test_waf_403_never_rotates_and_only_brief_cooldown(self):
+        error = UpstreamError("Request blocked by WAF", kind="waf", status=403, retryable=True)
+        svc, client = self.service([error])
+        with self.assertRaises(ServiceError) as ctx:
+            svc.chat_completions(self.request(self.body()))
+        self.assertEqual(ctx.exception.status, 403)
+        self.assertEqual(ctx.exception.code, "content_blocked")
+        self.assertEqual(len(client.calls), 1, "内容审核跟账号无关，换号只会连坐")
+        account = svc.store.get_account(client.calls[0]["headers"]["X-User-Id"])
+        self.assertGreater(account.cooldown_until, time.time())
+        self.assertLess(account.cooldown_until - time.time(), 120, "只该避让一分钟，不是两小时")
+        self.assertEqual(account.restricted_until, 0.0, "WAF 不是风控封号，不能写成受限")
+
+    def test_timeout_never_rotates(self):
+        error = UpstreamError("upstream timeout", kind="timeout", status=0)
+        svc, client = self.service([error])
+        with self.assertRaises(ServiceError) as ctx:
+            svc.chat_completions(self.request(self.body()))
+        self.assertEqual(ctx.exception.status, 503)
+        self.assertEqual(ctx.exception.code, "upstream_timeout")
+        self.assertEqual(len(client.calls), 1, "超时换号只会再撞一次慢上游，还可能被重复生成")
+
+    def test_transient_does_not_penalize_the_account(self):
+        error = UpstreamError("bad gateway", kind="transient", status=502)
+        svc, client = self.service([error, ok_stream()])
+        svc.chat_completions(self.request(self.body()))
+        first = svc.store.get_account(client.calls[0]["headers"]["X-User-Id"])
+        self.assertEqual(first.breaker_until, 0.0, "链路抖动不该把账号打进熔断")
+        self.assertEqual(first.failures, 0)
+
+    def test_rate_limit_carries_retry_after(self):
+        error = UpstreamError("slow down", kind="rate_limit", status=429, retryable=True, retry_after=12)
+        svc, _client = self.service([])
+        mapped = svc._client_error(error, "cn", "deepseek-v3")
+        self.assertEqual(mapped.status, 429)
+        self.assertAlmostEqual(mapped.retry_after, 12.0, msg="有 Retry-After 就给客户端，别让它盲目重试")
+
+    def test_stream_binds_session_affinity(self):
+        """流式是主路径：这里不绑亲和，等于从来没有亲和。"""
+        from wb2api.httpserver import Request
+
+        svc, client = self.service([ok_stream("hi")])
+        payload = self.body(stream=True)
+        req = Request(
+            "POST", "/v1/chat/completions", {}, {"X-Conversation-Id": "conv-42"},
+            json.dumps(payload).encode(), ("1.2.3.4", 1),
+        )
+        resp = svc.chat_completions(req)
+        list(resp.stream)
+        bound = svc.affinity.candidates("conv-42")
+        self.assertTrue(bound, "流式请求成功后必须把会话绑到账号上")
+        self.assertEqual(bound[0], client.calls[0]["headers"]["X-User-Id"])
 
 
 if __name__ == "__main__":

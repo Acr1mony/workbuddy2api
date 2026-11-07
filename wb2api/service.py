@@ -20,13 +20,14 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from . import identity, sse, util
 from .adapters import chat as chat_adapter
+from .egress import Egress
 from .log import get_logger
 from .markup import MARKUP_HINT
 from .models import ModelCatalog
 from .pool import Pool
 from .store import ApiKey
 from .sticky import SessionAffinity, session_key as make_session_key
-from .upstream import UpstreamClient, UpstreamError
+from .upstream import UpstreamClient, UpstreamError, is_restricted
 from .usage import UsageLedger
 
 log = get_logger("service")
@@ -53,12 +54,21 @@ CODE_QUEUE_FULL = 6021
 class ServiceError(Exception):
     """可以直接变成 OpenAI 错误信封的失败。"""
 
-    def __init__(self, message: str, status: int = 400, code: str = "bad_request", kind: str = "invalid_request_error") -> None:
+    def __init__(
+        self,
+        message: str,
+        status: int = 400,
+        code: str = "bad_request",
+        kind: str = "invalid_request_error",
+        retry_after: float = 0.0,
+    ) -> None:
         super().__init__(message)
         self.message = message
         self.status = status
         self.code = code
         self.kind = kind
+        # 有它就往响应里带 Retry-After：客户端自己会退避，比它盲目重试把墙撞穿好
+        self.retry_after = retry_after
 
 
 _RESET_CLOCK_RE = re.compile(r"(\d{4}-\d{1,2}-\d{1,2})[ T](\d{1,2}:\d{2}(?::\d{2})?)")
@@ -108,6 +118,7 @@ class GatewayService:
             enabled=sticky_on,
         )
         self.pool = Pool(store, cfg, self.affinity)
+        self.egress = Egress.from_config(cfg)
         self.ledger = UsageLedger(
             store.data_dir if hasattr(store, "data_dir") else "./data",
             retention_days=int(cfg.get("usage.retention_days", 7)) if cfg else 7,
@@ -175,10 +186,13 @@ class GatewayService:
         payload = json.dumps(meta_body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
         stick = make_session_key(request.headers, body)
+        # 有的抓包环境里官方 chat 不带稳定的 conversation id，这时"派生"反而更显眼，
+        # 所以留一个开关：关掉就退回每轮随机（老行为）。
+        hint = stick if bool(self.cfg.get("upstream.derive_conversation_id", True)) else ""
         meta = identity.ChatMeta.for_request(
             body,
             request.header("X-Trace-Id") or request.header("X-B3-TraceId"),
-            session_hint=stick,
+            session_hint=hint,
         )
         tool_names = _tool_names(meta_body)
         completion_id = "chatcmpl-" + identity.new_message_id()[:24]
@@ -198,6 +212,7 @@ class GatewayService:
                     key=key,
                     tool_names=tool_names,
                     started=started,
+                    stick=stick,
                 )
             )
 
@@ -257,6 +272,8 @@ class GatewayService:
                 )
             exclude.append(account.key)
 
+            url = ""
+            proxy = ""
             try:
                 self._ensure_ready(account, realm)
                 self._pace(account)
@@ -265,9 +282,16 @@ class GatewayService:
                     account, self.cfg, meta=meta, client_ip=request.client_ip
                 )
                 proxy = str(getattr(account, "proxy", "") or "")
+                # 同一出口还在退避就先等一等：一口气重试只会让上游更确信这是脚本
+                wait = self.egress.wait_for(Egress.key_for(url, proxy))
+                if wait > 0:
+                    time.sleep(min(wait, self.egress.max_wait))
                 response = self.client.post(url, headers, raw_body=payload, proxy=proxy)
             except UpstreamError as err:
                 last_error = err
+                if err.kind in ("timeout", "transient") or err.status >= 500:
+                    # 链路问题记在出口上：记到账号头上会让一次网络抖动把整池打断
+                    self.egress.note_failure(Egress.key_for(url, proxy), err.message or "")
                 rotate, auth_retry = self._absorb(account, err, model, realm)
                 self.pool.release(account)
                 if auth_retry:
@@ -289,6 +313,7 @@ class GatewayService:
                 self.pool.release(account)
                 log.exception("请求 %s 失败", model)
                 raise ServiceError(f"网关内部错误: {exc}", 500, "internal_error", "api_error") from exc
+            self.egress.note_success(Egress.key_for(url, proxy))
             return account, response
 
         error = last_error
@@ -322,9 +347,14 @@ class GatewayService:
             # 指纹拦截：换号没用，换的是"客户端指纹"，不是账号。
             log.warning("指纹被拦（%s）：检查 UA/头族，不要换号", model)
             return False, False
-        if code == CODE_RESTRICTED or (err.status == 403 and "11140" in message):
+        if err.kind == "restricted" or code == CODE_RESTRICTED or is_restricted(message):
             # 风控：实测一轮请求能把 7 个号一起封掉，所以绝不换号。
             self.pool.note_restricted(account, message)
+            return False, False
+        if err.kind == "waf":
+            # 内容审核 / 边缘 WAF：跟账号健康无关，换号也一样被拦，
+            # 而且"换号继续打"正是连坐的形态。给一分钟软冷却，然后把错交给客户端。
+            self.pool.note_waf(account, message)
             return False, False
         if code == CODE_PROMPT_TOO_LONG:
             return False, False
@@ -362,8 +392,12 @@ class GatewayService:
             return False, False
         if err.status == 404:
             return True, False
+        if err.kind == "timeout":
+            # 超时绝不换号：同一份请求换个号只会再撞一次慢上游，还可能被重复生成。
+            # 客户端拿到 503 自己决定要不要重来，比网关偷偷重试安全。
+            return False, False
         if err.kind == "transient" or err.status >= 500:
-            self.pool.note_failure(account, message or "上游 5xx")
+            # 链路问题不记在账号上（已记到出口）。换号可以，只是别再罚这个号。
             return True, False
         if err.kind == "bad_request":
             return False, False
@@ -385,16 +419,31 @@ class GatewayService:
                 "上游拒绝了本次请求（客户端指纹）。可尝试 prompt.mode=sanitize 或改用官方客户端头族。",
                 400, "fingerprint_rejected", "invalid_request_error",
             )
-        if err.code == CODE_RESTRICTED or err.status == 403:
+        if err.kind == "restricted" or err.code == CODE_RESTRICTED or is_restricted(message):
             return ServiceError("账号被上游风控限制，已停止重试以免连坐", 403, "restricted", "api_error")
+        if err.kind == "waf":
+            return ServiceError(
+                "上游内容审核拦截了本次请求（与账号无关，换号无效）。请改写触发内容或稍后重试。",
+                403, "content_blocked", "api_error",
+            )
         if err.code == CODE_PROMPT_TOO_LONG:
             return ServiceError("prompt 过长，上游拒绝（换号无效）", 400, "prompt_too_long", "invalid_request_error")
         if err.kind == "quota":
             return ServiceError("所有可用账号额度不足", 402, "insufficient_quota", "api_error")
         if err.kind == "rate_limit":
-            return ServiceError("上游限流，请稍后重试", 429, "rate_limited", "rate_limit_error")
+            return ServiceError(
+                "上游限流，请稍后重试", 429, "rate_limited", "rate_limit_error",
+                retry_after=float(err.retry_after or 0.0),
+            )
+        if err.kind == "timeout":
+            return ServiceError(
+                "上游响应超时（换号重试无效，请稍后再来）", 503, "upstream_timeout", "api_error", retry_after=0.0
+            )
         if err.kind == "transient" or err.status >= 500:
-            return ServiceError("上游暂时不可用", 503, "upstream_unavailable", "api_error")
+            return ServiceError(
+                "上游暂时不可用", 503, "upstream_unavailable", "api_error",
+                retry_after=float(err.retry_after or 0.0),
+            )
         if err.kind == "auth":
             return ServiceError("账号认证失败，需要重新登录", 503, "account_auth_failed", "api_error")
         # 以下这些是"请求本身有问题"，客户端改一下就好：一律 400，别用 502。
@@ -430,6 +479,7 @@ class GatewayService:
         key: Optional[ApiKey],
         tool_names: List[str],
         started: float,
+        stick: str = "",
     ) -> Iterator[bytes]:
         """把上游流翻译成客户端帧。
 
@@ -491,10 +541,9 @@ class GatewayService:
                 ttft=ttft, error=error_text,
             )
             if outcome == "completed":
-                self.pool.note_success(
-                    account, model=model,
-                    session_key=make_session_key({}, {"model": model}),
-                )
+                # 必须用**真实**会话键绑定亲和：流式是主路径，这里传空键等于
+                # 从来没有亲和——同一段对话会被摊到每台"设备"上，既漏缓存也留关联痕迹。
+                self.pool.note_success(account, model=model, session_key=stick)
             self.pool.release(account)
 
     # -- 记账 ---------------------------------------------------------------

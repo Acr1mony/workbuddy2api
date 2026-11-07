@@ -63,7 +63,7 @@ class TestRealm(unittest.TestCase):
 class TestUserAgent(unittest.TestCase):
     def test_cn_vs_global_brand(self):
         self.assertEqual(identity.user_agent("cn"), "WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1")
-        self.assertEqual(identity.user_agent("global"), "WorkBuddy AI/5.5.4 WorkBuddy AI/5.5.4 CLI/2.137.1")
+        self.assertEqual(identity.user_agent("global"), "WorkBuddy/5.5.4 WorkBuddy AI/5.5.4 CLI/2.137.1")
 
     def test_version_overrides(self):
         ua = identity.user_agent("cn", client_version="9.9.9", cli_version="1.1.1")

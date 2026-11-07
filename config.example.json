@@ -37,6 +37,11 @@
     "verify_tls": true,
     "passthrough_ip": false,
     "stream_heartbeat_seconds": 15,
+    "egress_base_seconds": 1.0,
+    "egress_max_seconds": 15.0,
+    "egress_reset_seconds": 60.0,
+    "egress_jitter": 0.25,
+    "derive_conversation_id": true,
     "hosts": {
       "cn": "",
       "global": ""
@@ -65,6 +70,7 @@
     "restriction_hold_seconds": 1800,
     "min_pick_gap_ms": 100,
     "min_request_interval": "200ms",
+    "waf_cooldown": "60s",
     "prefer_expiring": true,
     "expiring_soon": "168h",
     "model_rates": {},
@@ -81,7 +87,7 @@
   },
   "schedule": {
     "token_refresh_enabled": true,
-    "keepalive_minutes": 20,
+    "keepalive_minutes": 60,
     "balance_refresh_enabled": true,
     "balance_minutes": 180,
     "checkin_enabled": true,
@@ -95,10 +101,8 @@
     "default": ""
   },
   "prompt": {
-    "mode": "passthrough",
+    "mode": "sanitize",
     "file": ""
   },
-  "features": {
-    "sanitize_blacklist_fingerprints": true
-  }
+  "features": {}
 }

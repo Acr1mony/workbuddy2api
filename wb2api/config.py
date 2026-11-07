@@ -63,6 +63,14 @@ DEFAULTS: Dict[str, Any] = {
         "verify_tls": True,
         "passthrough_ip": False,
         "stream_heartbeat_seconds": 15,
+        # 出口级退避：链路抖动（超时/5xx）记在"链路"上，不记在账号上。
+        # 记在账号上的后果是：一次网络抖动 → 整池同时熔断 → 运维去重登、换号、加号，全是白费。
+        "egress_base_seconds": 1.0,
+        "egress_max_seconds": 15.0,
+        "egress_reset_seconds": 60.0,
+        "egress_jitter": 0.25,
+        # 客户端没给 conversation_id 时用会话键派生（跨轮稳定），别每轮换一个新会话
+        "derive_conversation_id": True,
         "hosts": {"cn": "", "global": ""},
     },
     "cooldown": {
@@ -90,6 +98,9 @@ DEFAULTS: Dict[str, Any] = {
         # 客户端会；对上游来说"同一机器 id 高频调用"是最像脚本的特征。
         # 0 = 关闭。
         "min_request_interval": "200ms",
+        # 内容审核 / 边缘 WAF 拦截（403 但不是 11140）时的短避让。它跟账号健康无关：
+        # 换号、刷令牌都没用，反而是"换号继续打"最容易连坐。
+        "waf_cooldown": "60s",
         "prefer_expiring": True,
         "expiring_soon": "168h",
         "model_rates": {},
@@ -106,7 +117,7 @@ DEFAULTS: Dict[str, Any] = {
     "schedule": {
         # 键名必须和 scheduler.py 读的一致，否则配置改了等于没改
         "token_refresh_enabled": True,
-        "keepalive_minutes": 20,
+        "keepalive_minutes": 60,
         "balance_refresh_enabled": True,
         "balance_minutes": 180,
         "checkin_enabled": True,
@@ -115,8 +126,11 @@ DEFAULTS: Dict[str, Any] = {
     },
     # 模型目录：hidden 支持 "prefix*" 通配；default 是请求里没带 model 时的兜底
     "models": {"hidden": [], "default": ""},
-    "prompt": {"mode": "passthrough", "file": ""},
-    "features": {"sanitize_blacklist_fingerprints": True},
+    # 出站请求体的反指纹净化。默认开：上游对 Claude Code / Codex 模板句和
+    # 字面量 "11-128" 是**逐字匹配**，命中就整单拒（400 11-128）。
+    # 想要原样透传自己的 prompt 就显式改成 "passthrough"。
+    "prompt": {"mode": "sanitize", "file": ""},
+    "features": {},
 }
 
 ENV_OVERRIDES: Dict[str, str] = {

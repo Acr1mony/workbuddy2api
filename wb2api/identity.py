@@ -71,11 +71,16 @@ def host_for(realm: Optional[str]) -> str:
 
 
 def user_agent(realm: Optional[str] = None, client_version: str = "", cli_version: str = "") -> str:
-    """``WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1``（global 用 ``WorkBuddy AI``）。"""
+    """``WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1``（global 第二段换成 ``WorkBuddy AI``）。
+
+    注意**只有第二段**按域切换：官方国际版是 ``WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2``，
+    第一段恒为 ``WorkBuddy``。两段都写成平台名的结果是一个官方从不发出的 UA，
+    而 UA 形状本身是会被判定的（送错平台段可能直接 403 11140）。
+    """
     platform = realm_info(realm)["platform"]
     product = client_version or DEFAULT_CLIENT_VERSION
     cli = cli_version or DEFAULT_CLI_VERSION
-    return f"{platform}/{product} {platform}/{product} CLI/{cli}"
+    return f"WorkBuddy/{product} {platform}/{product} CLI/{cli}"
 
 
 # --------------------------------------------------------------------------
@@ -243,8 +248,12 @@ class ChatMeta:
         """
         key = turn_key(body)
         conversation = conversation_id_from_body(body)
-        if not conversation and session_hint:
-            conversation = hashlib.sha256(f"wb2a:conv:{session_hint}".encode("utf-8")).hexdigest()[:32]
+        if not conversation:
+            # 客户端没给会话 id 时用会话键派生：同一段对话恒定，跨轮不变。
+            # 每轮随机等于"一个客户端几分钟内开了几十个一次性会话"，是最扎眼的机器形态。
+            seed = session_hint or key
+            if seed:
+                conversation = hashlib.sha256(f"wb2a:conv:{seed}".encode("utf-8")).hexdigest()[:32]
         return cls(
             conversation_id=conversation,
             conversation_request_id=request_id_for_key(key) if key else "",

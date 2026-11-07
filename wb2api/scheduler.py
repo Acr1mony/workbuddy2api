@@ -2,14 +2,18 @@
 
 一个线程、30 秒一跳、没有 cron 依赖。两个参考实现都在这里踩过，所以规则写死：
 
-* **令牌保活前置 48 小时**。旧版只在前 2 小时续期，结果账号 92% 的时间处在
-  "马上过期"的空档里，上游一抖就整批掉线。提前 48h 续，且刷新是单飞的。
+* **令牌保活前置 6 小时**。旧版只在前 2 小时续期，结果账号 92% 的时间处在
+  "马上过期"的空档里，上游一抖就整批掉线。也不能提前太早：刷新令牌是一次性的，
+  每刷一次都是一次风险，所以"快到期才刷"比"提前 48 小时反复刷"安全得多。
+* **账号之间必须错峰**。整点把全池的签到请求一起打出去 = 同一出口 IP 上的
+  一次流量尖峰，那正是风控在找的形状。每个账号之间随机停顿 1~3 秒。
 * **定时任务用"到点且没跑过"判断，不用 ``HH:MM == now``**。后者在跳秒、闹钟
   漂移、进程重启后必然漏跑一整天。这里比较 ``now >= 目标 && now - 目标 <= grace``。
 """
 
 from __future__ import annotations
 
+import random
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
@@ -20,8 +24,15 @@ from . import util
 log = get_logger("scheduler")
 
 TICK = 30.0
-KEEPALIVE_AHEAD = 48 * 3600  # 令牌剩余寿命低于这个就续期
+KEEPALIVE_AHEAD = 6 * 3600  # 令牌剩余寿命低于这个就续期
 GRACE = 3 * 3600  # 定时任务的容错窗口：错过 3 小时内的任务补跑
+SPREAD_MIN = 1.0  # 账号之间停顿时长（秒）
+SPREAD_MAX = 3.0
+
+
+def _spread() -> None:
+    """账号之间随机停一下：把"批量任务"打散成人手滑动的形状。"""
+    time.sleep(random.uniform(SPREAD_MIN, SPREAD_MAX))
 
 
 class Job:
@@ -162,18 +173,22 @@ class Scheduler:
 
     # -- 具体任务 -----------------------------------------------------------
     def keepalive(self) -> str:
-        """把 48 小时内要过期的令牌续掉。刷新令牌是一次性的，所以逐个来。"""
+        """把 6 小时内要过期的令牌续掉。刷新令牌是一次性的，所以逐个来、且要错峰。"""
         now = time.time()
         renewed = 0
         failed = 0
+        seen = 0
         for account in self.service.store.list_accounts():
             if not account.enabled or not account.refresh_token:
                 continue
             expires = float(account.expires_at or 0)
             # expires == 0 表示"到期时间未知"（静态密钥就是这种）。未知时续一次是划算的：
-            # 刷新响应会带回真实 expiresIn，之后它就和别的账号一样被 48h 规则管住。
+            # 刷新响应会带回真实 expiresIn，之后它就和别的账号一样被 KEEPALIVE_AHEAD 规则管住。
             if expires and (expires - now) > KEEPALIVE_AHEAD:
                 continue
+            if seen:
+                _spread()
+            seen += 1
             try:
                 self.service.auth.refresh(account, force=True)
                 renewed += 1
@@ -189,9 +204,13 @@ class Scheduler:
 
         billing = Billing(self.service.client, self.cfg)
         updated = 0
+        seen = 0
         for account in self.service.store.list_accounts():
             if not account.enabled or not account.access_token:
                 continue
+            if seen:
+                _spread()
+            seen += 1
             value = billing.credits(account, account.realm)
             if value is None:
                 continue
@@ -210,10 +229,14 @@ class Scheduler:
         billing = Billing(self.service.client, self.cfg)
         realms = self._schedule_cfg().get("checkin_realms") or ["cn"]
         done = 0
+        seen = 0
         for realm in realms:
             for account in self.service.store.list_accounts(realm):
                 if not account.enabled or not account.access_token:
                     continue
+                if seen:
+                    _spread()
+                seen += 1
                 ok, _message = billing.checkin(account, realm)
                 done += 1 if ok else 0
         return f"checkin={done}"

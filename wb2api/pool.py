@@ -68,6 +68,7 @@ MODEL_BLOCK_BASE = 21600.0
 MODEL_BLOCK_SHIFT = 4
 MODEL_BLOCK_MAX = 86400.0
 RESTRICTED_SECONDS = 7200.0
+WAF_COOLDOWN = 60.0  # 内容审核/WAF 短避让，不升级、不持久化
 SESSION_DEAD_THRESHOLD = 3
 MIN_PICK_GAP = 0.1  # 秒；赢家刚刚被用过就换最久未用的，避免两路请求撞同一个号
 
@@ -487,7 +488,7 @@ class Pool:
                 account.breaker_retries += 1
                 base = self._duration(("pool", "breaker_cooldown"), BREAKER_BASE)
                 cap = self._duration(("pool", "breaker_cooldown_max"), BREAKER_MAX)
-                wait = min(cap, base * (2.0 ** min(account.breaker_retries, STREAK_SHIFT_MAX)))
+                wait = min(cap, base * (2.0 ** min(account.breaker_retries - 1, STREAK_SHIFT_MAX)))
                 account.breaker_until = max(account.breaker_until, now + wait)
                 account.state = "cooldown"
                 log.warning("账号 %s 熔断 %ds（连续 %d 次）", account.label, wait, threshold)
@@ -511,6 +512,23 @@ class Pool:
                     account.degrade_until = now + min(cap, base)
             self._dirty = True
         self.note_failure(account, reason)
+
+    def note_waf(self, account: Account, reason: str = "403 waf") -> None:
+        """内容审核 / 边缘 WAF 拦截：一分钟软避让。
+
+        这跟账号健康无关：换号、刷令牌都没用，反而是"换号继续打"最容易连坐。
+        所以只做短避让、不动任何升级阶梯，也不写 ``restricted_until``。
+        """
+        now = util.now()
+        with self._lock:
+            wait = self._duration(("pool", "waf_cooldown"), WAF_COOLDOWN)
+            account.cooldown_until = max(account.cooldown_until, now + wait)
+            if account.cooldown_until > now:
+                account.cooldown_reason = reason
+                account.cooldown_level = "waf"
+            account.last_error = reason
+            self._dirty = True
+        log.info("账号 %s 被内容审核/WAF 拦（%s），避让 %ds", account.label, reason, int(wait))
 
     def note_restricted(self, account: Account, reason: str = "403 restricted") -> None:
         """403 / 11140：固定 2 小时，且触发 realm 级连坐检测。"""

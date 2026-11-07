@@ -26,10 +26,16 @@
 | 400 | `tool_call_mismatch` / `reasoning_effort_unsupported` / `user_agent_rejected` | `11148` / `11150` / `12403` | 修请求 |
 | 402 | `insufficient_quota` | 账号额度耗尽（`6004`/`402`） | 等次日 04:00 重置或换号 |
 | 403 | `restricted` | 账号被上游风控（`11140`） | **停止重试**，换号会连坐 |
-| 429 | `rate_limited` | 真限流 | 退避重试 |
+| 403 | `content_blocked` | 内容审核 / 边缘 WAF 拦的（HTML 错误页或审核文案，**不是** `11140`） | 改写触发内容或稍后再来；换号无效 |
+| 429 | `rate_limited` | 真限流 | 看响应头 `Retry-After` 退避重试 |
 | 503 | `no_account` | 池里没有可用账号（冷却/禁用/槽满） | 等冷却结束或去面板加号 |
-| 503 | `upstream_unavailable` | 上游 5xx / 超时 | 稍后重试 |
+| 503 | `upstream_unavailable` | 上游 5xx | 稍后重试（有 `Retry-After` 时按它来） |
+| 503 | `upstream_timeout` | 上游超时 | 稍后重试；网关**不会**替你换号重发 |
 | 503 | `account_auth_failed` | 账号令牌失效需要重新登录 | 面板里重新授权 |
+
+> `restricted`（风控封号）和 `content_blocked`（内容审核）以前是同一个 403，现在分开了：
+> 前者只能停手，后者换号一点用都没有——搞混的代价是"一次内容拦截把整池账号都打一遍"。
+> 同理超时单独是个 `code`：网关不会换号重发，因为重发很可能让上游再生成一遍（重复计费）。
 
 ---
 

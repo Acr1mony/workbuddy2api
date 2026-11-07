@@ -32,7 +32,11 @@ def guard(handler: Callable[..., Any]) -> Callable[..., Any]:
         try:
             return handler(req, **params)
         except ServiceError as exc:
-            return error_response(exc.status, exc.message, exc.code, kind=exc.kind)
+            headers = {}
+            if getattr(exc, "retry_after", 0):
+                # 带上 Retry-After，客户端会自己等；不带的话它们会立刻重试把墙撞穿
+                headers["Retry-After"] = str(int(exc.retry_after))
+            return error_response(exc.status, exc.message, exc.code, kind=exc.kind, headers=headers or None)
         except BadRequest as exc:
             return error_response(exc.status, exc.message, exc.code, kind="invalid_request_error")
         except UpstreamError as exc:

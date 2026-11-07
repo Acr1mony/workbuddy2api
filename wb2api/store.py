@@ -448,6 +448,16 @@ class Store:
                 self.save_accounts()
             return account
 
+    def update_credit(self, account: Account, credits: Any, *, save: bool = True) -> Account:
+        """记一次余额读数；credits=None 表示"读不到"，不能当 0 写回去。"""
+        with self._lock:
+            account.credit = credits
+            account.credit_at = util.now()
+            self.accounts[account.key] = account
+            if save:
+                self.save_accounts()
+            return account
+
     def remove_account(self, key: str) -> bool:
         with self._lock:
             existed = self.accounts.pop(key, None) is not None

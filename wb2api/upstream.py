@@ -13,8 +13,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import http.client
 import json
+import re
+import select
 import socket
 import ssl
 import threading
@@ -35,8 +38,85 @@ CODE_TOOL_PAIRING = 11148
 CODE_RATE_LIMITED = 11104
 CODE_QUOTA = 11109
 CODE_NO_MODEL = 11103
+CODE_RESTRICTED = 11140
+CODE_SESSION_DEAD = 12153
 
 TRANSIENT_STATUS = {500, 502, 503, 504, 520, 521, 522, 523, 524}
+
+# 403 有三种完全不同的含义，处置方式相反，绝不能一律当"凭证失效"：
+# ``restricted`` 是风控封号（换号会连坐，只能停）；
+# ``waf`` 是链路层/内容层拦截（跟账号无关，软冷却后重试即可）；
+# 其余才是真的要刷 token。
+_RESTRICTED_RE = re.compile(r'"code"\s*:\s*"?11140"?')
+_RESTRICTED_MARKERS = ("11140", "unusual activity", "账号存在异常行为", "已被限制", "异常行为")
+_WAF_MARKERS = (
+    "unusual activity",
+    "access denied",
+    "request blocked",
+    "captcha",
+    "web application firewall",
+    "安全策略",
+    "访问被拒绝",
+)
+
+
+def _unescape(text: str) -> str:
+    """上游偶尔把整个信封再套一层转义（``"{\\"code\\":11140}"``），解一层再看。
+
+    ``json.loads`` 出来是 str 时说明多套了一层，也一并拆掉。只解两三层就够，
+    无限解会把正常内容里的引号也当转义。
+    """
+    current = text or ""
+    for _ in range(3):
+        stripped = current.strip()
+        if not stripped:
+            return current
+        if stripped.startswith('"') and stripped.endswith('"') and len(stripped) > 2:
+            try:
+                inner = json.loads(stripped)
+            except (ValueError, TypeError):
+                return current
+            if isinstance(inner, str) and inner != current:
+                current = inner
+                continue
+        if '\\"' in current:
+            # 只有纯 ASCII 才能安全走 unicode_escape：中文内容会被解成乱码
+            if not current.isascii():
+                return current
+            try:
+                current = current.encode("utf-8").decode("unicode_escape")
+                continue
+            except (UnicodeDecodeError, ValueError):
+                return current
+        return current
+    return current
+
+
+def is_restricted(body_text: str, code: int = 0, message: str = "") -> bool:
+    """这股请求是不是被风控当成脚本了。
+
+    只看 ``code == 11140`` 会漏：消息可能被 HTML 包着、也可能被转义两次。
+    漏判的代价是"换号"——一次连坐能烧掉整池，所以这里宁可误判成受限。
+    """
+    if code == CODE_RESTRICTED:
+        return True
+    text = _unescape(body_text)
+    if _RESTRICTED_RE.search(text):
+        return True
+    probe = f"{message}\n{text}".lower()
+    return any(marker in probe for marker in _RESTRICTED_MARKERS)
+
+
+def is_waf(body_text: str, message: str = "") -> bool:
+    """403 但不是风控封号：网关侧/内容审核拦的，跟账号健康无关。"""
+    text = _unescape(body_text or "")
+    stripped = text.strip()
+    looks_json = stripped.startswith("{") or stripped.startswith("[")
+    if not looks_json:
+        # 边缘层（openresty/APISIX）的 HTML 错误页都长这样
+        return True
+    probe = f"{message}\n{stripped}".lower()
+    return any(marker in probe for marker in _WAF_MARKERS)
 
 
 class UpstreamError(Exception):
@@ -145,7 +225,14 @@ def classify(status: int, body_text: str = "", retry_after: float = 0.0) -> Upst
         message = (body_text or "").strip()[:400] or f"upstream HTTP {status}"
     lowered = message.lower()
 
-    if status in (401, 403) or code == CODE_AUTH_EXPIRED or "token" in lowered and status in (401, 403):
+    if status == 403:
+        if is_restricted(body_text, code, message):
+            return UpstreamError(message, kind="restricted", status=status, code=code or CODE_RESTRICTED, body=body_text)
+        if is_waf(body_text, message):
+            # 内容审核 / WAF 拦的，账号本身没问题：只有它走软冷却，且绝不刷新凭证
+            return UpstreamError(message, kind="waf", status=status, code=code, retryable=True, body=body_text)
+        return UpstreamError(message, kind="auth", status=status, code=code, body=body_text)
+    if status == 401 or code == CODE_AUTH_EXPIRED or (status == 401 and "token" in lowered):
         return UpstreamError(message, kind="auth", status=status, code=code, body=body_text)
     if status == 429 or code == CODE_RATE_LIMITED or "rate limit" in lowered or "too many" in lowered:
         return UpstreamError(
@@ -185,6 +272,9 @@ class UpstreamResponse:
         self.reason = raw.reason
         self.headers = {key.lower(): value for key, value in raw.getheaders()}
         self._closed = False
+        # 只有"整段 body 都读完了"的连接才允许回池。半读的连接里还留着上一条流的残帧，
+        # 放回去会让下一个请求读到别人的数据（协议错位，比不复用严重得多）。
+        self._consumed = False
 
     @property
     def content_type(self) -> str:
@@ -206,7 +296,10 @@ class UpstreamResponse:
 
     def text(self, limit: int = 1_000_000) -> str:
         try:
-            return self._read(limit).decode("utf-8", "replace")
+            data = self._read(limit)
+            if len(data) < limit:
+                self._consumed = True
+            return data.decode("utf-8", "replace")
         finally:
             self.close()
 
@@ -236,9 +329,10 @@ class UpstreamResponse:
                     yield line.rstrip(b"\r")
             if buffer:
                 yield buffer.rstrip(b"\r")
+            self._consumed = True
         except socket.timeout:
             raise UpstreamError(
-                f"upstream idle for more than {idle_timeout:.0f}s", kind="transient", status=0, retryable=True
+                f"upstream idle for more than {idle_timeout:.0f}s", kind="timeout", status=0
             )
         except (http.client.IncompleteRead, ConnectionError) as exc:
             raise UpstreamError(f"upstream stream broke: {exc}", kind="transient", status=0, retryable=True)
@@ -259,6 +353,8 @@ class UpstreamResponse:
         self._pool.release(self._pool_key, self._conn, reusable=self._reusable())
 
     def _reusable(self) -> bool:
+        if not self._consumed:
+            return False
         return self.header("connection", "").lower() != "close" and self.status < 500
 
 
@@ -268,18 +364,31 @@ class UpstreamResponse:
 
 
 class _ConnPool:
-    """按 (host, proxy) 复用连接；每个连接同一时刻只给一个线程。"""
+    """按 (host, proxy, 凭据) 复用连接；每个连接同一时刻只给一个线程。
 
-    def __init__(self, max_idle: int = 8) -> None:
-        self._idle: Dict[str, List[http.client.HTTPConnection]] = {}
+    闲置超过 ``IDLE_TTL`` 的连接直接丢掉：WAF 风暴之后上游会常态性掐闲置连接，
+    复用一个已经被对端关闭的 socket 只会让请求卡在等首字节上。
+    """
+
+    IDLE_TTL = 90.0
+
+    def __init__(self, max_idle: int = 2) -> None:
+        self._idle: Dict[str, List[Tuple[http.client.HTTPConnection, float]]] = {}
         self._lock = threading.Lock()
         self._max_idle = max_idle
 
     def acquire(self, key: str) -> Optional[http.client.HTTPConnection]:
         with self._lock:
             bucket = self._idle.get(key)
-            if bucket:
-                return bucket.pop()
+            while bucket:
+                conn, stamp = bucket.pop()
+                if time.time() - stamp > self.IDLE_TTL or not _alive(conn):
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    continue
+                return conn
         return None
 
     def release(self, key: str, conn: http.client.HTTPConnection, reusable: bool = True) -> None:
@@ -292,7 +401,7 @@ class _ConnPool:
         with self._lock:
             bucket = self._idle.setdefault(key, [])
             if len(bucket) < self._max_idle:
-                bucket.append(conn)
+                bucket.append((conn, time.time()))
                 return
         try:
             conn.close()
@@ -302,12 +411,25 @@ class _ConnPool:
     def close(self) -> None:
         with self._lock:
             for bucket in self._idle.values():
-                for conn in bucket:
+                for conn, _stamp in bucket:
                     try:
                         conn.close()
                     except Exception:
                         pass
             self._idle.clear()
+
+
+def _alive(conn: http.client.HTTPConnection) -> bool:
+    """连接是否还活着：对端已关闭时 socket 立刻可读（读到 EOF）。"""
+    sock = getattr(conn, "sock", None)
+    if sock is None:
+        # 还没连过（或已被 http.client 关闭）的连接留着没坏处：真要用时它会自己重连
+        return True
+    try:
+        readable, _w, _x = select.select([sock], [], [], 0)
+    except (OSError, ValueError):
+        return False
+    return not readable
 
 
 # --------------------------------------------------------------------------
@@ -353,10 +475,13 @@ class UpstreamClient:
         )
 
     # -- 连接 ---------------------------------------------------------------
-    def _connect(self, url: str, proxy: str, timeout: float) -> Tuple[http.client.HTTPConnection, str]:
+    def _connect(self, url: str, proxy: str, timeout: float, credential: str = "") -> Tuple[http.client.HTTPConnection, str]:
         parts = util.split_url(url)
         scheme, host, port, _path = parts
-        key = f"{scheme}://{host}:{port}|{proxy}"
+        # 池键必须带凭据摘要：同一个 TCP 连接上先后出现两个 Authorization，
+        # 在上游看就是"多开设备共用一条链路"，这是最直接的跨号关联线索。
+        tag = hashlib.sha256(credential.encode("utf-8")).hexdigest()[:16] if credential else "anon"
+        key = f"{scheme}://{host}:{port}|{proxy}|{tag}"
         conn = self._pool.acquire(key)
         if conn is not None:
             return conn, key
@@ -395,12 +520,17 @@ class UpstreamClient:
         path = parts[3] or "/"
         attempt = 0
         last: Optional[Exception] = None
+        credential = ""
+        if headers:
+            credential = headers.get("Authorization") or headers.get("authorization") or headers.get("X-User-Id") or ""
         while attempt <= retries:
             attempt += 1
             conn = None
             key = ""
+            reused = False
             try:
-                conn, key = self._connect(url, proxy, timeout)
+                conn, key = self._connect(url, proxy, timeout, credential)
+                reused = getattr(conn, "sock", None) is not None
                 conn.request(method, path, body=body, headers=headers or {})
                 raw = conn.getresponse()
                 response = UpstreamResponse(conn, raw, key, self._pool)
@@ -414,10 +544,15 @@ class UpstreamClient:
                 last = exc
                 if conn is not None:
                     self._pool.release(key, conn, reusable=False)
-                if attempt > retries:
+                # 超时不许重试：请求可能已经被上游处理完（真花了钱），重发就是重复生成。
+                # 只对"复用的旧连接已经死了"这种情况重来一次，那时上游什么都没收到。
+                retryable = reused and not isinstance(exc, socket.timeout)
+                if attempt > retries or not retryable:
                     break
                 log.debug("transport retry %s %s (%s)", method, url, exc)
                 time.sleep(0.2 * attempt)
+        if isinstance(last, socket.timeout):
+            raise UpstreamError(f"upstream timeout: {last}", kind="timeout", status=0)
         raise UpstreamError(f"transport failure: {last}", kind="transient", status=0, retryable=True)
 
     def get(self, url: str, headers: Dict[str, str], **kwargs: Any) -> UpstreamResponse:

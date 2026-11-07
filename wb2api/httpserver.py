@@ -77,7 +77,14 @@ def json_response(payload: Any, status: int = 200, headers: Optional[Dict[str, s
     return Response(status=status, body=payload, headers=headers)
 
 
-def error_response(status: int, message: str, code: str = "", *, kind: str = "error") -> Response:
+def error_response(
+    status: int,
+    message: str,
+    code: str = "",
+    *,
+    kind: str = "error",
+    headers: Optional[Dict[str, str]] = None,
+) -> Response:
     """OpenAI-compatible error envelope (clients parse ``error.message``)."""
     body = {
         "error": {
@@ -86,7 +93,7 @@ def error_response(status: int, message: str, code: str = "", *, kind: str = "er
             "code": code or None,
         }
     }
-    return Response(status=status, body=body)
+    return Response(status=status, body=body, headers=dict(headers or {}))
 
 
 def stream_response(frames: Iterable[bytes], status: int = 200, headers: Optional[Dict[str, str]] = None) -> Response:

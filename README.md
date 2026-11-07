@@ -175,6 +175,8 @@ Docker / 服务化部署见 [docs/DEPLOY.md](docs/DEPLOY.md)。
 | `503 no_account`                      | 没有可用账号（全在冷却/被禁/余额为空）                               | 面板「概览」看池状态；「账号」页看冷却原因                     |
 | `400 fingerprint_rejected` (`11-128`) | 请求体里带了被逐字匹配的特征（Claude Code / Codex CLI 的系统提示等）     | 把 `prompt.mode` 设为 `sanitize`，或换掉客户端自带提示词 |
 | `403 restricted` (`11140`)            | 触发风控                                               | **换号没用，会连坐封号**。停一到两小时，检查客户端/UA 是否被识别      |
+| `403 content_blocked`                 | 内容审核 / 边缘 WAF 拦的（不是 `11140`）                       | 跟账号无关，换号一样被拦：改写触发内容或稍后再来                 |
+| `503 upstream_timeout`                | 上游 120 秒没响应                                        | 稍后重试；网关**不会**替你换号重发（重发可能重复计费）             |
 | `429 rate_limit_error`                | 账号软限流                                              | 网关已按上游给的 reset 时钟冷却；加号或换域                 |
 | `402 quota`                           | 额度耗尽                                               | 换号 / 充值；次日 04:00 自动解冻                     |
 | `400 model_unavailable`               | 上游目录里列了但**没接入**的模型（`11102 service info not found`） | 换一个模型；等或换号都没用                             |

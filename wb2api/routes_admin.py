@@ -20,6 +20,7 @@ from . import identity, util
 from .billing import Billing
 from .httpserver import BadRequest, Response, Router, error_response, json_response
 from .log import get_logger
+from .probe import probe_account
 from .service import ServiceError
 from .pool import throttle_until
 from .store import Account, ApiKey
@@ -277,47 +278,11 @@ def _account_action(panel: Panel, req: Any, uid: str, action: str) -> Response:
 
 
 def _test(panel: Panel, account: Account) -> Response:
-    """用一次最小请求确认账号真的能用。
-
-    只测模型目录不够——目录接口对过期令牌也能返回缓存；必须打一次真 chat。
-    而且要允许它失败（这里不写冷却，免得测试把好号关掉）。
-    """
-    from .adapters import chat as chat_adapter
-
-    try:
-        panel.auth.ensure_token(account)
-        names = panel.service.catalog.names(account.realm) or panel.service.catalog.names("cn")
-        model = names[0] if names else "deepseek-v3"
-        body = {"model": model, "messages": [{"role": "user", "content": "ping"}], "stream": False, "max_tokens": 16}
-        meta_body = chat_adapter.prepare_request(body, panel.service.catalog.meta_map(account.realm))
-        import json as _json
-
-        payload = _json.dumps(meta_body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        meta = identity.ChatMeta.for_request(body)
-        headers = identity.chat_headers(account, panel.cfg, meta=meta, client_ip="127.0.0.1")
-        url = panel.service.client.base_url(account.realm) + "/v2/chat/completions"
-        response = panel.service.client.post(url, headers, raw_body=payload, proxy=account.proxy or "")
-        try:
-            first = ""
-            for line in response.iter_text(30.0):
-                if line.startswith("data:"):
-                    first = line[5:].strip()
-                    break
-        finally:
-            response.close()
-        ok = False
-        detail = ""
-        if first and first != "[DONE]":
-            try:
-                obj = _json.loads(first)
-            except ValueError:
-                ok = True  # 拿到了非 JSON 数据，说明流确实是真的
-            else:
-                ok = not (isinstance(obj, dict) and "error" in obj)
-                detail = _json.dumps(obj, ensure_ascii=False)[:200]
-        return json_response({"ok": ok, "model": model, "sample": (detail or first)[:200]})
-    except Exception as exc:
-        return json_response({"ok": False, "error": str(exc)[:300]})
+    """用一次最小请求确认账号真的能用（实现见 ``probe.py``，CLI 共用）。"""
+    ok, detail = probe_account(panel.service, account)
+    if ok:
+        return json_response({"ok": True, "model": detail.get("model"), "sample": detail.get("sample", "")})
+    return json_response({"ok": False, "model": detail.get("model"), "error": detail.get("error", "")})
 
 
 def _login_start(panel: Panel, req: Any) -> Response:

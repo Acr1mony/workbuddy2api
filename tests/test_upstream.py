@@ -76,10 +76,23 @@ class TestClassify(unittest.TestCase):
         self.assertEqual(err.kind, "auth")
         self.assertFalse(err.retryable)
 
-    def test_403_is_auth_kind_but_carries_code(self):
+    def test_403_11140_is_restricted_not_auth(self):
         err = upstream.classify(403, '{"code":11140,"msg":"restricted"}')
+        self.assertEqual(err.kind, "restricted", "11140 换号会连坐，必须与普通认证失败区分")
+        self.assertEqual(err.code, 11140, "code 必须带出来")
+
+    def test_403_html_page_is_waf_not_auth(self):
+        err = upstream.classify(403, "<html><body>Request blocked by WAF</body></html>")
+        self.assertEqual(err.kind, "waf", "边缘层 HTML 403 跟账号无关，不能去刷令牌/换号")
+
+    def test_403_envelope_without_11140_is_auth(self):
+        err = upstream.classify(403, '{"code":0,"msg":"invalid token"}')
         self.assertEqual(err.kind, "auth")
-        self.assertEqual(err.code, 11140, "code 必须带出来，上层靠它判断风控而非换号")
+
+    def test_403_with_double_escaped_11140_is_still_restricted(self):
+        body = json.dumps({"msg": '{"code":11140,"msg":"restricted"}'}, ensure_ascii=False)
+        err = upstream.classify(403, body)
+        self.assertEqual(err.kind, "restricted", "漏判一次就是换号连坐")
 
     def test_429_is_retryable_rate_limit(self):
         err = upstream.classify(429, '{"code":11104,"msg":"slow down"}', retry_after=12)
@@ -187,11 +200,11 @@ class TestResponse(unittest.TestCase):
         raw = FakeRaw(["你好\n".encode("utf-8")])
         self.assertEqual(list(make_response(raw).iter_text()), ["你好"])
 
-    def test_idle_timeout_becomes_transient(self):
+    def test_idle_timeout_is_its_own_kind(self):
         raw = FakeRaw([], fail=socket.timeout("timed out"))
         with self.assertRaises(upstream.UpstreamError) as ctx:
             list(make_response(raw).iter_lines(1.0))
-        self.assertEqual(ctx.exception.kind, "transient")
+        self.assertEqual(ctx.exception.kind, "timeout", "超时要单独分类：换号重试只会再撞一次慢上游")
 
     def test_broken_stream_is_transient(self):
         import http.client
@@ -288,7 +301,7 @@ class CaptureConn(FakeConn):
 class TestRequestBody(unittest.TestCase):
     def _client(self, conn):
         client = upstream.UpstreamClient(FakeCfg())
-        client._connect = lambda url, proxy, timeout: (conn, "k")  # type: ignore[assignment]
+        client._connect = lambda url, proxy, timeout, credential="": (conn, "k")  # type: ignore[assignment]
         return client
 
     def test_raw_body_passthrough(self):
