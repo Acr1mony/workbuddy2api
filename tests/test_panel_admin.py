@@ -152,6 +152,41 @@ class TestBulk(ServerCase):
         self.assertEqual(len(failed), 1)
         self.assertTrue(self.app.store.get_account("uid-a").disabled)
 
+    def test_checkin_calls_billing_once_per_account(self):
+        token = self._seed()
+        calls = []
+
+        def fake_checkin(account, realm):
+            calls.append(account.uid)
+            return True, "签到成功"
+
+        self.app.panel.billing.checkin = fake_checkin
+        status, payload = self._bulk(token, {"action": "checkin", "uids": ["uid-a", "uid-b"]})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["ok_count"], 2)
+        self.assertEqual(sorted(calls), ["uid-a", "uid-b"])
+        self.assertEqual(payload["results"][0]["detail"], "签到成功")
+
+    def test_report_skips_enterprise_accounts_without_calling_upstream(self):
+        token = self._seed()
+        enterprise = make_account("uid-ent")
+        enterprise.enterprise_id = "ent-1"
+        self.app.store.upsert_account(enterprise)
+        sent = []
+
+        def fake_report(account, realm, *args, **kwargs):
+            sent.append(account.uid)
+            return True
+
+        self.app.panel.billing.report = fake_report
+        status, payload = self._bulk(token, {"action": "report", "uids": ["uid-a", "uid-ent"]})
+        self.assertEqual(status, 200)
+        self.assertEqual(sent, ["uid-a"], "企业号上报是零收益，不该白打一次请求")
+        rows = {row["uid"]: row for row in payload["results"]}
+        self.assertTrue(rows["uid-a"]["ok"])
+        self.assertFalse(rows["uid-ent"]["ok"])
+        self.assertIn("企业号", rows["uid-ent"]["detail"])
+
 
 class TestLogs(ServerCase):
     def test_returns_lines_instead_of_raw_text(self):

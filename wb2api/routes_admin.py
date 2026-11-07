@@ -34,8 +34,8 @@ LOGIN_MAX_ATTEMPTS = 5
 
 # Bulk-capable actions, and the subset that talks to the upstream (those get
 # spaced out — a batch is still a burst from one egress IP).
-BULK_ACTIONS = ("enable", "disable", "test", "refresh", "balance")
-SLOW_ACTIONS = ("test", "refresh", "balance")
+BULK_ACTIONS = ("enable", "disable", "test", "refresh", "balance", "checkin", "report")
+SLOW_ACTIONS = ("test", "refresh", "balance", "checkin", "report")
 
 
 class Panel:
@@ -468,6 +468,19 @@ def _bulk_one(panel: Panel, account: Account, action: str) -> Dict[str, Any]:
             panel.store.upsert_account(account)
         # unknown is not zero: the account is fine, we just could not read it
         return {"ok": value is not None, "detail": "读不到余额" if value is None else f"{value:.2f}", "credits": value}
+    if action == "checkin":
+        ok, message = panel.billing.checkin(account, account.realm)
+        return {"ok": ok, "detail": message}
+    if action == "report":
+        if getattr(account, "enterprise_id", "") or getattr(account, "product", "") == "enterprise":
+            return {"ok": False, "detail": "企业号没有活跃体系，上报是零收益"}
+        try:
+            panel.billing.report(account, account.realm)
+        except Exception as exc:  # 单个号失败不该让整批停
+            return {"ok": False, "detail": str(exc)[:120]}
+        account.extra["reported_at"] = util.now()
+        panel.store.upsert_account(account)
+        return {"ok": True, "detail": "已上报"}
     return {"ok": False, "detail": f"批量不支持 {action}"}
 
 

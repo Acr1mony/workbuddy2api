@@ -739,7 +739,8 @@
     var uids = selectedUids();
     if (!uids.length) return;
     var body = { action: action, uids: uids };
-    var label = { test: "测试", refresh: "续期", balance: "查额度", enable: "启用", disable: "停用" }[action] || action;
+    var label = { test: "测试", refresh: "续期", balance: "查额度", enable: "启用",
+                  disable: "停用", checkin: "签到", report: "上报" }[action] || action;
     toast("", "正在" + label + " " + uids.length + " 个账号…", "逐个发，不会同时打上游");
     api("/api/accounts/bulk", { body: body }).then(function (data) {
       var okCount = (data && data.ok_count) || 0;
