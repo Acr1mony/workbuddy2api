@@ -58,6 +58,10 @@ class ServerCase(unittest.TestCase):
     def json_of(self, data):
         return json.loads(data.decode("utf-8"))
 
+    def panel_token(self):
+        _status, _headers, data = self.request("POST", "/panel/login", {"password": "s3cret-pass"})
+        return self.json_of(data)["token"]
+
 
 class TestClientSurface(ServerCase):
     def test_healthz_is_open(self):
@@ -168,6 +172,47 @@ class TestPanelSurface(ServerCase):
     def test_settings_never_leak_secrets(self):
         status, _headers, data = self.request("GET", "/panel/status")
         self.assertNotIn(b"s3cret-pass", data)
+
+
+class TestLoginPoll(ServerCase):
+    """轮询接口曾经按对象访问属性，而 authflow 返回的是 dict → 面板点"添加账号"直接 500。"""
+
+    def test_pending_payload(self):
+        token = self.panel_token()
+        self.app.panel.auth.poll_login = lambda state: {"state": state, "status": "pending", "message": "等待中"}
+        status, _headers, data = self.request(
+            "GET", "/api/accounts/login/poll?state=abc", headers={"X-Panel-Token": token})
+        self.assertEqual(status, 200)
+        payload = self.json_of(data)
+        self.assertEqual(payload["status"], "pending")
+        self.assertEqual(payload["message"], "等待中")
+
+    def test_error_payload_is_passed_through(self):
+        token = self.panel_token()
+        self.app.panel.auth.poll_login = lambda state: {"status": "error", "message": "登录会话不存在"}
+        status, _headers, data = self.request(
+            "GET", "/api/accounts/login/poll?state=abc", headers={"X-Panel-Token": token})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.json_of(data)["status"], "error")
+
+    def test_success_attaches_masked_account(self):
+        from wb2api.store import Account
+
+        self.service.store.upsert_account(Account(uid="u-poll", realm="global", access_token="secret-at"))
+        token = self.panel_token()
+        self.app.panel.auth.poll_login = lambda state: {"state": state, "status": "ok", "uid": "u-poll"}
+        status, _headers, data = self.request(
+            "GET", "/api/accounts/login/poll?state=abc", headers={"X-Panel-Token": token})
+        self.assertEqual(status, 200)
+        account = self.json_of(data)["account"]
+        self.assertEqual(account["uid"], "u-poll")
+        self.assertNotIn("secret-at", data.decode("utf-8"), "轮询结果里绝不能出现明文令牌")
+
+    def test_missing_state_is_400(self):
+        token = self.panel_token()
+        status, _headers, _data = self.request(
+            "GET", "/api/accounts/login/poll", headers={"X-Panel-Token": token})
+        self.assertEqual(status, 400)
 
 
 class TestPanelDisabled(ServerCase):

@@ -289,12 +289,14 @@ async function startLoginFlow() {
     state.pollTimer = setInterval(async () => {
       try {
         const poll = await api("/api/accounts/login/poll?state=" + encodeURIComponent(data.state));
-        $("#login-state").textContent = `${poll.state} ${poll.message || ""}`;
-        if (poll.state === "ok") {
+        // status 才是 pending/ok/error；state 是那串不透明的登录会话 id。
+        const status = poll.status || "pending";
+        $("#login-state").textContent = poll.message || "等待登录…";
+        if (status === "ok") {
           clearInterval(state.pollTimer);
           $("#login-state").textContent = "登录成功，账号已添加。";
           await loadAccounts();
-        } else if (poll.state === "expired" || poll.state === "error") {
+        } else if (status === "expired" || status === "error") {
           clearInterval(state.pollTimer);
         }
       } catch (error) {

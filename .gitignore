@@ -14,3 +14,9 @@ config.json
 config.local.json
 .DS_Store
 Thumbs.db
+
+# 打包产物
+build/
+dist/
+*.egg-info/
+__pycache__/

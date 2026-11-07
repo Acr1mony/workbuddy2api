@@ -333,10 +333,14 @@ def _login_poll(panel: Panel, req: Any) -> Response:
     state = req.arg("state")
     if not state:
         return error_response(400, "缺少 state", "missing_state")
-    session = panel.auth.poll_login(state)
-    payload = {"state": session.status, "message": session.message}
-    if session.status == "ok":
-        account = getattr(session, "account", None)
+    # poll_login 返回的是 dict（view() 的形状），不是 LoginSession：
+    # 用属性访问会直接 500，而前端只看到"轮询失败"，很难定位。
+    payload = dict(panel.auth.poll_login(state))
+    status = str(payload.get("status") or "pending")
+    payload["status"] = status
+    if status == "ok":
+        uid = payload.get("uid") or ""
+        account = panel.store.get_account(uid) if uid else None
         payload["account"] = account.masked() if account is not None else None
     return json_response(payload)
 

@@ -331,6 +331,21 @@ class LoginTest(AuthFlowBase):
         self.assertIn("uid", view["message"])
         self.assertEqual(self.store.list_accounts(), [], "没有 uid 的账号不能入库")
 
+    def test_login_uid_from_tokens_when_jwt_has_no_sub(self):
+        # 上游换过令牌格式：claims 里没有 sub/uid/userId 时，退回响应体里的 uid。
+        access = jwt({"exp": time.time() + 3600})
+        auth, _client = self.flow([
+            {"code": 0, "data": {"state": "st", "authUrl": "u"}},
+            {"code": 0, "data": {"accessToken": access, "refreshToken": "rt",
+                                 "uid": "u-9", "state": "s"}},
+            {"code": 0, "data": {}},
+        ])
+        auth.start_login("cn")
+        view = auth.poll_login("st")
+        self.assertEqual(view["status"], "ok")
+        self.assertEqual(view["uid"], "u-9")
+        self.assertIsNotNone(self.store.get_account("u-9"))
+
     def test_cancel_login(self):
         auth, _client = self.flow([{"code": 0, "data": {"state": "st", "authUrl": "u"}}])
         auth.start_login("cn")
@@ -412,6 +427,16 @@ class EnsureTokenTest(AuthFlowBase):
         self.assertTrue(auth.refresh(account, force=True))
         self.assertEqual(len(client.calls), 1)
         self.assertEqual(account.access_token, new)
+
+    def test_double_envelope_refresh(self):
+        # 上游偶发把令牌再套一层：{"data": {"data": {...}}}，不认就会判成"没给令牌"。
+        new = jwt({"exp": time.time() + 3600})
+        payload = {"code": 0, "data": {"data": {"accessToken": new, "refreshToken": "rt-2"}}}
+        auth, _client = self.flow([payload])
+        account = self.account(expires_in=-10)
+        self.assertTrue(auth.refresh(account))
+        self.assertEqual(account.access_token, new)
+        self.assertEqual(account.refresh_token, "rt-2")
 
 
 class SingleFlightTest(AuthFlowBase):

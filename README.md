@@ -15,6 +15,8 @@
 
 ## 30 秒跑起来
 
+不需要 clone 后安装：在仓库根目录直接跑即可。想装成命令，见下面的「安装为命令」。
+
 ```powershell
 # 1) 启动（首次会在当前目录生成 data/ 与日志）
 python -m wb2api serve
@@ -55,6 +57,17 @@ print(client.chat.completions.create(
 ```
 
 任何支持「自定义 OpenAI 兼容 endpoint」的客户端（Cherry Studio、NextChat、Cline、Continue、IDE 插件…）都能接：填 base_url 与 key 即可。
+
+### 安装为命令（可选）
+
+```powershell
+pip install .
+wb2a serve          # 或 workbuddy2api serve
+```
+
+- 构建只需要 setuptools（有网时 pip 会自动拉进隔离环境，不用手工装）。
+- 安装后 `wb2a` 与 `workbuddy2api` 两个命令等价；数据目录默认取当前工作目录下的 `data/`，可用 `WB_DATA_DIR` 改。
+- 不想装也行：`python -m wb2api serve` 与本机源码目录完全等价，功能上没有区别。
 
 ---
 
