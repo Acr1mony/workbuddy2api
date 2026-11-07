@@ -360,13 +360,20 @@ async function addKey() {
   const models = $("#key-models").value.split(",").map((s) => s.trim()).filter(Boolean);
   if (!name) { $("#settings-error").textContent = "先填名称"; return; }
   try {
-    await api("/api/settings", {
+    const res = await api("/api/settings", {
       method: "POST",
       body: JSON.stringify({ keys_add: [{ name, models, realm: $("#key-realm").value }] }),
     });
     $("#key-name").value = "";
     $("#key-models").value = "";
     $("#settings-error").textContent = "";
+    // 明文只出现这一次：列表里永远是打过码的。
+    const created = (res && res.added && res.added[0]) || null;
+    const box = $("#key-created");
+    if (created && created.key) {
+      box.hidden = false;
+      box.innerHTML = `新密钥（只显示这一次，请立即复制）：<code>${escapeHtml(created.key)}</code>`;
+    }
     await loadSettings();
   } catch (error) {
     $("#settings-error").textContent = error.message;

@@ -174,6 +174,53 @@ class TestPanelSurface(ServerCase):
         self.assertNotIn(b"s3cret-pass", data)
 
 
+class TestApiKeySettings(ServerCase):
+    """密钥增删：面板只显示打码形态，明文必须在这一条响应里给出一次。"""
+
+    def _post_settings(self, body, token=None):
+        headers = {"X-Panel-Token": token or self.panel_token()}
+        status, _headers, data = self.request("POST", "/api/settings", body, headers)
+        return status, self.json_of(data)
+
+    def test_add_returns_plaintext_once(self):
+        status, payload = self._post_settings({"keys_add": [{"name": "cli", "realm": "cn"}]})
+        self.assertEqual(status, 200)
+        added = payload["added"]
+        self.assertEqual(len(added), 1)
+        self.assertEqual(added[0]["name"], "cli")
+        self.assertTrue(added[0]["key"], "新建密钥必须把明文回给客户端一次")
+
+        listed = self.json_of(self.request("GET", "/api/settings", headers={"X-Panel-Token": self.panel_token()})[2])
+        self.assertEqual(len(listed["api_keys"]), 1)
+        self.assertNotEqual(listed["api_keys"][0]["key"], added[0]["key"], "列表里只能是打码的")
+
+    def test_add_accepts_object_and_bare_name(self):
+        for body in ({"keys_add": {"name": "obj"}}, {"keys_add": "bare"}):
+            status, payload = self._post_settings(body)
+            self.assertEqual(status, 200, body)
+            self.assertEqual(len(payload["added"]), 1)
+        self.assertEqual(len(self.app.store.list_keys()), 2)
+
+    def test_delete_by_name_removes_the_key(self):
+        _status, payload = self._post_settings({"keys_add": [{"name": "cli"}]})
+        key = payload["added"][0]["key"]
+        status, deleted = self._post_settings({"keys_delete": ["cli"]})
+        self.assertEqual(status, 200)
+        self.assertEqual(deleted["deleted"], [key])
+        self.assertEqual(self.app.store.list_keys(), [])
+
+    def test_delete_by_key_value(self):
+        _status, payload = self._post_settings({"keys_add": [{"name": "cli"}]})
+        key = payload["added"][0]["key"]
+        _status, deleted = self._post_settings({"keys_delete": [key]})
+        self.assertEqual(deleted["deleted"], [key])
+
+    def test_delete_unknown_name_is_silent(self):
+        status, deleted = self._post_settings({"keys_delete": ["nope"]})
+        self.assertEqual(status, 200)
+        self.assertEqual(deleted["deleted"], [])
+
+
 class TestLoginPoll(ServerCase):
     """轮询接口曾经按对象访问属性，而 authflow 返回的是 dict → 面板点"添加账号"直接 500。"""
 

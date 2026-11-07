@@ -372,6 +372,48 @@ def _settings_get(panel: Panel, req: Any) -> Response:
     )
 
 
+def _normalize_key_items(value: Any) -> List[Dict[str, Any]]:
+    """Accept a list, a single object, or a bare name.
+
+    The panel sends a list, but a script writing `{"keys_add": {"name": "x"}}`
+    or `{"keys_add": "x"}` should not turn into a 500 (`'str' object has no
+    attribute 'get'`) — that is how a typo becomes an outage.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [{"name": value}]
+    if isinstance(value, dict):
+        return [value]
+    items: List[Dict[str, Any]] = []
+    for entry in value:
+        if isinstance(entry, str):
+            items.append({"name": entry})
+        elif isinstance(entry, dict):
+            items.append(entry)
+    return items
+
+
+def _delete_keys(panel: Panel, targets: Any) -> List[str]:
+    """Delete by key value or by name; returns what actually went away."""
+    if isinstance(targets, str):
+        targets = [targets]
+    removed: List[str] = []
+    for raw in targets or []:
+        needle = str(raw or "").strip()
+        if not needle:
+            continue
+        if panel.store.get_key(needle) is not None:
+            if panel.store.remove_key(needle):
+                removed.append(needle)
+            continue
+        # Names are what the panel shows, so let a name mean "all of these".
+        for key in panel.store.list_keys():
+            if key.name == needle and panel.store.remove_key(key.key):
+                removed.append(key.key)
+    return removed
+
+
 def _settings_post(panel: Panel, req: Any) -> Response:
     panel.require(req)
     body = req.json_body()
@@ -392,17 +434,24 @@ def _settings_post(panel: Panel, req: Any) -> Response:
         cfg.set("listen", str(body["listen"]))
     cfg.save()
 
-    for item in body.get("keys_add") or []:
-        key = ApiKey(
-            key=str(item.get("key") or util.rand_hex(24)),
+    added: List[Dict[str, Any]] = []
+    for item in _normalize_key_items(body.get("keys_add")):
+        key = str(item.get("key") or util.rand_hex(24))
+        models = item.get("models") or []
+        if isinstance(models, str):
+            models = [part.strip() for part in models.split(",") if part.strip()]
+        created = ApiKey(
+            key=key,
             name=str(item.get("name") or ""),
             realm=str(item.get("realm") or ""),
-            models=[str(m) for m in (item.get("models") or [])],
+            models=[str(m) for m in models],
         )
-        panel.store.add_key(key)
-    for name in body.get("keys_delete") or []:
-        panel.store.remove_key(str(name))
-    return json_response({"ok": True})
+        panel.store.add_key(created)
+        # The plaintext key is returned exactly once — the panel cannot show it
+        # again (it only ever holds the masked form).
+        added.append({"name": created.name, "key": created.key, "realm": created.realm})
+    deleted = _delete_keys(panel, body.get("keys_delete"))
+    return json_response({"ok": True, "added": added, "deleted": deleted})
 
 
 # --------------------------------------------------------------------------
