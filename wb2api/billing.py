@@ -54,15 +54,22 @@ class Billing:
 
     # -- 对外 ---------------------------------------------------------------
     def credits(self, account: Any, realm: str) -> Optional[float]:
-        """读账号余额；读不到返回 None（不代表 0）。"""
+        """读账号余额；读不到返回 None（不代表 0）。
+
+        注意是 **POST**：真实上游对 GET 直接回 404，只有 POST 带空 body 才返回
+        腾讯计费侧的 `data.Response.Data.Accounts[]`（每个资源包一行，
+        余额在 `CapacityRemainPrecise`）。参考仓库写的是 GET，照着抄会永远读不到。
+        """
         try:
-            payload = self._call(account, realm, "GET", RESOURCE_PATH)
+            payload = self._call(account, realm, "POST", RESOURCE_PATH, {})
         except (UpstreamError, ValueError) as exc:
             # ValueError：上游 200 但回了 HTML/空体（网关错误页），json() 解不出来。
             # 这一样是"读不到"，返回 None，别让调度循环整个炸掉。
             log.debug("读取额度失败 %s: %s", getattr(account, "label", "?"), exc)
             return None
-        value = _dig_credit(payload)
+        value = _pack_credits(payload)
+        if value is None:
+            value = _dig_credit(payload)
         if value is None:
             log.debug("额度响应里没有可识别的字段: %s", _preview(payload))
         return value
@@ -136,6 +143,41 @@ def _dig_credit(payload: Any) -> Optional[float]:
         return None
     candidates.sort(key=lambda item: item[0])
     return candidates[0][1]
+
+
+def _pack_credits(payload: Any) -> Optional[float]:
+    """腾讯计费侧的资源包形状：``data.Response.Data.Accounts[]`` 每行一个包。
+
+    余额要**求和**：一个人的额度常常拆成"赠送包 + 每日签到包 + 套餐包"，
+    只取第一个包会少报一大截（真实账号上就是 100 + 5 拆成两行）。
+    """
+    node = payload
+    for key in ("data", "Response", "Data"):
+        if isinstance(node, dict) and key in node:
+            node = node[key]
+        else:
+            return None
+    accounts = node.get("Accounts") if isinstance(node, dict) else None
+    if not isinstance(accounts, list):
+        return None
+    total = 0.0
+    found = False
+    for item in accounts:
+        if not isinstance(item, dict):
+            continue
+        for key in ("CapacityRemainPrecise", "CycleCapacityRemainPrecise", "CapacityRemain", "CycleCapacityRemain"):
+            if key not in item:
+                continue
+            value = _as_number(item[key])
+            if value is None:
+                continue
+            # 只算还在有效期内的包：过期包留着 Remain 但不该算进可用额度。
+            if str(item.get("ExpiredTime") or "") and item.get("Status") not in (0, "0", None):
+                continue
+            total += value
+            found = True
+            break
+    return round(total, 6) if found else None
 
 
 def _as_number(value: Any) -> Optional[float]:

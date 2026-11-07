@@ -350,6 +350,25 @@ class Pool:
             kwargs["exclude"] = exclude
         return None
 
+    def model_blocked(self, realm: str, model: str) -> Dict[str, Any]:
+        """整个域的所有可用账号都把这个模型标记为不可用时，返回解禁信息。
+
+        "模型不存在/没接入"是请求本身的问题，客户端该换模型；这时回 503 会让
+        客户端以为等一会儿就好，白白重试。所以要能和账号冷却区分开。
+        """
+        if not model:
+            return {}
+        now = util.now()
+        accounts = [a for a in self.store.list_accounts(realm) if not a.disabled]
+        if not accounts:
+            return {}
+        for account in accounts:
+            if model_cooldown_until(account, model) <= now:
+                return {}
+        untils = [model_cooldown_until(a, model) for a in accounts]
+        entry = accounts[0].model_cooldowns.get(model) or {}
+        return {"until": min(untils), "reason": str(entry.get("reason") or "")}
+
     def _mark_used(self, account: Account) -> None:
         with self._lock:
             self._used_seq += 1

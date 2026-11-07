@@ -81,7 +81,9 @@ class UsageLedger:
         prompt = int(record.get("prompt_tokens") or 0)
         completion = int(record.get("completion_tokens") or 0)
         cached = int(record.get("cached_tokens") or 0)
-        credits = float(record.get("credits") or 0)
+        # service 写的是单数 credit（上游 usage 就叫这个），历史台账里也有写 credits 的，
+        # 两个都认——否则面板上"消耗积分"永远是 0，用户看不出钱花在哪。
+        credits = float(record.get("credit") or record.get("credits") or 0)
         latency = float(record.get("latency_ms") or record.get("elapsed_ms") or 0)
 
         def bump(bucket: Dict[str, float]) -> None:

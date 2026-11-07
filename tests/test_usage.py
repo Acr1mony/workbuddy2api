@@ -90,6 +90,12 @@ class DayFileTest(UsageBase):
 
 
 class AggregateTest(UsageBase):
+    def test_singular_credit_key_is_counted(self):
+        # service 写的是 "credit"（上游 usage 字段名），这里必须认得，
+        # 否则面板"消耗积分"永远是 0。
+        ledger = self.ledger()
+        ledger.record(self.event(credit=0.02, credits=None))
+        self.assertAlmostEqual(ledger.summary()["total"]["credits"], 0.02)
     def test_totals_and_groups(self):
         ledger = self.ledger()
         base = time.time()

@@ -270,5 +270,40 @@ class TestBaseUrl(unittest.TestCase):
         self.assertEqual(client._timeouts(), (30.0, 90.0))
 
 
+class CaptureConn(FakeConn):
+    """记下真正发出去的请求体：余额/签到接口用 raw_body 自己序列化，不能被二次编码。"""
+
+    def __init__(self, raw):
+        super().__init__()
+        self.raw = raw
+        self.sent = []
+
+    def request(self, method, path, body=None, headers=None):
+        self.sent.append((method, path, body, headers))
+
+    def getresponse(self):
+        return self.raw
+
+
+class TestRequestBody(unittest.TestCase):
+    def _client(self, conn):
+        client = upstream.UpstreamClient(FakeCfg())
+        client._connect = lambda url, proxy, timeout: (conn, "k")  # type: ignore[assignment]
+        return client
+
+    def test_raw_body_passthrough(self):
+        conn = CaptureConn(FakeRaw([json.dumps({"code": 0}).encode()]))
+        client = self._client(conn)
+        resp = client.request("POST", "https://a.test/x", {"k": "v"}, raw_body=b'{"a":1}')
+        self.assertEqual(resp.json()["code"], 0)
+        self.assertEqual(conn.sent[0][2], b'{"a":1}')
+
+    def test_post_json_still_works(self):
+        conn = CaptureConn(FakeRaw([b"{}"]))
+        client = self._client(conn)
+        client.post("https://a.test/x", {}, {"a": 1})
+        self.assertEqual(json.loads(conn.sent[0][2].decode()), {"a": 1})
+
+
 if __name__ == "__main__":
     unittest.main()

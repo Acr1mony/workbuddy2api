@@ -97,7 +97,9 @@ class CreditsTest(BillingBase):
         value = billing.credits(self.account(), "cn")
         self.assertEqual(len(client.calls), 1, "读余额必然打一次上游")
         call = client.calls[0]
-        self.assertEqual(call["method"], "GET")
+        # 真实上游对 GET 回 404，只有 POST + 空 body 才给数据（2026-11 实测）。
+        self.assertEqual(call["method"], "POST")
+        self.assertEqual(call.get("body"), b"{}", "空 body 也要真的把 {} 发出去")
         self.assertTrue(call["url"].endswith(RESOURCE_PATH),
                         "余额接口路径变了？%s" % call["url"])
         self.assertTrue(client.responses[0].closed, "响应必须 close，否则连接池会慢慢漏")
@@ -110,6 +112,39 @@ class CreditsTest(BillingBase):
         # 新版把额度塞进 data.resource.credits 里，且 credits 本身还是个对象。
         payload = {"code": 0, "data": {"resource": {"credits": {"value": 33}}}}
         self.assertEqual(self.credit(payload), 33.0)
+
+    def test_tencent_pack_shape_sums_packages(self):
+        # 2026-11 实测的真实形状：额度按资源包拆成多行，余额在 CapacityRemainPrecise。
+        payload = {
+            "code": 0,
+            "data": {
+                "Response": {
+                    "Data": {
+                        "TotalCount": 80,
+                        "Accounts": [
+                            {"CapacityRemain": 100, "CapacityRemainPrecise": "100", "Status": 0, "ExpiredTime": ""},
+                            {"CapacityRemainPrecise": "5.01", "CycleCapacityRemain": 5, "Status": 0},
+                        ],
+                    }
+                }
+            },
+        }
+        self.assertEqual(self.credit(payload), 105.01)
+
+    def test_expired_package_is_ignored(self):
+        payload = {
+            "data": {
+                "Response": {
+                    "Data": {
+                        "Accounts": [
+                            {"CapacityRemainPrecise": "5.01", "Status": 0},
+                            {"CapacityRemainPrecise": "50", "Status": 2, "ExpiredTime": "2026-10-01 00:00:00"},
+                        ]
+                    }
+                }
+            }
+        }
+        self.assertEqual(self.credit(payload), 5.01)
 
     def test_string_number(self):
         # 上游数字字段时而字符串时而数字，别因为类型就不认。

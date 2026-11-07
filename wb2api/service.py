@@ -240,6 +240,14 @@ class GatewayService:
             if account is None:
                 if last_error is not None:
                     raise self._client_error(last_error, realm, model)
+                blocked = self.pool.model_blocked(realm, model)
+                if blocked:
+                    # 池子是空的，但原因是"这个模型谁都跑不通"，不是"账号都在冷却"。
+                    detail = blocked.get("reason") or "上游没有该模型的服务"
+                    raise ServiceError(
+                        f"模型 {model} 在上游不可用（{detail}），请换一个模型",
+                        400, "model_unavailable", "invalid_request_error",
+                    )
                 raise ServiceError(
                     f"{realm} 域没有可用账号（都被冷却或未启用）", 503, "no_account", "api_error"
                 )
@@ -325,8 +333,12 @@ class GatewayService:
             else:
                 self.pool.note_unscoped_rate(account, message or "429")
             return True, False
-        if code in (CODE_MODEL_UNAVAILABLE, CODE_MODEL_FORBIDDEN):
-            # 模型不可用是模型层面的事，别因为一个模型把账号冷却掉。
+        if code == CODE_MODEL_UNAVAILABLE:
+            # "service info not found"：模型侧没接入，所有账号都一样，换号只会多烧三次退避。
+            self.pool.block_model(account, model, message or "模型不可用")
+            return False, False
+        if code == CODE_MODEL_FORBIDDEN:
+            # 11158 是"这个账号的用户类型/权限用不了这个模型"，换号可能就通了，所以换。
             self.pool.block_model(account, model, message or "模型不可用")
             return True, False
         if code in (CODE_TOOL_PAIRING, CODE_EFFORT_UNSUPPORTED, CODE_UA_REJECTED):
@@ -368,6 +380,25 @@ class GatewayService:
             return ServiceError("上游暂时不可用", 503, "upstream_unavailable", "api_error")
         if err.kind == "auth":
             return ServiceError("账号认证失败，需要重新登录", 503, "account_auth_failed", "api_error")
+        # 以下这些是"请求本身有问题"，客户端改一下就好：一律 400，别用 502。
+        # 502/503 会让客户端自动重试同一个坏请求，把配额和账号都白烧一遍。
+        if err.code in (CODE_MODEL_UNAVAILABLE, CODE_MODEL_FORBIDDEN):
+            return ServiceError(
+                f"模型 {model} 在上游不可用（{message[:120]}），请换一个模型",
+                400, "model_unavailable", "invalid_request_error",
+            )
+        if err.code == CODE_TOOL_PAIRING:
+            return ServiceError(
+                "工具调用配对不完整（assistant.tool_calls 与 tool 结果必须成对）", 400, "tool_call_mismatch", "invalid_request_error"
+            )
+        if err.code == CODE_EFFORT_UNSUPPORTED:
+            return ServiceError(
+                f"该模型不支持所请求的 reasoning_effort（{message[:120]}）", 400, "reasoning_effort_unsupported", "invalid_request_error"
+            )
+        if err.code == CODE_UA_REJECTED:
+            return ServiceError("上游拒绝了客户端 UA（12403）", 400, "user_agent_rejected", "invalid_request_error")
+        if err.kind == "bad_request":
+            return ServiceError(message[:300], 400, "upstream_rejected", "invalid_request_error")
         return ServiceError(message[:300], 502, "upstream_error", "api_error")
 
     # -- 流式转发 -----------------------------------------------------------
@@ -471,6 +502,11 @@ class GatewayService:
         reasoning = _num(usage.get("completion_tokens_details", {}).get("reasoning_tokens") if isinstance(usage.get("completion_tokens_details"), dict) else usage.get("reasoning_tokens"))
         cached = _num((usage.get("prompt_tokens_details") or {}).get("cached_tokens") if isinstance(usage.get("prompt_tokens_details"), dict) else usage.get("cached_tokens"))
         total = _num(usage.get("total_tokens")) or (prompt + completion)
+        # 上游 usage 里带 credit（这次请求扣了多少积分）。台账要记它，否则面板上
+        # 永远显示"花了 0 积分"，用户没法知道钱去哪了。
+        credit = _num(usage.get("credit"))
+        if not credit:
+            credit = _num(usage.get("credits")) or _num(usage.get("credit_cost"))
         event = {
             "at": int(started),
             "iso": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started)),
@@ -485,6 +521,7 @@ class GatewayService:
             "reasoning_tokens": int(reasoning),
             "cached_tokens": int(cached),
             "total_tokens": int(total),
+            "credit": round(float(credit), 6),
             "realm": realm,
             "account": getattr(account, "uid", "") or getattr(account, "id", ""),
             "key": getattr(key, "key", "")[:12] if key is not None else "",

@@ -67,7 +67,7 @@
     "prefer_expiring": true,
     "expiring_soon": "168h",
     "model_rates": {},
-    "credit_floor": 100,
+    "credit_floor": 0,
     "idle_weight_per_hour": 0.5,
     "idle_weight_max": 5.0,
     "rate_limit_retries": 2,

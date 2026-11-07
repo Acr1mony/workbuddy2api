@@ -13,6 +13,24 @@
 
 `type` 取值：`invalid_request_error`（请求本身有问题）、`api_error`（上游/网关）、`rate_limit_error`（限流）、`authentication_error`。`code` 是稳定的字符串符号（`invalid_api_key` / `no_account` / `fingerprint_rejected` …），**程序判断请用 `code` 而不是 `message`**。
 
+常见 `code` 对照（都是真机打出来过的，不是设想）：
+
+| HTTP | `code` | 含义 | 该怎么做 |
+|---|---|---|---|
+| 401 | `invalid_api_key` | 密钥不认识 | 换密钥 |
+| 400 | `missing_model` | 没给 `model` | 补上 |
+| 400 | `model_not_allowed` | 密钥的模型白名单不允许 | 换模型或改密钥 |
+| 400 | `model_unavailable` | 上游确实没有这个模型（`11102 service info not found`） | **换模型**；等多久都没用 |
+| 400 | `fingerprint_rejected` | 请求体里有指纹（`11-128`） | 开 `prompt.mode=sanitize` 或改提示词；换号无效 |
+| 400 | `prompt_too_long` | `11115` | 缩短上下文 |
+| 400 | `tool_call_mismatch` / `reasoning_effort_unsupported` / `user_agent_rejected` | `11148` / `11150` / `12403` | 修请求 |
+| 402 | `insufficient_quota` | 账号额度耗尽（`6004`/`402`） | 等次日 04:00 重置或换号 |
+| 403 | `restricted` | 账号被上游风控（`11140`） | **停止重试**，换号会连坐 |
+| 429 | `rate_limited` | 真限流 | 退避重试 |
+| 503 | `no_account` | 池里没有可用账号（冷却/禁用/槽满） | 等冷却结束或去面板加号 |
+| 503 | `upstream_unavailable` | 上游 5xx / 超时 | 稍后重试 |
+| 503 | `account_auth_failed` | 账号令牌失效需要重新登录 | 面板里重新授权 |
+
 ---
 
 ## 客户端面

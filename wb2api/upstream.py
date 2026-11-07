@@ -380,10 +380,15 @@ class UpstreamClient:
         headers: Optional[Dict[str, str]] = None,
         body: Optional[bytes] = None,
         *,
+        raw_body: Optional[bytes] = None,
         proxy: str = "",
         timeout: Optional[float] = None,
         retries: int = 1,
     ) -> UpstreamResponse:
+        # raw_body 是 post() 的同义参数：billing 先自己序列化好再发，必须与请求体字节一致，
+        # 不能被二次 json.dumps（那会多一层字符串转义，上游直接当畸形请求）。
+        if raw_body is not None:
+            body = raw_body
         connect_timeout, _idle = self._timeouts()
         timeout = timeout or connect_timeout
         parts = util.split_url(url)

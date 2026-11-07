@@ -185,6 +185,37 @@ class RestrictionTests(PoolTestBase):
         self.assertLessEqual(self.pool.realm_hold_remaining("cn"), 61)
 
 
+class ModelBlockTests(PoolTestBase):
+    """"模型不可用"必须能和"账号在冷却"区分开：前者客户端换模型，后者等一会儿。"""
+
+    def test_all_accounts_blocked_reports_model(self) -> None:
+        a = self.add("a")
+        b = self.add("b")
+        self.pool.block_model(a, "glm-4.6", "service info not found")
+        self.pool.block_model(b, "glm-4.6", "service info not found")
+        info = self.pool.model_blocked("cn", "glm-4.6")
+        self.assertTrue(info)
+        self.assertIn("service info not found", info["reason"])
+        self.assertGreater(info["until"], time.time())
+
+    def test_one_free_account_means_not_blocked(self) -> None:
+        a = self.add("a")
+        self.add("b")
+        self.pool.block_model(a, "glm-4.6", "boom")
+        self.assertEqual(self.pool.model_blocked("cn", "glm-4.6"), {})
+
+    def test_other_model_and_realm_unaffected(self) -> None:
+        a = self.add("a")
+        self.add("b")
+        for account in (a, self.store.list_accounts("cn")[1]):
+            self.pool.block_model(account, "glm-4.6", "boom")
+        self.assertEqual(self.pool.model_blocked("cn", "hy3"), {})
+        self.assertEqual(self.pool.model_blocked("global", "glm-4.6"), {})
+
+    def test_no_accounts_is_not_a_model_problem(self) -> None:
+        self.assertEqual(self.pool.model_blocked("cn", "glm-4.6"), {})
+
+
 class SelectionTests(PoolTestBase):
     def test_credit_floor_blocks_only_paid_models(self) -> None:
         self.cfg.set("pool.credit_floor", 100)

@@ -358,3 +358,31 @@ Classification helpers to copy: `Classify(status, body)` with `hardMarkers` (ins
 - Usage: reconcile cache aliases to `prompt_tokens_details.cached_tokens`; header/idle timeouts 120 s/300 s; `: keepalive` every 15 s.
 - Errors: pass `{"error":{code,message}}` frames through untouched; 429 with `Retry-After`/`reset_at`; 403 `11140` = stop, do not rotate; 429 `6004` = quota exhausted.
 - Outbound fingerprint sanitization (`11-128`, `x-anthropic-billing-hdr`, `cc_*=`, identity sentences) — outbound only, never applied to responses.
+
+---
+
+## 真机实测修正（2026-11-07，CN 域 · 个人版账号）
+
+下面几条是照着上面规格实现之后，用真实账号打出来的**偏差**。按规格写会踩到，所以单列：
+
+- **余额接口是 POST，不是 GET。** `GET /v2/billing/meter/get-user-resource` 回 openresty 的 `404 page not found`；
+  `POST` 带空 body `{}` 才给数据。返回结构也不是 `{code,data:{remaining}}`，而是腾讯计费侧的资源包列表：
+  `data.Response.Data.Accounts[]`，**每个资源包一行**，余额在 `CapacityRemainPrecise`（字符串）/`CapacityRemain`（数字），
+  可用额度 = 所有包求和。实测同一账号 80 个包（赠送包 + 每日签到包 + 裂变包），只取第一个包会少报约 8700 积分。
+  附带字段：`PackageName`、`CycleStartTime/CycleEndTime`（`2026-11-13 19:27:31` 这种 UTC+8 墙上时间）、
+  `CapacitySizePrecise`/`CapacityRemainPrecise`/`CapacityUsedPrecise`、`Status`（0 = 有效）、`AccountAttributes[]`
+  （`grantSource=daily_checkin` 之类）。
+- **`/v2/billing/meter/daily` 在 CN 是 404**，且是 APISIX 风格的 `{"error_msg":"404 Route Not Found"}`
+  （与 openresty 的纯文本 404 不是同一层），`?date=` 或 POST 都一样。企业用量接口 `get-enterprise-user-usage` 同样 404。
+- **`/v3/config` 列出来的模型不一定真能聊。** 目录里有 61 条、48 条可聊，但请求 `glm-4.6`、`deepseek-v3-1` 会得到
+  `400 {"code":11102,"msg":"model [glm-4.6] service info not found"}`，body 里还有
+  `retry_policy:{"retry":false}` 与中英双语 `displayMsg`/`displayTips`。**换号没用**（模型侧没接入），
+  正确处置是回 400 让客户端换模型，并给该账号标记这个模型不可用。实测同一账号 `auto`/`hy3`/`fast-model`/
+  `deepseek-v4-flash` 可正常对话。
+- **usage 帧里带 `credit`**（这次请求扣掉的积分，如 `0.02`，另有 `quota:null`），还有
+  `completion_tokens_details.reasoning_tokens`、`completion_thinking_tokens`、`prompt_cache_hit_tokens`、
+  `prompt_cache_miss_tokens`、`cache_read_input_tokens`。台账要记 `credit`，否则面板上「消耗积分」永远是 0。
+- **`max_tokens` 太小会被思考吃光**：`max_tokens:16` 时 `content` 为空、16 个 token 全在
+  `reasoning_content` 里（思考与回答共享预算）。这不是 bug，但探测脚本别拿 16 当「够用」。
+- 每日签到在 CN 存在：`POST /v2/billing/meter/daily-checkin`，body `{}`；已签到回业务错（文案「今天已签到，请明天再来」），
+  不是 HTTP 错误，别当账号故障处理。

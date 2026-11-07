@@ -89,7 +89,10 @@ DEFAULTS: Dict[str, Any] = {
         "prefer_expiring": True,
         "expiring_soon": "168h",
         "model_rates": {},
-        "credit_floor": 100,
+        # 余额闸门：余额低于它就不派发**收费**模型（0 = 关闭）。
+        # 默认关闭：只有一个号的用户被这道闸门拦住就等于网关全挂，而真实账号余额
+        # 常常就是十几个积分。想省钱的场景（多号、有人专门跑贵模型）再打开。
+        "credit_floor": 0,
         "idle_weight_per_hour": 0.5,
         "idle_weight_max": 5.0,
         "rate_limit_retries": 2,

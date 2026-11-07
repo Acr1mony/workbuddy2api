@@ -175,9 +175,14 @@ Docker / 服务化部署见 [docs/DEPLOY.md](docs/DEPLOY.md)。
 | `403 restricted` (`11140`) | 触发风控 | **换号没用，会连坐封号**。停一到两小时，检查客户端/UA 是否被识别 |
 | `429 rate_limit_error` | 账号软限流 | 网关已按上游给的 reset 时钟冷却；加号或换域 |
 | `402 quota` | 额度耗尽 | 换号 / 充值；次日 04:00 自动解冻 |
+| `400 model_unavailable` | 上游目录里列了但**没接入**的模型（`11102 service info not found`） | 换一个模型；等或换号都没用 |
 | 面板打不开 | 面板被关（`panel.enabled=false`）或端口不对 | `python -m wb2api doctor` |
 
 `python -m wb2api doctor` 会检查配置文件、数据目录、监听地址并把问题逐条列出来。
+
+面板「账号」页的**余额**来自上游计费接口（`POST /v2/billing/meter/get-user-resource`），会把一个账号下所有资源包
+（赠送包、每日签到包、套餐包）加起来；「概览」里的**消耗积分**来自每次请求的 usage（上游按请求扣分），
+所以两者应当对得上，对不上就说明有请求绕过了网关。
 
 ---
 

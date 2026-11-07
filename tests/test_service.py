@@ -198,6 +198,17 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual(resp.status, 200)
         self.assertEqual(len(client.calls), 2)
 
+    def test_model_unavailable_is_400_not_502(self):
+        # 上游真实返回：400 {"code":11102,"msg":"model [glm-4.6] service info not found"}
+        # 这类错误换号、重试都没用，必须让客户端看到 400 并自己换模型。
+        error = UpstreamError("model [glm-4.6] service info not found", kind="bad_request", status=400, code=11102)
+        svc, client = self.service([error])
+        with self.assertRaises(ServiceError) as ctx:
+            svc.chat_completions(self.request(self.body()))
+        self.assertEqual(ctx.exception.status, 400)
+        self.assertEqual(ctx.exception.code, "model_unavailable")
+        self.assertEqual(len(client.calls), 1)
+
     def test_all_accounts_fail_gives_503(self):
         errors = [UpstreamError("boom", kind="transient", status=500) for _ in range(12)]
         svc, _client = self.service(errors)
