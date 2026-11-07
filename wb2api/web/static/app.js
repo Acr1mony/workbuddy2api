@@ -257,6 +257,13 @@
     api("/panel/status").then(function (status) {
       state.status = status;
       $("#version-label").textContent = status.version ? "v" + status.version : "";
+      // 页面与服务版本不一致，说明浏览器还在用旧缓存里的脚本：旧脚本绑的是旧 DOM，
+      // 表现就是"登录按钮点了没反应"。与其让人怀疑密码，不如直接说清楚。
+      var uiVersion = document.documentElement.getAttribute("data-version") || "";
+      if (status.version && uiVersion && status.version !== uiVersion) {
+        toast("warn", "页面脚本不是最新的",
+          "页面 " + uiVersion + " / 服务 " + status.version + "，按 Ctrl+F5（Mac 上 Cmd+Shift+R）强制刷新");
+      }
       if (status.is_default_password || status.panel_password_is_default) {
         $("#default-pw-banner").hidden = false;
       }
@@ -1306,6 +1313,8 @@
   function main() {
     bind();
     setAddMode("link");
+    // 走到这里说明绑定都成功了；index.html 用它区分"脚本没跑"和"脚本跑了但没登录"。
+    window.__WB2A_READY = true;
     if (!state.token) {
       showLogin();
       return;

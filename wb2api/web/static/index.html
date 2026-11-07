@@ -1,12 +1,26 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-version="{{VERSION}}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>workbuddy2api 控制台</title>
-<link rel="stylesheet" href="/panel/style.css">
+<link rel="stylesheet" href="/panel/style.css?v={{VERSION}}">
 </head>
 <body>
+
+<!-- 脚本没跑起来时唯一能看到的东西：这时候页面是死的，登录按钮也不会响应 -->
+<div class="login-wrap" id="boot-warn" hidden>
+  <div class="login-card">
+    <h1>workbuddy2api</h1>
+    <p class="muted tiny" style="margin:0 0 8px;color:var(--bad)">
+      页面脚本没有正常运行。通常是浏览器缓存了旧版 app.js（或装了拦截脚本的扩展）。
+    </p>
+    <p class="muted tiny" style="margin:0">
+      请按 <strong>Ctrl+F5</strong>（Mac：<strong>Cmd+Shift+R</strong>）强制刷新；仍不行就看
+      <code>/panel/app.js</code> 是否 404（面板关闭时它会 404）。
+    </p>
+  </div>
+</div>
 
 <!-- 登录 -->
 <div class="login-wrap" id="login-view" hidden>
@@ -395,6 +409,18 @@
 </aside>
 
 <div class="toasts" id="toasts"></div>
-<script src="/panel/app.js"></script>
+<script src="/panel/app.js?v={{VERSION}}"></script>
+<script>
+  // app.js 跑起来会把 __WB2A_READY 置真。没有就说明它没跑（旧缓存、被拦、404）。
+  setTimeout(function () {
+    if (window.__WB2A_READY) return;
+    var warn = document.getElementById("boot-warn");
+    if (warn) warn.hidden = false;
+    ["login-view", "app-view"].forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el) el.hidden = true;
+    });
+  }, 2000);
+</script>
 </body>
 </html>

@@ -260,6 +260,13 @@ Docker / 服务化部署见 [docs/DEPLOY.md](docs/DEPLOY.md)。
 | `402 quota`                           | 额度耗尽                                               | 换号 / 充值；次日 04:00 自动解冻                     |
 | `400 model_unavailable`               | 上游目录里列了但**没接入**的模型（`11102 service info not found`） | 换一个模型；等或换号都没用                             |
 | 面板打不开                                 | 面板被关（`panel.enabled=false`）或端口不对                   | `python -m wb2api doctor`                 |
+| 面板点了「登录」没反应 / 登录后还看到登录框              | 浏览器缓存了旧版 `app.js`（页面脚本没跑起来，或被拦）                     | **Ctrl+F5** 强制刷新；页面 2 秒后会自己提示这一句          |
+
+面板脚本没跑起来时页面是"死"的：登录按钮不响应，人只会以为密码错了。所以：
+
+- `/panel/` 一律 `Cache-Control: no-store`，静态资源带 `?v=<版本号>` 指纹，升级后浏览器自然会拿到新文件；
+- 页面加载 2 秒后检查 `window.__WB2A_READY`，没置位就直接显示「页面脚本没有正常运行，请 Ctrl+F5」而不是干等；
+- 版本号（`data-version` 属性）和 `/panel/status` 返回的 `version` 不一致时会弹提示，说明前端文件是旧的。
 
 `python -m wb2api doctor` 会检查配置文件、数据目录、监听地址并把问题逐条列出来。
 

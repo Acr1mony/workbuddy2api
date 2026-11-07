@@ -46,6 +46,11 @@ body {
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
 
+/* 浏览器默认的 [hidden] 只是 UA 样式，任何作者样式都能盖掉它：
+   .login-wrap{display:grid} 会让 hidden 的登录卡/警告卡照样占满一屏，
+   登录后还能在顶部看见登录框。这里必须用 !important 兜住。 */
+[hidden] { display: none !important; }
+
 h1 { font-size: 20px; margin: 0 0 12px; }
 h2 { font-size: 14px; margin: 0; font-weight: 600; }
 

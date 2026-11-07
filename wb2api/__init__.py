@@ -28,5 +28,5 @@
     cli.py          命令行入口（serve / doctor / version / accounts）
 """
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 __version__ = VERSION

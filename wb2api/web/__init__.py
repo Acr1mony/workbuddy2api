@@ -51,9 +51,22 @@ def _file(name: str) -> Response:
     except OSError:
         return error_response(500, "cannot read panel asset", "io_error")
     extension = os.path.splitext(name)[1].lower()
-    headers: Dict[str, str] = {"Cache-Control": "no-cache" if extension == ".html" else "public, max-age=300"}
+    if extension == ".html":
+        # 页面本身绝不缓存，且把版本号填进静态资源 URL —— 只缓存一份 app.js
+        # 的浏览器会在升级后继续用旧脚本，登录按钮看着没反应（它绑的是旧 DOM）。
+        body = body.replace(b"{{VERSION}}", __version().encode("utf-8"))
+        headers: Dict[str, str] = {"Cache-Control": "no-store"}
+    else:
+        headers = {"Cache-Control": "public, max-age=300"}
     return Response(status=200, body=body, content_type=CONTENT_TYPES.get(extension, "application/octet-stream"), headers=headers)
 
 
 def asset_path(name: str) -> str:
     return os.path.join(STATIC_DIR, name)
+
+
+def __version() -> str:
+    """面板页面里填的版本号，用来给静态资源做缓存指纹。"""
+    from .. import VERSION
+
+    return VERSION

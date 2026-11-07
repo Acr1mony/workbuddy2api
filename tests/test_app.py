@@ -157,7 +157,42 @@ class TestPanelSurface(ServerCase):
         self.assertEqual(status, 200)
         self.assertIn("text/html", headers.get("content-type", ""))
         self.assertIn(b"<html", data.lower())
-        self.assertEqual(headers.get("cache-control"), "no-cache")
+        self.assertEqual(headers.get("cache-control"), "no-store")
+
+    def test_index_fills_version_and_busts_asset_cache(self):
+        """页面本身不缓存、静态资源带版本号：否则升级后浏览器会拿旧 app.js 跑新页面。"""
+        from wb2api import VERSION
+
+        status, _headers, data = self.request("GET", "/panel/")
+        self.assertEqual(status, 200)
+        text = data.decode("utf-8")
+        self.assertNotIn("{{VERSION}}", text, "占位符必须被替换掉")
+        self.assertIn("app.js?v=%s" % VERSION, text)
+        self.assertIn("style.css?v=%s" % VERSION, text)
+        self.assertIn('data-version="%s"' % VERSION, text)
+
+    def test_assets_stay_cacheable(self):
+        status, headers, data = self.request("GET", "/panel/app.js")
+        self.assertEqual(status, 200)
+        self.assertIn("javascript", headers.get("content-type", ""))
+        self.assertIn("max-age", headers.get("cache-control", ""), "带版本号之后允许缓存")
+        self.assertIn(b"wb2a_panel_token", data)
+
+    def test_hidden_attribute_always_wins(self):
+        """模型/警告卡是 .login-wrap（display:grid），没有 !important 的话
+        hidden 属性会被作者样式盖掉：登录成功之后还能看到登录框。"""
+        status, _headers, css = self.request("GET", "/panel/style.css")
+        self.assertEqual(status, 200)
+        self.assertIn(b"[hidden] { display: none !important; }", css)
+
+    def test_page_can_tell_when_script_did_not_run(self):
+        """脚本没跑时页面是死的：登录按钮不响应，人只会以为密码错了。"""
+        status, _headers, data = self.request("GET", "/panel/")
+        self.assertEqual(status, 200)
+        self.assertIn(b'id="boot-warn"', data)
+        status, _headers, js = self.request("GET", "/panel/app.js")
+        self.assertEqual(status, 200)
+        self.assertIn(b"__WB2A_READY", js)
 
     def test_panel_redirect(self):
         status, headers, _data = self.request("GET", "/panel")
