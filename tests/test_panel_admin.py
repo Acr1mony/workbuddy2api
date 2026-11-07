@@ -167,5 +167,58 @@ class TestLogs(ServerCase):
         self.assertIsInstance(self.json_of(data)["lines"], list)
 
 
+class TestBackup(ServerCase):
+    """备份的价值全在"能把号搬回来"，所以导出的必须是能 restore 的真凭据。"""
+
+    def _seed(self):
+        self.app.store.upsert_account(make_account("uid-a"))
+        return self.panel_token()
+
+    def test_export_contains_tokens_and_forces_download(self):
+        token = self._seed()
+        status, headers, data = self.request("GET", "/api/accounts/export", headers={"X-Panel-Token": token})
+        self.assertEqual(status, 200)
+        lowered = {str(k).lower(): v for k, v in dict(headers).items()}
+        self.assertIn("attachment", lowered.get("content-disposition", ""))
+        self.assertEqual(lowered.get("cache-control"), "no-store")
+        payload = self.json_of(data)
+        self.assertEqual(len(payload["accounts"]), 1)
+        row = payload["accounts"][0]
+        self.assertEqual(row["access_token"], "tok-uid-a", "脱敏导出等于假备份")
+        self.assertIn("refresh token", payload["warning"])
+
+    def test_export_requires_auth(self):
+        self._seed()
+        status, _headers, _data = self.request("GET", "/api/accounts/export")
+        self.assertEqual(status, 401)
+
+    def test_import_merges_and_skips_garbage(self):
+        token = self._seed()
+        body = {"accounts": [
+            {"uid": "uid-a", "realm": "cn", "access_token": "new-token", "nickname": "改名了"},
+            {"uid": "uid-b", "realm": "global", "access_token": "tok-b"},
+            {"realm": "cn"},          # 没有任何凭据 → 跳过
+            "not-an-object",          # 结构不对 → 跳过
+        ]}
+        status, _headers, data = self.request(
+            "POST", "/api/accounts/import", body, headers={"X-Panel-Token": token}
+        )
+        self.assertEqual(status, 200)
+        payload = self.json_of(data)
+        self.assertEqual(payload["added"], 1)
+        self.assertEqual(payload["updated"], 1)
+        self.assertEqual(payload["skipped"], 2)
+        self.assertEqual(self.app.store.get_account("uid-a").access_token, "new-token")
+        self.assertIsNotNone(self.app.store.get_account("uid-b"))
+
+    def test_import_rejects_non_list(self):
+        token = self._seed()
+        status, _headers, data = self.request(
+            "POST", "/api/accounts/import", {"accounts": "nope"}, headers={"X-Panel-Token": token}
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(self.json_of(data)["error"]["code"], "bad_request")
+
+
 if __name__ == "__main__":
     unittest.main()

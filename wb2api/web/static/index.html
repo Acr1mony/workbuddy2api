@@ -187,6 +187,9 @@
             <option value="nickname">按昵称排序</option>
             <option value="last_used_at">按最近使用排序</option>
           </select>
+          <button class="ghost tiny-btn" id="acc-export" title="下载含 refresh token 的备份文件">导出</button>
+          <button class="ghost tiny-btn" id="acc-import" title="从备份文件恢复账号">导入</button>
+          <input type="file" id="acc-import-file" accept=".json,application/json" hidden>
         </div>
 
         <!-- 批量操作条 -->

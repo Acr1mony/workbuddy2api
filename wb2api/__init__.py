@@ -7,7 +7,9 @@
     identity.py     上游要求的 UA / 请求头 / 设备与会话指纹
     authflow.py     OAuth 登录（无 PKCE，state 轮询）与一次性 refresh token
     upstream.py     上游 HTTP 客户端、连接复用、错误码归一化
+    egress.py       出口（host+proxy）级退避：链路抖动不记在账号头上
     billing.py      额度查询 / 签到 / 用量上报（宽容解析）
+    probe.py        账号体检（真打一次最小 chat，只读不记账）
     sse.py          SSE 解析与 OpenAI 分块编码
     markup.py       DSML 内联工具调用的增量提取
     sanitize.py     出站请求体反指纹净化（可选）
@@ -16,15 +18,15 @@
     pool.py         选号、五类冷却窗口、会话粘滞、并发槽
     sticky.py       会话 → 账号亲和表
     service.py      请求编排：鉴权、换号、流式边界、记账
-    scheduler.py    令牌保活（提前 48h）、余额刷新、签到、落盘
+    scheduler.py    令牌保活（提前 6h）、余额刷新、签到、落盘
     usage.py        用量台账与面板聚合
     httpserver.py   极简 HTTP 框架（路由 / 请求 / 响应 / 面板会话）
     routes_openai.py  客户端面：/v1/chat/completions、/v1/models、/healthz、/status
-    routes_admin.py   面板 API：账号、设置、用量、日志、调度
+    routes_admin.py   面板 API：账号（含备份）、设置、用量、日志、调度
     web/            面板静态页（零构建）
     app.py          装配：把上面这些拼成一个应用
-    cli.py          命令行入口（serve / doctor / version）
+    cli.py          命令行入口（serve / doctor / version / accounts）
 """
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 __version__ = VERSION

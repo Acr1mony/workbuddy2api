@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import hmac
+import json
 import random
 import time
 from typing import Any, Dict, List, Optional
@@ -97,6 +98,8 @@ def register(router: Router, panel: Panel) -> None:
     router.add("POST", r"/api/accounts/login/start", lambda req: _login_start(panel, req))
     router.add("GET", r"/api/accounts/login/poll", lambda req: _login_poll(panel, req))
     router.add("POST", r"/api/accounts/bulk", lambda req: _bulk_action(panel, req))
+    router.add("GET", r"/api/accounts/export", lambda req: _export_accounts(panel, req))
+    router.add("POST", r"/api/accounts/import", lambda req: _import_accounts(panel, req))
     router.add(
         "POST",
         r"/api/accounts/(?P<uid>[^/]+)/(?P<action>enable|disable|delete|test|refresh|checkin|balance)",
@@ -185,6 +188,67 @@ def _accounts(panel: Panel, req: Any) -> Response:
         row["in_flight"] = getattr(account, "in_flight", 0)
         rows.append(row)
     return json_response({"accounts": rows, "realm": realm or "all"})
+
+
+def _export_accounts(panel: Panel, req: Any) -> Response:
+    """导出账号（含 refresh token）——备份用，代价是这份文件等同于账号密码。
+
+    不做"脱敏导出"：脱敏后的备份 restore 不回来，等于假备份。所以老实导出，
+    但用 ``Content-Disposition`` 让浏览器存成文件、``Cache-Control: no-store``
+    防止被中间层缓存，并在文件里写一句人话警告。
+    """
+    panel.require(req)
+    accounts = [account.to_dict() for account in panel.store.list_accounts("")]
+    payload = {
+        "version": 1,
+        "exported_at": time.time(),
+        "warning": "本文件含 refresh token，等同于账号密码。别提交到仓库，别贴到聊天软件里。",
+        "accounts": accounts,
+    }
+    body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    return Response(
+        200,
+        body,
+        headers={
+            "Content-Disposition": 'attachment; filename="wb2api-accounts.json"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+def _import_accounts(panel: Panel, req: Any) -> Response:
+    """导入账号（merge 语义：同 uid 覆盖，其余保留）。
+
+    ``delete`` 一类的破坏性合并故意不做：导入的用途是"换机器/重装后把号搬回来"，
+    不是同步删除。
+    """
+    panel.require(req)
+    body = req.json_body()
+    items = body.get("accounts") if isinstance(body, dict) else body
+    if not isinstance(items, list):
+        return error_response(400, "需要 {\"accounts\": [...]} 或直接给数组", "bad_request")
+    added = updated = skipped = 0
+    for raw in items[:500]:
+        if not isinstance(raw, dict):
+            skipped += 1
+            continue
+        try:
+            account = Account.from_dict(raw)
+        except Exception:  # 结构不认识的行跳过，别让一行坏数据毁掉整次导入
+            skipped += 1
+            continue
+        if not (account.uid or account.access_token or account.refresh_token):
+            skipped += 1
+            continue
+        account.ensure_ids()
+        existed = bool(account.uid) and panel.store.get_account(account.uid) is not None
+        panel.store.upsert_account(account)
+        if existed:
+            updated += 1
+        else:
+            added += 1
+    log.info("导入账号：新增 %d，更新 %d，跳过 %d", added, updated, skipped)
+    return json_response({"ok": True, "added": added, "updated": updated, "skipped": skipped})
 
 
 def _add_account(panel: Panel, req: Any) -> Response:

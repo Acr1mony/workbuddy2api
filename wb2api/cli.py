@@ -67,10 +67,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     accounts = sub.add_parser("accounts", help="账号管理（不需要面板）")
     accounts.add_argument(
         "action",
-        choices=("list", "test", "enable", "disable", "remove", "balance"),
-        help="list=列表 test=体检 enable/disable=启停 remove=删除 balance=查余额",
+        choices=("list", "test", "enable", "disable", "remove", "balance", "export", "import"),
+        help="list=列表 test=体检 enable/disable=启停 remove=删除 balance=查余额 export/import=备份与恢复",
     )
-    accounts.add_argument("target", nargs="?", default="all", help="uid / uid 前缀 / all")
+    accounts.add_argument("target", nargs="?", default="all", help="uid / uid 前缀 / all；import 时是备份文件路径")
+    accounts.add_argument("-o", "--output", default="", help="export 的输出文件（不给就打标准输出）")
     accounts.add_argument("--realm", default="", help="只处理这个域（cn/global）")
     accounts.add_argument("--model", default="", help="test 用的模型，默认取目录第一个")
     accounts.add_argument("--json", action="store_true", help="输出 JSON（给脚本用）")
@@ -121,14 +122,82 @@ def _state_of(service: Any, account: Any) -> str:
 
     if account.disabled:
         return "已禁用"
-    reason = unavailable_reason(account, "")
+    # unavailable_reason 返回的是 dict（reason/kind/remaining），不是字符串——
+    # 直接拿它做布尔判断会把每个可用账号都显示成"冷却"。
+    info = unavailable_reason(account, "")
+    reason = str(info.get("reason") or "")
     return f"冷却({reason})" if reason else "可用"
+
+
+def _export_accounts(service: Any, output: str = "") -> int:
+    """把账号（含 refresh token）导出成 JSON——备份用，不是"导出成可分享的东西"。"""
+    accounts = service.store.list_accounts("")
+    if not accounts:
+        print("没有账号可导出。")
+        return 1
+    payload = {
+        "version": 1,
+        "exported_at": time.time(),
+        "warning": "本文件含 refresh token，等同于账号密码。别提交到仓库，别贴到聊天软件里。",
+        "accounts": [account.to_dict() for account in accounts],
+    }
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    if output:
+        with open(output, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        print(f"已导出 {len(accounts)} 个账号 → {output}（含 refresh token，注意保管）")
+    else:
+        print(text)
+    return 0
+
+
+def _import_accounts(service: Any, path: str) -> int:
+    """从备份文件恢复账号。同 uid 覆盖，其余保留——导入不做删除。"""
+    if not path or path in ("all", "*") or not os.path.exists(path):
+        print(f"找不到备份文件：{path or '(未指定)'}")
+        return 1
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+    items = data.get("accounts") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        print("备份格式不对：需要 {\"accounts\": [...]} 或直接给数组。")
+        return 1
+    from .store import Account
+
+    added = updated = skipped = 0
+    for raw in items[:500]:
+        if not isinstance(raw, dict):
+            skipped += 1
+            continue
+        try:
+            account = Account.from_dict(raw)
+        except Exception:
+            skipped += 1
+            continue
+        if not (account.uid or account.access_token or account.refresh_token):
+            skipped += 1
+            continue
+        account.ensure_ids()
+        existed = bool(account.uid) and service.store.get_account(account.uid) is not None
+        service.store.upsert_account(account)
+        if existed:
+            updated += 1
+        else:
+            added += 1
+    print(f"导入完成：新增 {added}，更新 {updated}，跳过 {skipped}")
+    return 0
 
 
 def _accounts(cfg: Config, args: argparse.Namespace) -> int:
     from .probe import probe_account
 
     service = _service(cfg)
+
+    if args.action == "export":
+        return _export_accounts(service, getattr(args, "output", ""))
+    if args.action == "import":
+        return _import_accounts(service, args.target)
+
     accounts = _resolve(service, args.target, args.realm)
     if not accounts:
         print("没有匹配的账号。" if args.target in ("all", "", "*") else f"找不到账号：{args.target}")

@@ -1044,6 +1044,60 @@
       renderAccounts();
     });
 
+    // 备份：导出走 fetch 拿 blob（令牌走请求头，不进 URL/下载记录）
+    $("#acc-export").addEventListener("click", function () {
+      fetch("/api/accounts/export", { headers: { "X-Panel-Token": state.token || "" } })
+        .then(function (res) {
+          if (!res.ok) throw new Error("导出失败（HTTP " + res.status + "）");
+          return res.blob();
+        })
+        .then(function (blob) {
+          var url = URL.createObjectURL(blob);
+          var a = document.createElement("a");
+          a.href = url;
+          a.download = "wb2api-accounts.json";
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          setTimeout(function () { URL.revokeObjectURL(url); }, 2000);
+          toast("ok", "已导出", "文件里有 refresh token，等于账号密码，注意保管");
+        })
+        .catch(function (err) { toast("bad", "导出失败", err.message || ""); });
+    });
+
+    $("#acc-import").addEventListener("click", function () {
+      $("#acc-import-file").click();
+    });
+
+    $("#acc-import-file").addEventListener("change", function () {
+      var file = this.files && this.files[0];
+      this.value = "";
+      if (!file) return;
+      var reader = new FileReader();
+      reader.onload = function () {
+        var accounts;
+        try {
+          var parsed = JSON.parse(String(reader.result || ""));
+          accounts = Array.isArray(parsed) ? parsed : parsed && parsed.accounts;
+        } catch (err) {
+          toast("bad", "文件不是合法 JSON", err.message || "");
+          return;
+        }
+        if (!Array.isArray(accounts)) {
+          toast("bad", "文件里没有 accounts 数组", "");
+          return;
+        }
+        api("/api/accounts/import", { body: { accounts: accounts } })
+          .then(function (res) {
+            toast("ok", "已导入", "新增 " + res.added + "，更新 " + res.updated + "，跳过 " + res.skipped);
+            return loadAccounts();
+          })
+          .catch(function (err) { toast("bad", "导入失败", err.message || ""); });
+      };
+      reader.onerror = function () { toast("bad", "读文件失败", ""); };
+      reader.readAsText(file);
+    });
+
     $("#acc-check-all").addEventListener("change", function () {
       var checked = this.checked;
       var start = (state.pageNo - 1) * state.pageSize;
