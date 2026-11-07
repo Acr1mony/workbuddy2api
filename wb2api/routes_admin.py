@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import hmac
+import random
 import time
 from typing import Any, Dict, List, Optional
 
@@ -29,6 +30,11 @@ log = get_logger("panel")
 
 LOGIN_WINDOW = 60.0
 LOGIN_MAX_ATTEMPTS = 5
+
+# Bulk-capable actions, and the subset that talks to the upstream (those get
+# spaced out — a batch is still a burst from one egress IP).
+BULK_ACTIONS = ("enable", "disable", "test", "refresh", "balance")
+SLOW_ACTIONS = ("test", "refresh", "balance")
 
 
 class Panel:
@@ -90,6 +96,7 @@ def register(router: Router, panel: Panel) -> None:
     router.add("POST", r"/api/accounts/set", lambda req: _set_account(panel, req))
     router.add("POST", r"/api/accounts/login/start", lambda req: _login_start(panel, req))
     router.add("GET", r"/api/accounts/login/poll", lambda req: _login_poll(panel, req))
+    router.add("POST", r"/api/accounts/bulk", lambda req: _bulk_action(panel, req))
     router.add(
         "POST",
         r"/api/accounts/(?P<uid>[^/]+)/(?P<action>enable|disable|delete|test|refresh|checkin|balance)",
@@ -277,6 +284,81 @@ def _account_action(panel: Panel, req: Any, uid: str, action: str) -> Response:
     return error_response(400, f"未知操作 {action}", "bad_action")
 
 
+def _bulk_action(panel: Panel, req: Any) -> Response:
+    """Run one action over many accounts.
+
+    The panel used to need one click per account to test/refresh a pool of
+    forty. Doing that by hand is how people end up writing a shell loop that
+    hits the upstreams all at once — so this walks the list one at a time and
+    reports per-account results instead of failing the whole batch.
+    """
+    panel.require(req)
+    body = req.json_body()
+    action = str(body.get("action") or "")
+    if action not in BULK_ACTIONS:
+        return error_response(400, f"未知批量操作 {action}", "bad_action")
+    uids = body.get("uids")
+    if not isinstance(uids, list):
+        uids = []
+    if not uids and body.get("all"):
+        realm = identity.normalize_realm(body.get("realm")) if body.get("realm") else ""
+        uids = [account.uid for account in panel.store.list_accounts(realm)]
+    uids = [str(uid) for uid in uids[:200]]
+    if not uids:
+        return error_response(400, "没有选中账号", "empty_selection")
+
+    results: List[Dict[str, Any]] = []
+    ok_count = 0
+    for index, uid in enumerate(uids):
+        account = panel.store.get_account(uid)
+        if account is None:
+            results.append({"uid": uid, "ok": False, "detail": "账号不存在"})
+            continue
+        # Network-bound actions get the same spacing the scheduler uses: a batch
+        # of forty "test" calls fired in one millisecond is a burst from one IP.
+        if action in SLOW_ACTIONS and index:
+            time.sleep(random.uniform(0.8, 2.0))
+        try:
+            result = _bulk_one(panel, account, action)
+        except Exception as exc:  # one bad account must not abort the batch
+            result = {"uid": uid, "ok": False, "detail": str(exc)}
+        result.setdefault("uid", uid)
+        ok_count += 1 if result.get("ok") else 0
+        results.append(result)
+
+    return json_response(
+        {"ok": ok_count == len(results), "action": action, "total": len(results), "ok_count": ok_count, "results": results}
+    )
+
+
+def _bulk_one(panel: Panel, account: Account, action: str) -> Dict[str, Any]:
+    if action == "enable":
+        account.enabled = True
+        panel.store.upsert_account(account)
+        return {"ok": True, "detail": "已启用"}
+    if action == "disable":
+        account.enabled = False
+        panel.store.upsert_account(account)
+        return {"ok": True, "detail": "已禁用"}
+    if action == "test":
+        ok, detail = probe_account(panel.service, account)
+        note = detail.get("sample") or detail.get("error") or ""
+        return {"ok": ok, "detail": note, "model": detail.get("model")}
+    if action == "refresh":
+        panel.auth.refresh(account, force=True)
+        panel.store.upsert_account(account)
+        return {"ok": True, "detail": "令牌已续期", "expires_at": account.expires_at}
+    if action == "balance":
+        value = panel.billing.credits(account, account.realm)
+        if value is not None:
+            account.credit = value
+            account.credit_at = util.now()
+            panel.store.upsert_account(account)
+        # unknown is not zero: the account is fine, we just could not read it
+        return {"ok": value is not None, "detail": "读不到余额" if value is None else f"{value:.2f}", "credits": value}
+    return {"ok": False, "detail": f"批量不支持 {action}"}
+
+
 def _test(panel: Panel, account: Account) -> Response:
     """用一次最小请求确认账号真的能用（实现见 ``probe.py``，CLI 共用）。"""
     ok, detail = probe_account(panel.service, account)
@@ -333,8 +415,108 @@ def _settings_get(panel: Panel, req: Any) -> Response:
             "pool": cfg.get("pool.strategy"),
             "prompt_mode": cfg.get("prompt.mode"),
             "listen": cfg.get("listen"),
+            # Editable pool/schedule knobs. Values are strings-or-numbers exactly
+            # as the config holds them (durations stay human: "30m", "200ms").
+            "tunables": _tunables(panel),
         }
     )
+
+
+# (config path, label, kind, restart_required)
+# kind: "int" | "float" | "duration" | "str"
+TUNABLES = (
+    ("pool.max_in_flight", "同账号并发上限", "int", False),
+    ("pool.max_in_flight_global", "global 域并发上限", "int", False),
+    ("pool.credit_floor", "余额闸门（0=关闭；低于此值不发收费模型）", "float", False),
+    ("pool.min_request_interval", "同账号最小请求间隔", "duration", False),
+    ("pool.waf_cooldown", "WAF 软避让", "duration", False),
+    ("pool.breaker_threshold", "熔断阈值（连续失败次数）", "int", False),
+    ("pool.breaker_cooldown", "熔断首档时长", "duration", False),
+    ("pool.restriction_hold_seconds", "整域暂停时长（触发风控连坐时）", "duration", False),
+    ("pool.strategy.cn", "cn 域选号策略", "str", False),
+    ("pool.strategy.global", "global 域选号策略", "str", False),
+    ("session_sticky.ttl", "会话粘滞有效期", "duration", False),
+    ("schedule.keepalive_minutes", "令牌保活间隔（分钟）", "int", False),
+    ("schedule.balance_minutes", "余额刷新间隔（分钟）", "int", False),
+    ("schedule.checkin_hour", "每日签到小时（0-23）", "int", False),
+    ("upstream.timeout_seconds", "上游响应超时（秒）", "float", False),
+    ("upstream.idle_timeout_seconds", "流式空闲超时（秒）", "float", False),
+    ("server.max_payload_mb", "请求体上限（MB）", "float", True),
+)
+
+
+def _tunables(panel: Panel) -> List[Dict[str, Any]]:
+    """Current values plus enough metadata for the panel to render inputs."""
+    out: List[Dict[str, Any]] = []
+    for path, label, kind, restart in TUNABLES:
+        out.append(
+            {
+                "path": path,
+                "label": label,
+                "kind": kind,
+                "restart": restart,
+                "value": panel.cfg.get(path),
+            }
+        )
+    return out
+
+
+def _coerce_tunable(path: str, kind: str, raw: Any) -> Any:
+    """Validate one tunable; raises ValueError with a human message."""
+    if kind == "duration":
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            if raw <= 0:
+                raise ValueError("时长必须大于 0")
+            return f"{int(raw)}s"
+        text = str(raw or "").strip()
+        if not text:
+            raise ValueError("时长不能为空")
+        parsed = util.parse_duration(text, -1)
+        if parsed is None or parsed < 0:
+            raise ValueError(f"看不懂的时长：{text}（试 30s / 10m / 2h）")
+        return text
+    if kind == "int":
+        try:
+            value = int(str(raw).strip())
+        except (TypeError, ValueError):
+            raise ValueError("需要整数")
+        if value < 0:
+            raise ValueError("不能是负数")
+        if path == "schedule.checkin_hour" and value > 23:
+            raise ValueError("小时需在 0-23 之间")
+        return value
+    if kind == "float":
+        try:
+            value = float(str(raw).strip())
+        except (TypeError, ValueError):
+            raise ValueError("需要数字")
+        if value < 0:
+            raise ValueError("不能是负数")
+        return value
+    text = str(raw or "").strip()
+    if path.startswith("pool.strategy.") and text not in ("weighted_random", "round_robin", "sequential_exhaust"):
+        raise ValueError("策略只能是 weighted_random / round_robin / sequential_exhaust")
+    return text
+
+
+def _apply_tunables(panel: Panel, raw: Any) -> Optional[Response]:
+    """Write ``{"tunables": {"pool.max_in_flight": 3, ...}}``; returns an error response on bad input."""
+    if not isinstance(raw, dict):
+        return None
+    known = {path: (kind, restart) for path, _label, kind, restart in TUNABLES}
+    cleaned: Dict[str, Any] = {}
+    for path, value in raw.items():
+        path = str(path)
+        if path not in known:
+            continue  # silently ignore unknown keys: forward compatibility
+        kind, _restart = known[path]
+        try:
+            cleaned[path] = _coerce_tunable(path, kind, value)
+        except ValueError as exc:
+            return error_response(400, f"{path}：{exc}", "bad_value")
+    for path, value in cleaned.items():
+        panel.cfg.set(path, value)
+    return None
 
 
 def _normalize_key_items(value: Any) -> List[Dict[str, Any]]:
@@ -397,6 +579,10 @@ def _settings_post(panel: Panel, req: Any) -> Response:
         cfg.set("api_key", str(body["api_key"] or ""))
     if "listen" in body:
         cfg.set("listen", str(body["listen"]))
+    if "tunables" in body:
+        bad = _apply_tunables(panel, body["tunables"])
+        if bad is not None:
+            return bad
     cfg.save()
 
     added: List[Dict[str, Any]] = []

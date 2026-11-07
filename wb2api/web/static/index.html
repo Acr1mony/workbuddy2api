@@ -3,51 +3,264 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>workbuddy2api</title>
+<title>workbuddy2api 控制台</title>
 <link rel="stylesheet" href="/panel/style.css">
 </head>
 <body>
-<div id="login" class="login hidden">
-  <form class="card" id="login-form">
+
+<!-- 登录 -->
+<div class="login-wrap" id="login-view" hidden>
+  <form class="login-card" id="login-form" autocomplete="off">
     <h1>workbuddy2api</h1>
-    <p class="muted">输入面板密码</p>
-    <input id="password" type="password" placeholder="密码" autocomplete="current-password" required>
-    <button type="submit">登录</button>
-    <p class="error" id="login-error"></p>
+    <p class="muted tiny" style="margin:0 0 6px">控制台登录 · 面板密码</p>
+    <input type="password" id="login-password" placeholder="面板密码" autocomplete="current-password" required>
+    <button type="submit" id="login-submit">登录</button>
+    <p class="muted tiny" id="login-error" style="margin:0;color:var(--bad)" hidden></p>
   </form>
 </div>
 
-<div id="app" class="hidden">
-  <header>
-    <div class="brand">workbuddy2api <span id="version" class="muted"></span></div>
-    <nav>
-      <button class="tab active" data-tab="dashboard">概览</button>
-      <button class="tab" data-tab="accounts">账号</button>
-      <button class="tab" data-tab="settings">设置</button>
+<!-- 主界面 -->
+<div id="app-view" hidden>
+
+  <div class="warn-banner" id="default-pw-banner" hidden>
+    面板仍在用默认密码 <code>admin</code>，任何能访问本端口的人都能改配置——
+    <a href="#settings">去设置里改掉</a>。
+  </div>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot" id="health-dot"></span>
+      <strong>workbuddy2api</strong>
+      <span class="muted tiny" id="version-label"></span>
+    </div>
+    <nav class="tabs" id="tabs">
+      <a href="#overview" data-page="overview">概览</a>
+      <a href="#accounts" data-page="accounts">账号</a>
+      <a href="#usage" data-page="usage">用量</a>
+      <a href="#logs" data-page="logs">日志</a>
+      <a href="#settings" data-page="settings">设置</a>
     </nav>
-    <button id="logout" class="ghost">退出</button>
+    <div class="topbar-right">
+      <span class="muted tiny" id="updated-at"></span>
+      <button class="ghost tiny-btn" id="refresh-btn" title="立即刷新">刷新</button>
+      <button class="ghost tiny-btn" id="logout-btn">退出</button>
+    </div>
   </header>
 
   <main>
-    <section id="tab-dashboard" class="tab-panel active">
-      <div class="kpis">
-        <div class="kpi"><span class="label">请求</span><strong id="kpi-requests">-</strong></div>
-        <div class="kpi"><span class="label">错误</span><strong id="kpi-errors">-</strong></div>
-        <div class="kpi"><span class="label">Tokens</span><strong id="kpi-tokens">-</strong></div>
-        <div class="kpi"><span class="label">平均延迟</span><strong id="kpi-latency">-</strong></div>
-        <div class="kpi"><span class="label">缓存命中</span><strong id="kpi-cache">-</strong></div>
+
+    <!-- ============ 概览 ============ -->
+    <section id="page-overview" hidden>
+      <div class="kpis" id="kpis"></div>
+
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-head">
+            <h2>账号池</h2>
+            <span class="muted tiny" id="pool-strategy"></span>
+          </div>
+          <div id="pool-body"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>调度任务</h2>
+            <div class="row-actions">
+              <span class="muted tiny" id="sched-state"></span>
+              <button class="ghost tiny-btn" id="sched-run-btn" title="立刻跑一轮（不会等待上一轮结束）">立即执行</button>
+            </div>
+          </div>
+          <div class="job-list" id="sched-body"></div>
+        </div>
       </div>
 
-      <div class="grid">
+      <div class="card">
+        <div class="card-head">
+          <h2>最近请求</h2>
+          <div class="row-actions">
+            <span class="muted tiny" id="recent-note"></span>
+            <button class="ghost tiny-btn" id="recent-copy-btn">复制全部</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="data" id="recent-table">
+            <thead>
+              <tr>
+                <th>时间</th><th>模型</th><th>账号</th><th>结果</th>
+                <th class="num">耗时</th><th class="num">首字</th>
+                <th class="num">输入</th><th class="num">输出</th>
+                <th class="num">缓存</th><th class="num">积分</th><th>错误</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 账号 ============ -->
+    <section id="page-accounts" hidden>
+      <div class="card">
+        <div class="card-head">
+          <h2>账号</h2>
+          <div class="row-actions">
+            <span class="muted tiny" id="acc-summary"></span>
+            <button class="ghost tiny-btn" id="acc-add-toggle">添加账号</button>
+          </div>
+        </div>
+
+        <!-- 添加账号 -->
+        <div class="add-panel" id="acc-add-panel" hidden>
+          <div class="add-tabs" id="add-tabs">
+            <button type="button" data-mode="link" class="active">登录链接（推荐）</button>
+            <button type="button" data-mode="refresh">贴 refresh token</button>
+            <button type="button" data-mode="access">贴 access token</button>
+          </div>
+
+          <div id="add-link">
+            <p class="muted tiny" style="margin:0 0 8px">
+              选一个域生成登录链接，在浏览器里打开并完成授权，本页会自动把账号收进来。
+            </p>
+            <div class="inline">
+              <select id="add-realm">
+                <option value="cn">cn（copilot.tencent.com / codebuddy.cn）</option>
+                <option value="global">global（workbuddy.ai）</option>
+              </select>
+              <button id="add-link-start">生成登录链接</button>
+              <span class="muted tiny" id="add-link-state"></span>
+            </div>
+            <div class="inline" id="add-link-result" hidden>
+              <input type="text" id="add-link-url" readonly>
+              <button class="ghost" id="add-link-open">打开</button>
+              <button class="ghost" id="add-link-copy">复制</button>
+              <button class="ghost danger" id="add-link-cancel">取消</button>
+            </div>
+          </div>
+
+          <div id="add-refresh" hidden>
+            <div class="inline">
+              <select id="add-refresh-realm">
+                <option value="cn">cn</option>
+                <option value="global">global</option>
+              </select>
+              <input type="password" id="add-refresh-token" placeholder="refreshToken（一长串，通常 40+ 字符）" autocomplete="off">
+              <button id="add-refresh-submit">添加</button>
+            </div>
+            <p class="muted tiny" style="margin:6px 0 0">
+              从已登录的 WorkBuddy / CodeBuddy 客户端里读 <code>refreshToken</code>。它是一次性的：
+              网关拿到后会立刻换掉旧值，别在别处再用同一个。
+            </p>
+          </div>
+
+          <div id="add-access" hidden>
+            <div class="inline">
+              <select id="add-access-realm">
+                <option value="cn">cn</option>
+                <option value="global">global</option>
+              </select>
+              <input type="password" id="add-access-token" placeholder="accessToken（短期，几小时内就会过期）" autocomplete="off">
+              <button id="add-access-submit">添加</button>
+            </div>
+            <p class="muted tiny" style="margin:6px 0 0">
+              只贴 accessToken 的账号过期后需要手动续期；有 refreshToken 才能自动保活。
+            </p>
+          </div>
+        </div>
+
+        <!-- 工具条 -->
+        <div class="toolbar">
+          <input type="search" id="acc-search" placeholder="搜索昵称 / uid / 备注 / 分组…">
+          <div class="chips" id="acc-status-chips">
+            <button type="button" data-status="all" class="active">全部</button>
+            <button type="button" data-status="ready">可用</button>
+            <button type="button" data-status="cooling">冷却中</button>
+            <button type="button" data-status="disabled">已停用</button>
+          </div>
+          <select id="acc-realm-filter">
+            <option value="">所有域</option>
+            <option value="cn">cn</option>
+            <option value="global">global</option>
+          </select>
+          <select id="acc-sort">
+            <option value="state">按状态排序</option>
+            <option value="credit">按余额排序</option>
+            <option value="nickname">按昵称排序</option>
+            <option value="last_used_at">按最近使用排序</option>
+          </select>
+        </div>
+
+        <!-- 批量操作条 -->
+        <div class="bulkbar" id="bulkbar" hidden>
+          已选 <strong id="bulk-count">0</strong> 个：
+          <button class="ghost tiny-btn" data-bulk="test">测试</button>
+          <button class="ghost tiny-btn" data-bulk="refresh">续期</button>
+          <button class="ghost tiny-btn" data-bulk="balance">查额度</button>
+          <button class="ghost tiny-btn" data-bulk="enable">启用</button>
+          <button class="ghost tiny-btn" data-bulk="disable">停用</button>
+          <button class="ghost tiny-btn" data-bulk="clear">取消选择</button>
+        </div>
+
+        <div class="table-wrap">
+          <table class="data" id="acc-table">
+            <thead>
+              <tr>
+                <th class="check"><input type="checkbox" id="acc-check-all" title="全选本页"></th>
+                <th>账号</th>
+                <th>状态</th>
+                <th class="num">余额</th>
+                <th class="num">令牌</th>
+                <th>备注 / 分组 / 权重</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="pager" id="acc-pager"></div>
+      </div>
+    </section>
+
+    <!-- ============ 用量 ============ -->
+    <section id="page-usage" hidden>
+      <div class="kpis" id="usage-kpis"></div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>按模型</h2>
+          <span class="muted tiny" id="usage-retention"></span>
+        </div>
+        <div class="table-wrap">
+          <table class="data" id="usage-model-table">
+            <thead>
+              <tr>
+                <th>模型</th><th class="num">请求</th><th class="num">输入</th>
+                <th class="num">输出</th><th class="num">缓存命中</th><th class="num">积分</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="grid-2">
         <div class="card">
-          <h2>账号池</h2>
-          <div id="pool" class="pool"></div>
+          <div class="card-head"><h2>按账号</h2></div>
+          <div class="table-wrap">
+            <table class="data" id="usage-account-table">
+              <thead>
+                <tr><th>账号</th><th class="num">请求</th><th class="num">积分</th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
         </div>
         <div class="card">
-          <h2>最近请求</h2>
-          <div class="scroll">
-            <table id="recent">
-              <thead><tr><th>时间</th><th>模型</th><th>账号</th><th>状态</th><th>耗时</th><th>Tokens</th></tr></thead>
+          <div class="card-head"><h2>按 API key</h2></div>
+          <div class="table-wrap">
+            <table class="data" id="usage-key-table">
+              <thead>
+                <tr><th>key</th><th class="num">请求</th><th class="num">积分</th></tr>
+              </thead>
               <tbody></tbody>
             </table>
           </div>
@@ -55,119 +268,120 @@
       </div>
 
       <div class="card">
-        <h2>按模型</h2>
-        <div class="scroll">
-          <table id="by-model">
-            <thead><tr><th>模型</th><th>请求</th><th>错误</th><th>Tokens</th></tr></thead>
+        <div class="card-head"><h2>按天</h2></div>
+        <div class="table-wrap">
+          <table class="data" id="usage-day-table">
+            <thead>
+              <tr>
+                <th>日期</th><th class="num">请求</th><th class="num">失败</th>
+                <th class="num">输入</th><th class="num">输出</th><th class="num">积分</th>
+              </tr>
+            </thead>
             <tbody></tbody>
           </table>
         </div>
       </div>
     </section>
 
-    <section id="tab-accounts" class="tab-panel">
-      <div class="toolbar">
-        <select id="realm-filter">
-          <option value="">全部域</option>
-          <option value="cn">CN</option>
-          <option value="global">Global</option>
-        </select>
-        <button id="refresh-accounts" class="ghost">刷新列表</button>
-        <button id="show-add">添加账号</button>
-      </div>
-
-      <div class="card hidden" id="add-panel">
-        <h2>添加账号</h2>
-        <div class="row">
-          <label>域
-            <select id="add-realm">
-              <option value="cn">CN（copilot.tencent.com）</option>
-              <option value="global">Global（workbuddy.ai）</option>
+    <!-- ============ 日志 ============ -->
+    <section id="page-logs" hidden>
+      <div class="card">
+        <div class="card-head">
+          <h2>运行日志</h2>
+          <div class="row-actions">
+            <select id="log-lines">
+              <option value="200">200 行</option>
+              <option value="500" selected>500 行</option>
+              <option value="1000">1000 行</option>
+              <option value="2000">2000 行</option>
             </select>
+            <button class="ghost tiny-btn" id="log-copy-btn">复制</button>
+            <button class="ghost tiny-btn" id="log-refresh-btn">刷新</button>
+          </div>
+        </div>
+        <div class="toolbar">
+          <input type="search" id="log-search" placeholder="过滤（支持正则写法，例如 error|WARN）">
+          <label class="muted tiny"><input type="checkbox" id="log-follow" checked> 自动刷新（3s）</label>
+        </div>
+        <pre class="log" id="log-body"></pre>
+      </div>
+    </section>
+
+    <!-- ============ 设置 ============ -->
+    <section id="page-settings" hidden>
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-head"><h2>网关</h2></div>
+          <label class="field">监听地址
+            <input type="text" id="set-listen" placeholder="127.0.0.1:8788">
           </label>
-          <label>备注 <input id="add-note" placeholder="可选"></label>
+          <label class="field">默认 API key（客户端不带 key 时用它；留空表示开放模式）
+            <input type="password" id="set-api-key" placeholder="留空 = 不设默认 key" autocomplete="off">
+          </label>
+          <label class="field">面板密码
+            <input type="password" id="set-panel-password" placeholder="留空 = 不修改" autocomplete="new-password">
+          </label>
+          <button id="set-save">保存</button>
         </div>
-        <label>refresh token
-          <textarea id="add-refresh" rows="2" placeholder="粘贴 refresh token（推荐，可自动续期）"></textarea>
-        </label>
-        <label>或 access token
-          <textarea id="add-access" rows="2" placeholder="粘贴 access token（过期后需手动替换）"></textarea>
-        </label>
-        <div class="row">
-          <button id="add-submit">保存</button>
-          <button id="login-by-url" class="ghost">用登录链接添加</button>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>客户端密钥</h2>
+            <span class="muted tiny" id="keys-note"></span>
+          </div>
+          <div class="table-wrap">
+            <table class="data" id="keys-table">
+              <thead>
+                <tr><th>名称</th><th>key</th><th>域</th><th>模型</th><th></th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <p class="tiny created" id="key-created" hidden></p>
+          <div class="inline">
+            <input type="text" id="key-name" placeholder="名称（例如 laptop）">
+            <select id="key-realm">
+              <option value="">跟随请求</option>
+              <option value="cn">cn</option>
+              <option value="global">global</option>
+            </select>
+            <input type="text" id="key-models" placeholder="限定模型，逗号分隔，可写 deepseek*">
+            <button id="key-add">新增</button>
+          </div>
+          <p class="muted tiny" style="margin:6px 0 0">
+            新建后**明文只显示这一次**，列表里永远是打码值，请立刻复制保存。
+          </p>
         </div>
-        <div id="login-flow" class="hidden">
-          <ol>
-            <li>在浏览器打开下面这条链接并完成登录：</li>
-            <li><a id="login-url" href="#" target="_blank" rel="noreferrer"></a></li>
-            <li>本页会自动轮询，成功后账号出现在列表里。</li>
-          </ol>
-          <p class="muted" id="login-state"></p>
-        </div>
-        <p class="error" id="add-error"></p>
       </div>
 
       <div class="card">
-        <div class="scroll">
-          <table id="accounts">
-            <thead><tr>
-              <th>昵称</th><th>域</th><th>额度</th><th>令牌到期</th><th>状态</th><th>操作</th>
-            </tr></thead>
-            <tbody></tbody>
-          </table>
+        <div class="card-head">
+          <h2>调优参数</h2>
+          <span class="muted tiny">改完立刻生效；标注"需重启"的要重启进程</span>
         </div>
+        <div class="tunables" id="tunables"></div>
+        <button id="tunables-save">保存调优参数</button>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>提示词模式</h2></div>
+        <label class="field">出站请求体净化
+          <select id="set-prompt-mode">
+            <option value="passthrough">passthrough（原样转发，用户 prompt 一字不改）</option>
+            <option value="sanitize">sanitize（改掉会被上游逐字拒绝的模板句/键名）</option>
+          </select>
+        </label>
+        <p class="muted tiny" style="margin:0">
+          上游的风控是按字面量匹配的：请求里出现某些固定句子或键名会被整单拒绝（400 <code>11-128</code>）。
+          sanitize 只做最小改写，但确实会动到你自己写的 prompt。
+        </p>
       </div>
     </section>
 
-    <section id="tab-settings" class="tab-panel">
-      <div class="card">
-        <h2>网关</h2>
-        <label>监听地址 <input id="set-listen" placeholder="127.0.0.1:8788"></label>
-        <label>默认 API key（留空 = 本机免鉴权）
-          <input id="set-apikey" placeholder="sk-...">
-        </label>
-        <label>prompt 模式
-          <select id="set-prompt">
-            <option value="passthrough">passthrough（原样转发）</option>
-            <option value="sanitize">sanitize（改写疑似指纹句）</option>
-          </select>
-        </label>
-        <p class="muted">sanitize 会把请求里疑似 Anthropic/Codex 客户端标识的句子改一个词——上游是逐字匹配的，但改写用户 prompt 始终有代价，默认关闭。</p>
-        <button id="save-gateway">保存</button>
-      </div>
-
-      <div class="card">
-        <h2>客户端密钥</h2>
-        <div class="scroll">
-          <table id="keys">
-            <thead><tr><th>名称</th><th>Key</th><th>域</th><th>模型</th><th>请求</th><th></th></tr></thead>
-            <tbody></tbody>
-          </table>
-        </div>
-        <div class="row">
-          <input id="key-name" placeholder="名称">
-          <input id="key-models" placeholder="模型白名单，如 deepseek* , gpt-*（留空=全部）">
-          <select id="key-realm">
-            <option value="">跟随请求</option>
-            <option value="cn">仅 CN</option>
-            <option value="global">仅 Global</option>
-          </select>
-          <button id="add-key">新增</button>
-        </div>
-        <p class="muted" id="key-created" hidden></p>
-      </div>
-
-      <div class="card">
-        <h2>面板密码</h2>
-        <label>新密码 <input id="set-password" type="password" placeholder="至少 6 位"></label>
-        <button id="save-password">修改</button>
-      </div>
-      <p class="error" id="settings-error"></p>
-    </section>
   </main>
 </div>
 
+<div class="toasts" id="toasts"></div>
 <script src="/panel/app.js"></script>
 </body>
 </html>

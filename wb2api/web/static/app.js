@@ -1,463 +1,1147 @@
-// workbuddy2api 面板。零构建：一个文件、无框架、直接跑。
-// 约定：所有请求都过 api()，它负责带令牌、解析 JSON、把错误冒泡到页面提示。
+/* workbuddy2api 控制台 —— 零构建、零依赖。
+   状态全在内存里，刷新即重建；只有面板令牌存 localStorage。
+   URL hash 决定当前页，刷新不会丢 tab。 */
 
-const TOKEN_KEY = "wb2a_panel_token";
+(function () {
+  "use strict";
 
-const state = {
-  token: localStorage.getItem(TOKEN_KEY) || "",
-  accounts: [],
-  settings: null,
-  pollTimer: null,
-  refreshTimer: null,
-};
+  // ---------------- 基础状态 ----------------
 
-const $ = (sel) => document.querySelector(sel);
-const $$ = (sel) => Array.from(document.querySelectorAll(sel));
+  var TOKEN_KEY = "wb2a_panel_token";
+  var PAGES = ["overview", "accounts", "usage", "logs", "settings"];
 
-function fmtNum(value) {
-  const n = Number(value || 0);
-  if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
-  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
-  if (n >= 1e4) return (n / 1e3).toFixed(1) + "k";
-  return String(Math.round(n));
-}
-
-function fmtDuration(seconds) {
-  const s = Math.max(0, Math.round(Number(seconds || 0)));
-  if (s < 60) return s + "s";
-  if (s < 3600) return Math.round(s / 60) + "m";
-  if (s < 86400) return Math.round(s / 3600) + "h";
-  return Math.round(s / 86400) + "d";
-}
-
-function fmtTime(epoch) {
-  if (!epoch) return "-";
-  const d = new Date(Number(epoch) * 1000);
-  return d.toLocaleString("zh-CN", { hour12: false });
-}
-
-function escapeHtml(text) {
-  return String(text == null ? "" : text)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-async function api(path, options = {}) {
-  const headers = Object.assign({ "Content-Type": "application/json" }, options.headers || {});
-  if (state.token) headers["X-Panel-Token"] = state.token;
-  const response = await fetch(path, Object.assign({}, options, { headers }));
-  const text = await response.text();
-  let data = null;
-  try { data = text ? JSON.parse(text) : null; } catch (_) { data = { raw: text }; }
-  if (!response.ok) {
-    if (response.status === 401) showLogin();
-    const message = (data && data.error && data.error.message) || ("HTTP " + response.status);
-    throw new Error(message);
-  }
-  return data;
-}
-
-// ---------------------------------------------------------------- 启动
-
-async function boot() {
-  let status = {};
-  try { status = await api("/panel/status"); } catch (_) { status = {}; }
-  if (!status.enabled) {
-    document.body.innerHTML = '<div class="login"><div class="card"><h1>面板未启用</h1><p class="muted">在配置里把 panel.enabled 设为 true 后重启网关。</p></div></div>';
-    return;
-  }
-  $("#version").textContent = status.version || "";
-  if (status.authenticated) {
-    await enterApp(status);
-  } else {
-    showLogin();
-  }
-}
-
-function showLogin() {
-  state.token = "";
-  localStorage.removeItem(TOKEN_KEY);
-  $("#app").classList.add("hidden");
-  $("#login").classList.remove("hidden");
-  clearInterval(state.refreshTimer);
-  $("#password").focus();
-}
-
-async function enterApp(status) {
-  $("#login").classList.add("hidden");
-  $("#app").classList.remove("hidden");
-  if (status && status.is_default_password) {
-    console.warn("面板正在使用默认密码 admin，请尽快修改。");
-  }
-  switchTab("dashboard");
-  await Promise.all([loadDashboard(), loadSettings()]);
-  clearInterval(state.refreshTimer);
-  state.refreshTimer = setInterval(() => {
-    if ($("#tab-dashboard").classList.contains("active")) loadDashboard();
-  }, 5000);
-}
-
-// ---------------------------------------------------------------- 概览
-
-async function loadDashboard() {
-  try {
-    const [usage, pool, recent] = await Promise.all([
-      api("/api/usage"),
-      api("/api/pool"),
-      api("/api/usage/recent?limit=30"),
-    ]);
-    renderKpis(usage.total || {});
-    renderPool(pool);
-    renderRecent(recent.items || []);
-    renderByModel(usage.by_model || {});
-  } catch (error) {
-    console.warn("概览刷新失败", error);
-  }
-}
-
-function renderKpis(total) {
-  $("#kpi-requests").textContent = fmtNum(total.requests);
-  $("#kpi-errors").textContent = fmtNum(total.errors);
-  $("#kpi-tokens").textContent = fmtNum((total.prompt_tokens || 0) + (total.completion_tokens || 0));
-  $("#kpi-latency").textContent = (total.avg_latency_ms || 0).toFixed(0) + " ms";
-  $("#kpi-cache").textContent = Math.round((total.cache_hit_rate || 0) * 100) + "%";
-}
-
-function renderPool(pool) {
-  const total = Math.max(1, pool.total || 0);
-  const seg = (value, cls) => `<span class="${cls}" style="width:${(value / total) * 100}%"></span>`;
-  const holds = [];
-  if (pool.hold_cn_remaining) holds.push(`CN 风控暂停 ${fmtDuration(pool.hold_cn_remaining)}`);
-  if (pool.hold_global_remaining) holds.push(`Global 风控暂停 ${fmtDuration(pool.hold_global_remaining)}`);
-  $("#pool").innerHTML = `
-    <div class="pool-row"><span class="muted">容量</span>
-      <div class="bar">${seg(pool.ready, "ready")}${seg(pool.cooling, "cooling")}${seg(pool.disabled, "dead")}</div>
-    </div>
-    <div class="muted">可用 ${pool.ready || 0} · 冷却 ${pool.cooling || 0} · 停用 ${pool.disabled || 0} · 并发中 ${pool.in_flight || 0}</div>
-    <div class="muted">额度合计 ${pool.credits || 0}${pool.credit_unknown ? `（${pool.credit_unknown} 个未知）` : ""}</div>
-    <div class="muted">策略 CN=${escapeHtml((pool.strategy || {}).cn || "-")} · Global=${escapeHtml((pool.strategy || {}).global || "-")}</div>
-    ${holds.length ? `<div class="badge warn">${escapeHtml(holds.join("；"))}</div>` : ""}
-  `;
-}
-
-function renderRecent(items) {
-  const body = $("#recent tbody");
-  if (!items.length) {
-    body.innerHTML = '<tr><td colspan="6" class="muted">还没有请求</td></tr>';
-    return;
-  }
-  body.innerHTML = items.map((row) => {
-    const status = Number(row.status || 0);
-    const cls = status >= 400 ? "err" : row.outcome === "completed" ? "ok" : "warn";
-    const tokens = (Number(row.prompt_tokens || 0) + Number(row.completion_tokens || 0));
-    return `<tr>
-      <td>${escapeHtml(fmtTime(row.at))}</td>
-      <td>${escapeHtml(row.model || "-")}</td>
-      <td>${escapeHtml(row.account || "-")}</td>
-      <td><span class="badge ${cls}">${escapeHtml(row.outcome || status)}</span></td>
-      <td>${fmtNum(row.elapsed_ms)} ms</td>
-      <td>${fmtNum(tokens)}</td>
-    </tr>`;
-  }).join("");
-}
-
-function renderByModel(byModel) {
-  const rows = Object.entries(byModel).sort((a, b) => (b[1].requests || 0) - (a[1].requests || 0));
-  const body = $("#by-model tbody");
-  if (!rows.length) {
-    body.innerHTML = '<tr><td colspan="4" class="muted">暂无数据</td></tr>';
-    return;
-  }
-  body.innerHTML = rows.map(([model, bucket]) => `<tr>
-    <td>${escapeHtml(model)}</td>
-    <td>${fmtNum(bucket.requests)}</td>
-    <td>${fmtNum(bucket.errors)}</td>
-    <td>${fmtNum((bucket.prompt_tokens || 0) + (bucket.completion_tokens || 0))}</td>
-  </tr>`).join("");
-}
-
-// ---------------------------------------------------------------- 账号
-
-async function loadAccounts() {
-  const realm = $("#realm-filter").value;
-  const data = await api("/api/accounts" + (realm ? "?realm=" + encodeURIComponent(realm) : ""));
-  state.accounts = data.accounts || [];
-  renderAccounts();
-}
-
-function accountStatus(row) {
-  if (row.disabled) return ['<span class="badge err">停用</span>', "disabled"];
-  if (row.throttle_for > 0) {
-    return [`<span class="badge warn">${escapeHtml(row.throttle_reason || "冷却")} ${fmtDuration(row.throttle_for)}</span>`, "cooling"];
-  }
-  if (row.token_expired) return ['<span class="badge warn">令牌过期</span>', "expired"];
-  if (!row.has_access_token && !row.has_refresh_token) return ['<span class="badge err">无凭据</span>', "dead"];
-  return ['<span class="badge ok">就绪</span>', "ready"];
-}
-
-function renderAccounts() {
-  const body = $("#accounts tbody");
-  if (!state.accounts.length) {
-    body.innerHTML = '<tr><td colspan="6" class="muted">还没有账号。点"添加账号"开始。</td></tr>';
-    return;
-  }
-  body.innerHTML = state.accounts.map((row) => {
-    const [badge] = accountStatus(row);
-    const credit = row.credit == null ? '<span class="muted">未知</span>' : Number(row.credit).toFixed(0);
-    const expiry = row.token_expires_at ? fmtTime(row.token_expires_at) : "-";
-    const uid = escapeHtml(row.uid || row.id);
-    const toggle = row.disabled
-      ? `<button class="ghost" data-act="enable" data-uid="${uid}">启用</button>`
-      : `<button class="ghost" data-act="disable" data-uid="${uid}">停用</button>`;
-    return `<tr>
-      <td>${escapeHtml(row.nickname || row.email || row.uid || row.id)}${row.note ? `<div class="muted">${escapeHtml(row.note)}</div>` : ""}</td>
-      <td>${escapeHtml(row.realm || "-")}</td>
-      <td>${credit}</td>
-      <td>${escapeHtml(expiry)}</td>
-      <td>${badge}</td>
-      <td class="actions">
-        <button class="ghost" data-act="test" data-uid="${uid}">测试</button>
-        <button class="ghost" data-act="refresh" data-uid="${uid}">续期</button>
-        <button class="ghost" data-act="balance" data-uid="${uid}">查额度</button>
-        ${row.realm === "cn" ? `<button class="ghost" data-act="checkin" data-uid="${uid}">签到</button>` : ""}
-        ${toggle}
-        <button class="danger" data-act="delete" data-uid="${uid}">删除</button>
-      </td>
-    </tr>`;
-  }).join("");
-}
-
-async function accountAction(uid, action, button) {
-  if (action === "delete" && !confirm("确定删除该账号？")) return;
-  const label = button ? button.textContent : "";
-  if (button) { button.disabled = true; button.textContent = "…"; }
-  try {
-    const result = await api(`/api/accounts/${encodeURIComponent(uid)}/${action}`, { method: "POST", body: "{}" });
-    if (action === "test") {
-      alert(result.ok ? `账号可用（模型 ${result.model}）` : `测试失败：${result.error || "未知"}`);
-    } else if (action === "balance") {
-      alert(result.ok ? `余额 ${result.credits}` : "读取余额失败（上游没给可用字段）");
-    } else if (action === "checkin") {
-      alert(result.message || (result.ok ? "已签到" : "签到失败"));
-    }
-  } catch (error) {
-    alert(error.message);
-  } finally {
-    if (button) { button.disabled = false; button.textContent = label; }
-    await loadAccounts();
-  }
-}
-
-async function submitAccount() {
-  const payload = {
-    realm: $("#add-realm").value,
-    note: $("#add-note").value.trim(),
-    refresh_token: $("#add-refresh").value.trim(),
-    access_token: $("#add-access").value.trim(),
+  var state = {
+    token: localStorage.getItem(TOKEN_KEY) || "",
+    page: "overview",
+    accounts: [],
+    selected: Object.create(null),
+    filter: { text: "", status: "all", realm: "" },
+    sort: "state",
+    pageNo: 1,
+    pageSize: 10,
+    login: { state: "", timer: 0, url: "" },
+    logFollow: true,
+    timers: {},
+    status: null,
+    tunables: []
   };
-  if (!payload.refresh_token && !payload.access_token) {
-    $("#add-error").textContent = "至少填 refresh token 或 access token";
-    return;
-  }
-  $("#add-error").textContent = "";
-  try {
-    await api("/api/accounts/add", { method: "POST", body: JSON.stringify(payload) });
-    $("#add-refresh").value = "";
-    $("#add-access").value = "";
-    $("#add-note").value = "";
-    $("#add-panel").classList.add("hidden");
-    await loadAccounts();
-  } catch (error) {
-    $("#add-error").textContent = error.message;
-  }
-}
 
-async function startLoginFlow() {
-  try {
-    const data = await api("/api/accounts/login/start", {
-      method: "POST",
-      body: JSON.stringify({ realm: $("#add-realm").value }),
+  var $ = function (sel) { return document.querySelector(sel); };
+  var $$ = function (sel) { return Array.prototype.slice.call(document.querySelectorAll(sel)); };
+
+  function esc(value) {
+    var text = value === null || value === undefined ? "" : String(value);
+    return text.replace(/[&<>"']/g, function (ch) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch];
     });
-    $("#login-flow").classList.remove("hidden");
-    const link = $("#login-url");
-    link.textContent = data.url;
-    link.href = data.url;
-    $("#login-state").textContent = "等待登录…";
-    clearInterval(state.pollTimer);
-    state.pollTimer = setInterval(async () => {
-      try {
-        const poll = await api("/api/accounts/login/poll?state=" + encodeURIComponent(data.state));
-        // status 才是 pending/ok/error；state 是那串不透明的登录会话 id。
-        const status = poll.status || "pending";
-        $("#login-state").textContent = poll.message || "等待登录…";
-        if (status === "ok") {
-          clearInterval(state.pollTimer);
-          $("#login-state").textContent = "登录成功，账号已添加。";
-          await loadAccounts();
-        } else if (status === "expired" || status === "error") {
-          clearInterval(state.pollTimer);
-        }
-      } catch (error) {
-        $("#login-state").textContent = error.message;
-        clearInterval(state.pollTimer);
+  }
+
+  // ---------------- 格式化 ----------------
+
+  function pad(n) { return n < 10 ? "0" + n : String(n); }
+
+  function fmtTime(epoch) {
+    var v = Number(epoch || 0);
+    if (!v) return "—";
+    var d = new Date(v * 1000);
+    var now = new Date();
+    var sameDay = d.toDateString() === now.toDateString();
+    var hm = pad(d.getHours()) + ":" + pad(d.getMinutes());
+    if (sameDay) return hm;
+    return (d.getMonth() + 1) + "-" + pad(d.getDate()) + " " + hm;
+  }
+
+  function fmtAgo(epoch) {
+    var v = Number(epoch || 0);
+    if (!v) return "从未";
+    var diff = Date.now() / 1000 - v;
+    if (diff < 0) return fmtCountdown(-diff) + "后";
+    if (diff < 60) return "刚刚";
+    if (diff < 3600) return Math.floor(diff / 60) + " 分钟前";
+    if (diff < 86400) return Math.floor(diff / 3600) + " 小时前";
+    return Math.floor(diff / 86400) + " 天前";
+  }
+
+  function fmtCountdown(seconds) {
+    var s = Math.max(0, Math.floor(Number(seconds) || 0));
+    if (s < 60) return s + "s";
+    if (s < 3600) return Math.floor(s / 60) + "m" + pad(s % 60) + "s";
+    var h = Math.floor(s / 3600);
+    if (h < 48) return h + "h" + pad(Math.floor((s % 3600) / 60)) + "m";
+    return Math.floor(h / 24) + "d" + (h % 24) + "h";
+  }
+
+  function fmtNum(value) {
+    var v = Number(value || 0);
+    if (!v) return "0";
+    if (v >= 1e9) return (v / 1e9).toFixed(1) + "B";
+    if (v >= 1e6) return (v / 1e6).toFixed(1) + "M";
+    if (v >= 10000) return (v / 1000).toFixed(1) + "k";
+    return String(Math.round(v));
+  }
+
+  function fmtCredit(value) {
+    if (value === null || value === undefined) return "未知";
+    var v = Number(value);
+    if (!isFinite(v)) return "未知";
+    if (v === 0) return "0";
+    if (v >= 100) return v.toFixed(0);
+    if (v >= 1) return v.toFixed(2);
+    return v.toFixed(3);
+  }
+
+  function fmtPct(ratio) {
+    var v = Number(ratio || 0);
+    return (v * 100).toFixed(v >= 0.995 || v === 0 ? 0 : 1) + "%";
+  }
+
+  // ---------------- 提示条 ----------------
+
+  function toast(kind, title, body) {
+    var host = $("#toasts");
+    if (!host) return;
+    var el = document.createElement("div");
+    el.className = "toast " + (kind || "");
+    el.innerHTML = '<div class="title">' + esc(title) + "</div>" +
+      (body ? '<div class="body">' + esc(body) + "</div>" : "");
+    host.appendChild(el);
+    setTimeout(function () {
+      el.style.transition = "opacity .2s";
+      el.style.opacity = "0";
+      setTimeout(function () { if (el.parentNode) el.parentNode.removeChild(el); }, 220);
+    }, kind === "bad" ? 6000 : 3600);
+  }
+
+  // ---------------- HTTP ----------------
+
+  function api(path, options) {
+    var opts = options || {};
+    var headers = { "Accept": "application/json" };
+    if (state.token) headers["X-Panel-Token"] = state.token;
+    if (opts.body !== undefined) headers["Content-Type"] = "application/json";
+    return fetch(path, {
+      method: opts.method || (opts.body !== undefined ? "POST" : "GET"),
+      headers: headers,
+      body: opts.body === undefined ? undefined : JSON.stringify(opts.body)
+    }).then(function (res) {
+      if (res.status === 401) {
+        showLogin();
+        throw new Error("面板会话已过期，请重新登录");
       }
-    }, 3000);
-  } catch (error) {
-    $("#add-error").textContent = error.message;
-  }
-}
-
-// ---------------------------------------------------------------- 设置
-
-async function loadSettings() {
-  try {
-    const data = await api("/api/settings");
-    state.settings = data;
-    $("#set-listen").value = data.listen || "";
-    $("#set-prompt").value = data.prompt_mode || "passthrough";
-    $("#set-apikey").value = "";
-    $("#set-apikey").placeholder = data.default_api_key_set ? "已设置（留空则不修改）" : "sk-...";
-    renderKeys(data.api_keys || []);
-  } catch (error) {
-    console.warn("读取设置失败", error);
-  }
-}
-
-function renderKeys(keys) {
-  const body = $("#keys tbody");
-  if (!keys.length) {
-    body.innerHTML = '<tr><td colspan="6" class="muted">没有客户端密钥；网关当前对本机开放。</td></tr>';
-    return;
-  }
-  body.innerHTML = keys.map((key) => `<tr>
-    <td>${escapeHtml(key.name || "-")}</td>
-    <td><code>${escapeHtml(key.key || "")}</code></td>
-    <td>${escapeHtml(key.realm || "跟随")}</td>
-    <td>${escapeHtml((key.models || []).join(", ") || "全部")}</td>
-    <td>${fmtNum(key.requests || 0)}</td>
-    <td><button class="danger" data-key="${escapeHtml(key.name)}" data-act="del-key">删除</button></td>
-  </tr>`).join("");
-}
-
-async function saveGateway() {
-  const payload = { listen: $("#set-listen").value.trim(), prompt_mode: $("#set-prompt").value };
-  const apiKey = $("#set-apikey").value.trim();
-  if (apiKey) payload.api_key = apiKey;
-  try {
-    await api("/api/settings", { method: "POST", body: JSON.stringify(payload) });
-    $("#settings-error").textContent = "";
-    await loadSettings();
-    alert("已保存（监听地址需重启生效）");
-  } catch (error) {
-    $("#settings-error").textContent = error.message;
-  }
-}
-
-async function addKey() {
-  const name = $("#key-name").value.trim();
-  const models = $("#key-models").value.split(",").map((s) => s.trim()).filter(Boolean);
-  if (!name) { $("#settings-error").textContent = "先填名称"; return; }
-  try {
-    const res = await api("/api/settings", {
-      method: "POST",
-      body: JSON.stringify({ keys_add: [{ name, models, realm: $("#key-realm").value }] }),
-    });
-    $("#key-name").value = "";
-    $("#key-models").value = "";
-    $("#settings-error").textContent = "";
-    // 明文只出现这一次：列表里永远是打过码的。
-    const created = (res && res.added && res.added[0]) || null;
-    const box = $("#key-created");
-    if (created && created.key) {
-      box.hidden = false;
-      box.innerHTML = `新密钥（只显示这一次，请立即复制）：<code>${escapeHtml(created.key)}</code>`;
-    }
-    await loadSettings();
-  } catch (error) {
-    $("#settings-error").textContent = error.message;
-  }
-}
-
-async function deleteKey(name) {
-  if (!confirm(`删除密钥 ${name}？`)) return;
-  try {
-    await api("/api/settings", { method: "POST", body: JSON.stringify({ keys_delete: [name] }) });
-    await loadSettings();
-  } catch (error) {
-    $("#settings-error").textContent = error.message;
-  }
-}
-
-async function savePassword() {
-  const password = $("#set-password").value;
-  if (password.length < 6) { $("#settings-error").textContent = "密码至少 6 位"; return; }
-  try {
-    await api("/api/settings", { method: "POST", body: JSON.stringify({ panel_password: password }) });
-    $("#set-password").value = "";
-    $("#settings-error").textContent = "";
-    alert("密码已更新，请重新登录。");
-    showLogin();
-  } catch (error) {
-    $("#settings-error").textContent = error.message;
-  }
-}
-
-// ---------------------------------------------------------------- 交互
-
-function switchTab(name) {
-  $$(".tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === name));
-  $$(".tab-panel").forEach((panel) => panel.classList.toggle("active", panel.id === "tab-" + name));
-  if (name === "accounts") loadAccounts().catch((error) => console.warn(error));
-  if (name === "settings") loadSettings();
-}
-
-document.addEventListener("DOMContentLoaded", () => {
-  $("#login-form").addEventListener("submit", async (event) => {
-    event.preventDefault();
-    try {
-      const data = await api("/panel/login", {
-        method: "POST",
-        body: JSON.stringify({ password: $("#password").value }),
+      return res.text().then(function (text) {
+        var data = null;
+        try { data = text ? JSON.parse(text) : null; } catch (e) { data = null; }
+        if (!res.ok) {
+          var msg = (data && data.error && data.error.message) || text || ("HTTP " + res.status);
+          var err = new Error(msg);
+          err.status = res.status;
+          err.code = data && data.error ? data.error.code : "";
+          throw err;
+        }
+        return data;
       });
-      state.token = data.token;
-      localStorage.setItem(TOKEN_KEY, data.token);
-      $("#login-error").textContent = "";
-      $("#password").value = "";
-      const status = await api("/panel/status");
-      await enterApp(status);
-    } catch (error) {
-      $("#login-error").textContent = error.message;
+    });
+  }
+
+  // ---------------- 登录 ----------------
+
+  function showLogin() {
+    localStorage.removeItem(TOKEN_KEY);
+    state.token = "";
+    stopTimers();
+    $("#app-view").hidden = true;
+    $("#login-view").hidden = false;
+    var input = $("#login-password");
+    if (input) { input.value = ""; input.focus(); }
+  }
+
+  function showApp() {
+    $("#login-view").hidden = true;
+    $("#app-view").hidden = false;
+    boot();
+  }
+
+  function doLogin(password) {
+    return fetch("/panel/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
+      body: JSON.stringify({ password: password })
+    }).then(function (res) {
+      return res.text().then(function (text) {
+        var data = null;
+        try { data = text ? JSON.parse(text) : null; } catch (e) { data = null; }
+        if (!res.ok) {
+          var msg = (data && data.error && data.error.message) || "登录失败";
+          throw new Error(msg);
+        }
+        if (!data || !data.token) throw new Error("登录响应缺少 token");
+        state.token = data.token;
+        localStorage.setItem(TOKEN_KEY, state.token);
+        return data;
+      });
+    });
+  }
+
+  // ---------------- 路由 ----------------
+
+  function currentPageFromHash() {
+    var hash = (location.hash || "").replace(/^#/, "");
+    return PAGES.indexOf(hash) >= 0 ? hash : "overview";
+  }
+
+  function go(page, replace) {
+    var target = PAGES.indexOf(page) >= 0 ? page : "overview";
+    if (replace) {
+      history.replaceState(null, "", "#" + target);
+      render();
+    } else if (("#" + target) !== location.hash) {
+      location.hash = target;
+    } else {
+      render();
     }
-  });
+  }
 
-  $$(".tab").forEach((tab) => tab.addEventListener("click", () => switchTab(tab.dataset.tab)));
+  function render() {
+    state.page = currentPageFromHash();
+    $$("#tabs a").forEach(function (a) {
+      a.classList.toggle("active", a.getAttribute("data-page") === state.page);
+    });
+    PAGES.forEach(function (name) {
+      var el = $("#page-" + name);
+      if (el) el.hidden = name !== state.page;
+    });
+    refreshPage();
+  }
 
-  $("#logout").addEventListener("click", () => {
-    api("/panel/logout", { method: "POST", body: "{}" }).catch(() => {});
-    showLogin();
-  });
+  // ---------------- 定时器 ----------------
 
-  $("#refresh-accounts").addEventListener("click", () => loadAccounts().catch((e) => alert(e.message)));
-  $("#realm-filter").addEventListener("change", () => loadAccounts().catch((e) => alert(e.message)));
-  $("#show-add").addEventListener("click", () => $("#add-panel").classList.toggle("hidden"));
-  $("#add-submit").addEventListener("click", submitAccount);
-  $("#login-by-url").addEventListener("click", startLoginFlow);
+  function every(name, ms, fn) {
+    stopTimer(name);
+    state.timers[name] = setInterval(function () {
+      if (document.hidden) return;
+      fn();
+    }, ms);
+  }
 
-  $("#accounts").addEventListener("click", (event) => {
-    const button = event.target.closest("button[data-act]");
-    if (!button) return;
-    accountAction(button.dataset.uid, button.dataset.act, button);
-  });
+  function stopTimer(name) {
+    if (state.timers[name]) { clearInterval(state.timers[name]); state.timers[name] = 0; }
+  }
 
-  $("#save-gateway").addEventListener("click", saveGateway);
-  $("#add-key").addEventListener("click", addKey);
-  $("#save-password").addEventListener("click", savePassword);
-  $("#keys").addEventListener("click", (event) => {
-    const button = event.target.closest("button[data-act='del-key']");
-    if (button) deleteKey(button.dataset.key);
-  });
+  function stopTimers() {
+    Object.keys(state.timers).forEach(stopTimer);
+    if (state.login.timer) { clearInterval(state.login.timer); state.login.timer = 0; }
+  }
 
-  boot();
-});
+  function refreshPage() {
+    stopTimers();
+    if (state.page === "overview") {
+      loadOverview();
+      every("overview", 5000, loadOverview);
+    } else if (state.page === "accounts") {
+      loadAccounts();
+      every("accounts", 15000, function () { loadAccounts(true); });
+    } else if (state.page === "usage") {
+      loadUsage();
+      every("usage", 15000, loadUsage);
+    } else if (state.page === "logs") {
+      loadLogs();
+      if (state.logFollow) every("logs", 3000, loadLogs);
+    } else if (state.page === "settings") {
+      loadSettings();
+    }
+  }
+
+  // ---------------- 启动 ----------------
+
+  function boot() {
+    api("/panel/status").then(function (status) {
+      state.status = status;
+      $("#version-label").textContent = status.version ? "v" + status.version : "";
+      if (status.is_default_password || status.panel_password_is_default) {
+        $("#default-pw-banner").hidden = false;
+      }
+      if (state.token && !status.authenticated) { showLogin(); return; }
+      render();
+      every("health", 10000, updateHealth);
+      updateHealth();
+    }).catch(function (err) {
+      toast("bad", "无法连接网关", err.message);
+    });
+  }
+
+  function updateHealth() {
+    fetch("/healthz").then(function (res) { return res.json(); }).then(function (data) {
+      var dot = $("#health-dot");
+      if (dot) dot.className = "dot " + (data && data.ok ? "ok" : "bad");
+    }).catch(function () {
+      var dot = $("#health-dot");
+      if (dot) dot.className = "dot bad";
+    });
+  }
+
+  function markUpdated() {
+    var el = $("#updated-at");
+    if (el) el.textContent = "更新于 " + fmtTime(Date.now() / 1000);
+  }
+
+  // ---------------- 概览 ----------------
+
+  function loadOverview() {
+    return Promise.all([
+      api("/api/usage").catch(function () { return null; }),
+      api("/api/usage/recent?limit=20").catch(function () { return null; }),
+      api("/api/pool").catch(function () { return null; }),
+      api("/api/scheduler").catch(function () { return null; })
+    ]).then(function (res) {
+      renderKpis(res[0]);
+      renderRecent(res[1]);
+      renderPool(res[2]);
+      renderScheduler(res[3]);
+      markUpdated();
+    });
+  }
+
+  function kpi(label, value, sub, tone) {
+    return '<div class="kpi ' + (tone || "") + '">' +
+      '<div class="label">' + esc(label) + "</div>" +
+      '<div class="value">' + esc(value) + "</div>" +
+      (sub ? '<div class="sub">' + esc(sub) + "</div>" : "") +
+      "</div>";
+  }
+
+  function renderKpis(usage) {
+    var host = $("#kpis");
+    if (!host) return;
+    if (!usage || !usage.total) {
+      host.innerHTML = kpi("状态", "无数据", "还没有处理过请求");
+      return;
+    }
+    var t = usage.total;
+    var success = t.requests ? (t.ok / t.requests) : 0;
+    var cacheRate = t.cache_hit_rate || 0;
+    var errTone = t.errors ? "warn" : "";
+    host.innerHTML = [
+      kpi("请求", fmtNum(t.requests), success ? "成功 " + fmtPct(success) : "全部失败", t.requests && !t.ok ? "bad" : ""),
+      kpi("失败", fmtNum(t.errors), t.errors ? "看日志里的错误行" : "没有失败", errTone),
+      kpi("输入 token", fmtNum(t.prompt_tokens), cacheRate ? "缓存命中 " + fmtPct(cacheRate) : "缓存未命中"),
+      kpi("输出 token", fmtNum(t.completion_tokens), "含思考 " + fmtNum(t.cached_tokens ? t.cached_tokens : 0) + " 缓存"),
+      kpi("消耗积分", fmtCredit(t.credits), usage.retention_days ? "保留 " + usage.retention_days + " 天" : ""),
+      kpi("平均耗时", t.avg_latency_ms ? Math.round(t.avg_latency_ms) + " ms" : "—", "含排队时间")
+    ].join("");
+  }
+
+  function renderRecent(payload) {
+    var tbody = $("#recent-table tbody");
+    if (!tbody) return;
+    var items = (payload && payload.items) || [];
+    $("#recent-note").textContent = items.length ? "最近 " + items.length + " 条" : "";
+    if (!items.length) {
+      tbody.innerHTML = '<tr><td colspan="11" class="empty">还没有请求</td></tr>';
+      return;
+    }
+    tbody.innerHTML = items.map(function (row) {
+      var outcome = row.outcome || "";
+      var badge = outcome === "completed" ? "ok" : (outcome === "client_aborted" ? "" : "bad");
+      var label = { completed: "完成", client_aborted: "客户端断开", upstream_aborted: "上游中断", failed: "失败" }[outcome] || outcome || "—";
+      var cacheRate = row.prompt_tokens ? (row.cached_tokens || 0) / row.prompt_tokens : 0;
+      return "<tr>" +
+        "<td>" + esc(fmtTime(row.at)) + "</td>" +
+        "<td>" + esc(row.model || "—") + "</td>" +
+        "<td>" + esc((row.account || "").slice(0, 8)) + "</td>" +
+        '<td><span class="badge ' + badge + '">' + esc(label) + "</span></td>" +
+        '<td class="num">' + esc(row.elapsed_ms ? Math.round(row.elapsed_ms) + "ms" : "—") + "</td>" +
+        '<td class="num">' + esc(row.ttft_ms ? Math.round(row.ttft_ms) + "ms" : "—") + "</td>" +
+        '<td class="num">' + esc(fmtNum(row.prompt_tokens)) + "</td>" +
+        '<td class="num">' + esc(fmtNum(row.completion_tokens)) + "</td>" +
+        '<td class="num">' + esc(cacheRate ? fmtPct(cacheRate) : "—") + "</td>" +
+        '<td class="num">' + esc(fmtCredit(row.credit)) + "</td>" +
+        "<td>" + (row.error ? "<span title=\"" + esc(row.error) + "\">" + esc(String(row.error).slice(0, 40)) + "</span>" : "") + "</td>" +
+        "</tr>";
+    }).join("");
+  }
+
+  function renderPool(pool) {
+    var host = $("#pool-body");
+    if (!host) return;
+    if (!pool) { host.innerHTML = '<p class="muted">读不到池状态</p>'; return; }
+    $("#pool-strategy").textContent = "策略 " + (pool.strategy ? ((pool.strategy.cn || "?") + " / " + (pool.strategy.global || "?")) : "");
+    var total = pool.total || 0;
+    var width = function (n) { return total ? (n / total * 100) + "%" : "0"; };
+    var holds = [];
+    if (pool.hold_cn_remaining) holds.push("cn 风控暂停 " + fmtCountdown(pool.hold_cn_remaining));
+    if (pool.hold_global_remaining) holds.push("global 风控暂停 " + fmtCountdown(pool.hold_global_remaining));
+    host.innerHTML =
+      '<div class="pool-realm">' +
+        '<div class="pool-row"><strong>' + fmtNum(pool.ready) + "</strong> 可用 · " +
+        fmtNum(pool.cooling) + " 冷却 · " + fmtNum(pool.disabled) + " 停用 · " +
+        fmtNum(pool.in_flight) + " 在途</div>" +
+        '<div class="pool-bars">' +
+          '<i class="ready" style="width:' + width(pool.ready) + '"></i>' +
+          '<i class="cooling" style="width:' + width(pool.cooling) + '"></i>' +
+          '<i class="disabled" style="width:' + width(pool.disabled) + '"></i>' +
+        "</div>" +
+        '<div class="muted tiny">余额合计 ' + esc(fmtCredit(pool.credits)) +
+        (pool.credit_unknown ? " · " + pool.credit_unknown + " 个号余额未知" : "") + "</div>" +
+      "</div>" +
+      (holds.length ? '<div class="muted tiny" style="color:var(--warn)">' + esc(holds.join("；")) + "</div>" : "");
+  }
+
+  function renderScheduler(sched) {
+    var host = $("#sched-body");
+    if (!host) return;
+    if (!sched) { host.innerHTML = '<p class="muted">读不到调度状态</p>'; return; }
+    $("#sched-state").textContent = sched.running ? "运行中" : "未启用";
+    var jobs = sched.jobs || [];
+    if (!jobs.length) { host.innerHTML = '<p class="muted tiny">当前没有任何任务</p>'; return; }
+    host.innerHTML = jobs.map(function (job) {
+      var when = job.at_hour === null || job.at_hour === undefined
+        ? ("每 " + fmtCountdown(job.interval))
+        : ("每天 " + pad(job.at_hour) + ":00");
+      var last = job.last_run ? fmtAgo(job.last_run) : "未跑过";
+      var tone = job.errors ? "warn" : "ok";
+      return '<div class="job-row"><span>' + esc(job.name) + "</span>" +
+        '<span class="muted tiny">' + esc(when) + " · " + esc(last) +
+        (job.last_result ? " · " + esc(String(job.last_result).slice(0, 60)) : "") + "</span>" +
+        '<span class="badge ' + (tone === "warn" ? "warn" : "") + '">' + esc(job.runs) + " 次</span></div>";
+    }).join("");
+  }
+
+  // ---------------- 账号 ----------------
+
+  function loadAccounts(quiet) {
+    return api("/api/accounts").then(function (data) {
+      var list = (data && data.accounts) || [];
+      state.accounts = list;
+      // 选择里已经不存在的 uid 要摘掉，否则批量操作会打到不存在的号
+      var alive = Object.create(null);
+      list.forEach(function (a) { alive[a.uid] = true; });
+      Object.keys(state.selected).forEach(function (uid) {
+        if (!alive[uid]) delete state.selected[uid];
+      });
+      renderAccounts();
+      markUpdated();
+      if (!quiet) {
+        var disabledCount = list.filter(function (a) { return a.disabled; }).length;
+        $("#acc-summary").textContent = list.length
+          ? (list.length + " 个号" + (disabledCount ? " · " + disabledCount + " 个停用" : ""))
+          : "还没有账号";
+      }
+    }).catch(function (err) {
+      toast("bad", "读取账号失败", err.message);
+    });
+  }
+
+  function accountState(account) {
+    if (account.disabled) return { key: "disabled", label: "已停用", tone: "" };
+    var now = Date.now() / 1000;
+    var until = Number(account.throttle_for || 0);
+    if (until > now) {
+      return { key: "cooling", label: "冷却 " + fmtCountdown(until - now), tone: "warn" };
+    }
+    if (account.token_expired && !account.has_refresh_token) {
+      return { key: "cooling", label: "令牌过期", tone: "bad" };
+    }
+    return { key: "ready", label: "可用", tone: "ok" };
+  }
+
+  /* 一行里说清楚"为什么不接单"：把已经算好的窗口一次性摊开，
+     而不是只写"冷却中"让人去翻日志。 */
+  function windowBadges(account) {
+    var now = Date.now() / 1000;
+    var out = [];
+    function add(label, until, tone) {
+      var v = Number(until || 0);
+      if (v > now) out.push('<span class="badge ' + (tone || "") + '">' + esc(label + " " + fmtCountdown(v - now)) + "</span>");
+    }
+    add("冷却", account.cooldown_until, "warn");
+    add("熔断", account.breaker_until, "warn");
+    add("降权", account.degrade_until, "warn");
+    add("余额", account.balance_until, "warn");
+    if (Number(account.restricted_until || 0) > now) {
+      out.push('<span class="badge bad" title="11140 风控：换号只会连坐，别换">风控 ' +
+        esc(fmtCountdown(Number(account.restricted_until) - now)) + "</span>");
+    }
+    var models = account.model_cooldowns || {};
+    Object.keys(models).slice(0, 2).forEach(function (model) {
+      add(model, models[model], "");
+    });
+    if (Number(account.consecutive_fails || 0) >= 3) {
+      out.push('<span class="badge warn">连败 ' + esc(account.consecutive_fails) + "</span>");
+    }
+    if (account.in_flight) out.push('<span class="badge accent">在途 ' + esc(account.in_flight) + "</span>");
+    return out.join("");
+  }
+
+  function filteredAccounts() {
+    var f = state.filter;
+    var text = f.text.trim().toLowerCase();
+    var list = state.accounts.filter(function (a) {
+      if (f.realm && a.realm !== f.realm) return false;
+      if (f.status !== "all") {
+        var st = accountState(a);
+        if (st.key !== f.status) return false;
+      }
+      if (!text) return true;
+      var hay = [a.nickname, a.uid, a.note, a.group, a.email].join(" ").toLowerCase();
+      return hay.indexOf(text) >= 0;
+    });
+    var now = Date.now() / 1000;
+    var rank = { ready: 0, cooling: 1, disabled: 2 };
+    list.sort(function (a, b) {
+      if (state.sort === "credit") return Number(b.credit || 0) - Number(a.credit || 0);
+      if (state.sort === "nickname") return String(a.nickname || "").localeCompare(String(b.nickname || ""));
+      if (state.sort === "last_used_at") return Number(b.last_used_at || 0) - Number(a.last_used_at || 0);
+      var ra = rank[accountState(a).key] || 9;
+      var rb = rank[accountState(b).key] || 9;
+      if (ra !== rb) return ra - rb;
+      return Number(b.last_used_at || 0) - Number(a.last_used_at || 0);
+    });
+    void now;
+    return list;
+  }
+
+  function renderAccounts() {
+    var tbody = $("#acc-table tbody");
+    if (!tbody) return;
+    var list = filteredAccounts();
+    var pages = Math.max(1, Math.ceil(list.length / state.pageSize));
+    if (state.pageNo > pages) state.pageNo = pages;
+    var start = (state.pageNo - 1) * state.pageSize;
+    var rows = list.slice(start, start + state.pageSize);
+
+    if (!list.length) {
+      var empty = state.accounts.length
+        ? "没有符合筛选条件的账号"
+        : "还没有账号 —— 点右上角「添加账号」用登录链接接一个";
+      tbody.innerHTML = '<tr><td colspan="7" class="empty">' + esc(empty) + "</td></tr>";
+    } else {
+      tbody.innerHTML = rows.map(function (a) {
+        var st = accountState(a);
+        var creditText = a.credit === null || a.credit === undefined
+          ? '<span class="muted">未知</span>'
+          : esc(fmtCredit(a.credit));
+        var tokenText = a.has_refresh_token
+          ? '<span class="badge ok">可续期</span>'
+          : (a.has_access_token ? '<span class="badge warn">仅 access</span>' : '<span class="badge bad">无令牌</span>');
+        if (a.token_expired) tokenText += '<span class="badge bad">已过期</span>';
+        var checked = state.selected[a.uid] ? " checked" : "";
+        return '<tr data-uid="' + esc(a.uid) + '">' +
+          '<td class="check"><input type="checkbox" class="acc-check"' + checked + "></td>" +
+          "<td>" +
+            '<div><strong>' + esc(a.nickname || a.uid.slice(0, 8)) + "</strong> " +
+            '<span class="badge">' + esc(a.realm || "cn") + "</span>" +
+            (a.group ? ' <span class="badge accent">' + esc(a.group) + "</span>" : "") + "</div>" +
+            '<div class="muted tiny mono" title="' + esc(a.last_error || "") + '">' + esc(a.uid) + "</div>" +
+            (a.last_error ? '<div class="muted tiny" title="' + esc(a.last_error) + '">最近错误：' + esc(String(a.last_error).slice(0, 46)) + "</div>" : "") +
+          "</td>" +
+          '<td><span class="badge ' + st.tone + '">' + esc(st.label) + "</span>" + windowBadges(a) + "</td>" +
+          '<td class="num">' + creditText + "</td>" +
+          '<td class="num">' + tokenText +
+            '<div class="muted tiny">' + esc(a.token_expires_at ? fmtTime(a.token_expires_at) : "—") + "</div></td>" +
+          "<td>" +
+            '<input type="text" class="tiny-btn acc-note" value="' + esc(a.note || "") + '" placeholder="备注" style="width:100%">' +
+            '<div class="inline" style="margin-top:4px">' +
+              '<input type="text" class="tiny-btn acc-group" value="' + esc(a.group || "") + '" placeholder="分组" style="flex:1 1 70px">' +
+              '<input type="number" class="tiny-btn acc-weight" value="' + esc(a.weight || 1) + '" min="1" max="100" title="权重：越大越容易被选中" style="flex:0 0 64px">' +
+            "</div>" +
+          "</td>" +
+          '<td><div class="row-actions">' +
+            '<button class="ghost tiny-btn acc-test">测试</button>' +
+            '<button class="ghost tiny-btn" data-act="refresh">续期</button>' +
+            '<button class="ghost tiny-btn" data-act="balance">查额度</button>' +
+            (a.realm === "cn" ? '<button class="ghost tiny-btn" data-act="checkin">签到</button>' : "") +
+            (a.disabled
+              ? '<button class="ghost tiny-btn" data-act="enable">启用</button>'
+              : '<button class="ghost tiny-btn" data-act="disable">停用</button>') +
+            '<button class="ghost tiny-btn danger" data-act="delete">删除</button>' +
+          "</div></td>" +
+          "</tr>";
+      }).join("");
+    }
+
+    renderPager(pages, list.length);
+    renderBulkBar();
+    $("#acc-check-all").checked = rows.length > 0 && rows.every(function (a) { return state.selected[a.uid]; });
+  }
+
+  function renderPager(pages, total) {
+    var host = $("#acc-pager");
+    if (!host) return;
+    if (pages <= 1) { host.innerHTML = '<span class="muted tiny">共 ' + total + " 个</span>"; return; }
+    var html = '<span class="muted tiny">共 ' + total + " 个 · 第 " + state.pageNo + "/" + pages + " 页</span>";
+    html += '<button class="ghost tiny-btn" data-page-go="' + (state.pageNo - 1) + '"' +
+      (state.pageNo <= 1 ? " disabled" : "") + ">上一页</button>";
+    html += '<button class="ghost tiny-btn" data-page-go="' + (state.pageNo + 1) + '"' +
+      (state.pageNo >= pages ? " disabled" : "") + ">下一页</button>";
+    host.innerHTML = html;
+  }
+
+  function renderBulkBar() {
+    var count = Object.keys(state.selected).length;
+    var bar = $("#bulkbar");
+    if (!bar) return;
+    bar.hidden = count === 0;
+    $("#bulk-count").textContent = String(count);
+  }
+
+  function selectedUids() {
+    return Object.keys(state.selected);
+  }
+
+  function rowAction(uid, action, button) {
+    var labels = {
+      enable: "启用账号", disable: "停用账号", delete: "删除账号",
+      refresh: "续期令牌", checkin: "签到", balance: "查余额", test: "测试账号"
+    };
+    var text = labels[action] || action;
+    var account = state.accounts.filter(function (a) { return a.uid === uid; })[0];
+    var name = account ? (account.nickname || uid.slice(0, 8)) : uid.slice(0, 8);
+
+    // 删除是不可恢复的：把后果写进确认文案，而不是"确定吗"
+    if (action === "delete" && !confirm("删除账号 " + name + "？\n\n这会把它从池里移除，本地保存的令牌一并删除，且不可恢复。")) return;
+
+    var old = button ? button.textContent : "";
+    if (button) { button.disabled = true; button.textContent = "…"; }
+
+    api("/api/accounts/" + encodeURIComponent(uid) + "/" + action, { method: "POST", body: {} })
+      .then(function (data) {
+        var detail = (data && (data.message || data.detail)) || "";
+        var ok = !data || data.ok !== false;
+        toast(ok ? "ok" : "warn", text + (ok ? "完成" : "未成功"), detail || name);
+        if (action === "delete" && account) delete state.selected[uid];
+        if (action === "test" && data) {
+          var lines = [];
+          if (data.model) lines.push("模型 " + data.model);
+          if (data.sample) lines.push("返回 " + String(data.sample).slice(0, 60));
+          if (lines.length) toast("ok", name + " 通了", lines.join(" · "));
+        }
+        return loadAccounts(true);
+      })
+      .catch(function (err) {
+        toast("bad", text + "失败", err.message);
+      })
+      .then(function () {
+        if (button) { button.disabled = false; button.textContent = old; }
+      });
+  }
+
+  function bulkAction(action) {
+    var uids = selectedUids();
+    if (!uids.length) return;
+    var body = { action: action, uids: uids };
+    var label = { test: "测试", refresh: "续期", balance: "查额度", enable: "启用", disable: "停用" }[action] || action;
+    toast("", "正在" + label + " " + uids.length + " 个账号…", "逐个发，不会同时打上游");
+    api("/api/accounts/bulk", { body: body }).then(function (data) {
+      var okCount = (data && data.ok_count) || 0;
+      var total = (data && data.total) || uids.length;
+      var failed = (data && data.results ? data.results.filter(function (r) { return !r.ok; }) : []);
+      var tone = failed.length ? "warn" : "ok";
+      toast(tone, label + "完成 " + okCount + "/" + total,
+        failed.slice(0, 3).map(function (r) { return (r.detail || r.uid.slice(0, 8)); }).join("；"));
+      if (action === "enable" || action === "disable") state.selected = Object.create(null);
+      return loadAccounts(true);
+    }).catch(function (err) {
+      toast("bad", label + "失败", err.message);
+    });
+  }
+
+  function saveAccountField(uid, field, value) {
+    var body = { uid: uid };
+    body[field] = value;
+    return api("/api/accounts/set", { body: body }).then(function () {
+      return loadAccounts(true);
+    }).catch(function (err) {
+      toast("bad", "保存失败", err.message);
+    });
+  }
+
+  // ---------------- 添加账号 ----------------
+
+  function setAddMode(mode) {
+    $$("#add-tabs button").forEach(function (b) {
+      b.classList.toggle("active", b.getAttribute("data-mode") === mode);
+    });
+    $("#add-link").hidden = mode !== "link";
+    $("#add-refresh").hidden = mode !== "refresh";
+    $("#add-access").hidden = mode !== "access";
+  }
+
+  function stopLoginPoll() {
+    if (state.login.timer) { clearInterval(state.login.timer); state.login.timer = 0; }
+  }
+
+  function startLoginFlow() {
+    var realm = $("#add-realm").value;
+    stopLoginPoll();
+    $("#add-link-state").textContent = "正在申请登录链接…";
+    api("/api/accounts/login/start", { body: { realm: realm } }).then(function (data) {
+      state.login.state = data.state || "";
+      state.login.url = data.url || "";
+      $("#add-link-url").value = state.login.url;
+      $("#add-link-result").hidden = false;
+      $("#add-link-state").textContent = "等待浏览器授权（每 2s 查一次）";
+      try { window.open(state.login.url, "_blank", "noopener"); } catch (e) { /* 弹窗被拦就靠复制 */ }
+      state.login.timer = setInterval(pollLogin, 2000);
+    }).catch(function (err) {
+      $("#add-link-state").textContent = "";
+      toast("bad", "生成登录链接失败", err.message);
+    });
+  }
+
+  function pollLogin() {
+    if (!state.login.state) return;
+    api("/api/accounts/login/poll?state=" + encodeURIComponent(state.login.state))
+      .then(function (data) {
+        var status = (data && data.status) || "pending";
+        var message = (data && data.message) || "";
+        if (status === "ok") {
+          stopLoginPoll();
+          $("#add-link-state").textContent = "";
+          $("#add-link-result").hidden = true;
+          state.login.state = "";
+          toast("ok", "账号已添加", message || "");
+          loadAccounts();
+        } else if (status === "expired" || status === "error") {
+          stopLoginPoll();
+          $("#add-link-state").textContent = "";
+          toast("bad", status === "expired" ? "链接已过期" : "登录失败", message);
+        } else {
+          $("#add-link-state").textContent = message || "等待授权…";
+        }
+      })
+      .catch(function (err) {
+        stopLoginPoll();
+        toast("bad", "轮询失败", err.message);
+      });
+  }
+
+  function cancelLoginFlow() {
+    stopLoginPoll();
+    state.login.state = "";
+    $("#add-link-result").hidden = true;
+    $("#add-link-state").textContent = "已取消";
+  }
+
+  function addAccountByToken(kind) {
+    var realm = $("#add-" + kind + "-realm").value;
+    var input = $("#add-" + kind + "-token");
+    var token = (input.value || "").trim();
+    if (!token) { toast("warn", "请先填令牌", ""); return; }
+    var body = { realm: realm };
+    body[kind === "refresh" ? "refresh_token" : "access_token"] = token;
+    api("/api/accounts/add", { body: body }).then(function (data) {
+      input.value = "";
+      toast("ok", "账号已添加", (data && data.account && data.account.nickname) || "");
+      loadAccounts();
+    }).catch(function (err) {
+      toast("bad", "添加失败", err.message);
+    });
+  }
+
+  // ---------------- 用量 ----------------
+
+  function loadUsage() {
+    return api("/api/usage").then(function (data) {
+      renderUsage(data);
+      markUpdated();
+    }).catch(function (err) {
+      toast("bad", "读取用量失败", err.message);
+    });
+  }
+
+  function rowsToTable(tbody, rows, cols, emptyText) {
+    if (!tbody) return;
+    if (!rows.length) {
+      tbody.innerHTML = '<tr><td colspan="' + cols + '" class="empty">' + esc(emptyText || "暂无数据") + "</td></tr>";
+      return;
+    }
+    tbody.innerHTML = rows.join("");
+  }
+
+  function renderUsage(usage) {
+    if (!usage) return;
+    var host = $("#usage-kpis");
+    if (host) {
+      var t = usage.total || {};
+      host.innerHTML = [
+        kpi("请求", fmtNum(t.requests), "成功 " + fmtNum(t.ok)),
+        kpi("失败", fmtNum(t.errors), t.requests ? fmtPct(t.errors / t.requests) : ""),
+        kpi("输入 token", fmtNum(t.prompt_tokens), t.prompt_tokens ? "缓存 " + fmtPct(t.cache_hit_rate || 0) : ""),
+        kpi("输出 token", fmtNum(t.completion_tokens), ""),
+        kpi("积分", fmtCredit(t.credits), "")
+      ].join("");
+    }
+    $("#usage-retention").textContent = usage.retention_days ? "台账保留 " + usage.retention_days + " 天" : "";
+
+    var models = Object.keys(usage.by_model || {}).map(function (name) {
+      var m = usage.by_model[name] || {};
+      return { name: name, m: m };
+    }).sort(function (a, b) { return (b.m.requests || 0) - (a.m.requests || 0); });
+
+    rowsToTable($("#usage-model-table tbody"), models.map(function (row) {
+      var m = row.m;
+      return "<tr><td>" + esc(row.name) + "</td>" +
+        '<td class="num">' + esc(fmtNum(m.requests)) + "</td>" +
+        '<td class="num">' + esc(fmtNum(m.prompt_tokens)) + "</td>" +
+        '<td class="num">' + esc(fmtNum(m.completion_tokens)) + "</td>" +
+        '<td class="num">' + esc(m.cache_hit_rate ? fmtPct(m.cache_hit_rate) : "—") + "</td>" +
+        '<td class="num">' + esc(fmtCredit(m.credits)) + "</td></tr>";
+    }), 6, "还没有请求");
+
+    rowsToTable($("#usage-account-table tbody"),
+      Object.keys(usage.by_account || {}).map(function (uid) {
+        var a = usage.by_account[uid] || {};
+        return "<tr><td>" + esc((a.nickname || uid).slice(0, 20)) + "</td>" +
+          '<td class="num">' + esc(fmtNum(a.requests)) + "</td>" +
+          '<td class="num">' + esc(fmtCredit(a.credits)) + "</td></tr>";
+      }), 3, "没有按账号的数据");
+
+    rowsToTable($("#usage-key-table tbody"),
+      Object.keys(usage.by_key || {}).map(function (name) {
+        var k = usage.by_key[name] || {};
+        return "<tr><td>" + esc(name) + "</td>" +
+          '<td class="num">' + esc(fmtNum(k.requests)) + "</td>" +
+          '<td class="num">' + esc(fmtCredit(k.credits)) + "</td></tr>";
+      }), 3, "没有按 key 的数据");
+
+    rowsToTable($("#usage-day-table tbody"),
+      Object.keys(usage.by_day || {}).sort().reverse().map(function (day) {
+        var d = usage.by_day[day] || {};
+        return "<tr><td>" + esc(day) + "</td>" +
+          '<td class="num">' + esc(fmtNum(d.requests)) + "</td>" +
+          '<td class="num">' + esc(fmtNum(d.errors)) + "</td>" +
+          '<td class="num">' + esc(fmtNum(d.prompt_tokens)) + "</td>" +
+          '<td class="num">' + esc(fmtNum(d.completion_tokens)) + "</td>" +
+          '<td class="num">' + esc(fmtCredit(d.credits)) + "</td></tr>";
+      }), 6, "还没有数据");
+  }
+
+  // ---------------- 日志 ----------------
+
+  function loadLogs() {
+    var lines = $("#log-lines") ? $("#log-lines").value : "500";
+    return api("/api/logs?lines=" + encodeURIComponent(lines)).then(function (data) {
+      var text = (data && (data.text || (data.lines || []).join("\n"))) || "";
+      var filter = ($("#log-search").value || "").trim();
+      if (filter) {
+        var re = null;
+        try { re = new RegExp(filter, "i"); } catch (e) { re = null; }
+        text = text.split("\n").filter(function (line) {
+          return re ? re.test(line) : line.toLowerCase().indexOf(filter.toLowerCase()) >= 0;
+        }).join("\n");
+      }
+      var body = $("#log-body");
+      if (body) {
+        body.textContent = text || "（空）";
+        body.scrollTop = body.scrollHeight;
+      }
+      markUpdated();
+    }).catch(function (err) {
+      var body = $("#log-body");
+      if (body) body.textContent = "读取日志失败：" + err.message;
+    });
+  }
+
+  // ---------------- 设置 ----------------
+
+  function loadSettings() {
+    return api("/api/settings").then(function (data) {
+      var panel = data.panel || {};
+      $("#set-listen").value = data.listen || "";
+      $("#set-api-key").value = "";
+      $("#set-api-key").placeholder = data.default_api_key_set ? "已设置（留空 = 不修改）" : "留空 = 不设默认 key";
+      $("#set-prompt-mode").value = data.prompt_mode || "passthrough";
+      if (panel.session_hours) $("#keys-note").textContent = "会话 " + panel.session_hours + " 小时";
+      renderKeys(data.api_keys || []);
+      renderTunables(data.tunables || []);
+      markUpdated();
+    }).catch(function (err) {
+      toast("bad", "读取设置失败", err.message);
+    });
+  }
+
+  function renderKeys(keys) {
+    rowsToTable($("#keys-table tbody"), keys.map(function (k) {
+      return "<tr><td>" + esc(k.name || "—") + "</td>" +
+        '<td class="mono tiny">' + esc(k.key || "") + "</td>" +
+        "<td>" + esc(k.realm || "跟随") + "</td>" +
+        '<td class="tiny">' + esc((k.models || []).join(",") || "全部") + "</td>" +
+        '<td><button class="ghost tiny-btn danger" data-key-del="' + esc(k.name || k.key) + '">删除</button></td></tr>';
+    }), 5, "还没有 key（客户端不带 key 时走开放模式）");
+  }
+
+  function renderTunables(items) {
+    state.tunables = items;
+    var host = $("#tunables");
+    if (!host) return;
+    host.innerHTML = items.map(function (item) {
+      var value = item.value === null || item.value === undefined ? "" : String(item.value);
+      var hint = item.restart ? "（需重启）" : "";
+      return '<label class="field">' + esc(item.label || item.path) + hint +
+        '<input type="text" data-tunable="' + esc(item.path) + '" value="' + esc(value) + '"></label>';
+    }).join("");
+  }
+
+  function saveSettings() {
+    var body = {};
+    var listen = $("#set-listen").value.trim();
+    if (listen) body.listen = listen;
+    var key = $("#set-api-key").value.trim();
+    if (key) body.api_key = key;
+    var password = $("#set-panel-password").value;
+    if (password) body.panel_password = password;
+    body.prompt_mode = $("#set-prompt-mode").value;
+    api("/api/settings", { body: body }).then(function () {
+      $("#set-panel-password").value = "";
+      $("#set-api-key").value = "";
+      toast("ok", "设置已保存", body.listen ? "监听地址改动需要重启进程" : "");
+      loadSettings();
+    }).catch(function (err) {
+      toast("bad", "保存失败", err.message);
+    });
+  }
+
+  function saveTunables() {
+    var raw = {};
+    $$("#tunables input[data-tunable]").forEach(function (input) {
+      raw[input.getAttribute("data-tunable")] = input.value.trim();
+    });
+    api("/api/settings", { body: { tunables: raw } }).then(function () {
+      toast("ok", "调优参数已保存", "策略/阈值立即生效");
+      loadSettings();
+    }).catch(function (err) {
+      toast("bad", "保存失败", err.message);
+    });
+  }
+
+  function addKey() {
+    var name = $("#key-name").value.trim() || ("key-" + Date.now().toString(36).slice(-5));
+    var realm = $("#key-realm").value;
+    var models = $("#key-models").value.split(",").map(function (s) { return s.trim(); }).filter(Boolean);
+    api("/api/settings", { body: { keys_add: [{ name: name, realm: realm, models: models }] } })
+      .then(function (data) {
+        var created = (data && data.added && data.added[0]) || null;
+        var box = $("#key-created");
+        if (created && created.key) {
+          box.hidden = false;
+          box.textContent = "新 key（只显示这一次）：" + created.key;
+          try { navigator.clipboard.writeText(created.key); } catch (e) { /* 无剪贴板权限就手动复制 */ }
+          toast("ok", "已创建 " + name, "明文已复制到剪贴板");
+        } else {
+          toast("ok", "已创建 " + name, "");
+        }
+        $("#key-name").value = "";
+        $("#key-models").value = "";
+        loadSettings();
+      })
+      .catch(function (err) { toast("bad", "创建失败", err.message); });
+  }
+
+  function deleteKey(name) {
+    if (!confirm("删除 key " + name + "？用它的客户端会立刻 401。")) return;
+    api("/api/settings", { body: { keys_delete: [name] } }).then(function (data) {
+      var deleted = (data && data.deleted) || [];
+      toast(deleted.length ? "ok" : "warn", deleted.length ? "已删除 " + name : "没找到 " + name, "");
+      loadSettings();
+    }).catch(function (err) { toast("bad", "删除失败", err.message); });
+  }
+
+  // ---------------- 事件绑定 ----------------
+
+  function bind() {
+    $("#login-form").addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      var button = $("#login-submit");
+      var error = $("#login-error");
+      error.hidden = true;
+      button.disabled = true;
+      button.textContent = "登录中…";
+      doLogin($("#login-password").value).then(function () {
+        button.disabled = false;
+        button.textContent = "登录";
+        showApp();
+      }).catch(function (err) {
+        button.disabled = false;
+        button.textContent = "登录";
+        error.hidden = false;
+        error.textContent = err.message;
+      });
+    });
+
+    $("#logout-btn").addEventListener("click", function () {
+      api("/panel/logout", { method: "POST", body: {} }).catch(function () { });
+      showLogin();
+    });
+
+    $("#refresh-btn").addEventListener("click", function () { refreshPage(); });
+
+    window.addEventListener("hashchange", render);
+
+    // 概览
+    $("#recent-copy-btn").addEventListener("click", function () {
+      var text = Array.prototype.map.call($$("#recent-table tbody tr"), function (tr) {
+        return Array.prototype.map.call(tr.children, function (td) { return td.textContent.trim(); }).join("\t");
+      }).join("\n");
+      try { navigator.clipboard.writeText(text); toast("ok", "已复制", ""); }
+      catch (e) { toast("warn", "复制失败", "浏览器拒绝了剪贴板"); }
+    });
+
+    $("#sched-run-btn").addEventListener("click", function () {
+      var button = this;
+      button.disabled = true;
+      api("/api/scheduler/trigger", { body: {} }).then(function (data) {
+        toast("ok", "已执行一轮", (data && data.running === false) ? "调度器没在跑，只跑了一次" : "");
+        renderScheduler(data);
+      }).catch(function (err) {
+        toast("bad", "执行失败", err.message);
+      }).then(function () { button.disabled = false; });
+    });
+
+    // 账号页
+    $("#acc-add-toggle").addEventListener("click", function () {
+      var panel = $("#acc-add-panel");
+      panel.hidden = !panel.hidden;
+    });
+    $("#add-tabs").addEventListener("click", function (ev) {
+      var button = ev.target.closest("button[data-mode]");
+      if (button) setAddMode(button.getAttribute("data-mode"));
+    });
+    $("#add-link-start").addEventListener("click", startLoginFlow);
+    $("#add-link-cancel").addEventListener("click", cancelLoginFlow);
+    $("#add-link-open").addEventListener("click", function () {
+      if (state.login.url) window.open(state.login.url, "_blank", "noopener");
+    });
+    $("#add-link-copy").addEventListener("click", function () {
+      try { navigator.clipboard.writeText(state.login.url); toast("ok", "链接已复制", ""); }
+      catch (e) { toast("warn", "复制失败", "手动选中输入框内容复制"); }
+    });
+    $("#add-refresh-submit").addEventListener("click", function () { addAccountByToken("refresh"); });
+    $("#add-access-submit").addEventListener("click", function () { addAccountByToken("access"); });
+
+    $("#acc-search").addEventListener("input", function () {
+      state.filter.text = this.value;
+      state.pageNo = 1;
+      renderAccounts();
+    });
+
+    $("#acc-status-chips").addEventListener("click", function (ev) {
+      var button = ev.target.closest("button[data-status]");
+      if (!button) return;
+      state.filter.status = button.getAttribute("data-status");
+      $$("#acc-status-chips button").forEach(function (b) { b.classList.toggle("active", b === button); });
+      state.pageNo = 1;
+      renderAccounts();
+    });
+
+    $("#acc-realm-filter").addEventListener("change", function () {
+      state.filter.realm = this.value;
+      state.pageNo = 1;
+      renderAccounts();
+    });
+
+    $("#acc-sort").addEventListener("change", function () {
+      state.sort = this.value;
+      renderAccounts();
+    });
+
+    $("#acc-check-all").addEventListener("change", function () {
+      var checked = this.checked;
+      var start = (state.pageNo - 1) * state.pageSize;
+      filteredAccounts().slice(start, start + state.pageSize).forEach(function (a) {
+        if (checked) state.selected[a.uid] = true;
+        else delete state.selected[a.uid];
+      });
+      renderAccounts();
+    });
+
+    $("#acc-table").addEventListener("click", function (ev) {
+      var tr = ev.target.closest("tr[data-uid]");
+      if (!tr) return;
+      var uid = tr.getAttribute("data-uid");
+      if (ev.target.classList.contains("acc-check")) {
+        if (ev.target.checked) state.selected[uid] = true;
+        else delete state.selected[uid];
+        renderAccounts();
+        return;
+      }
+      if (ev.target.classList.contains("acc-test")) { rowAction(uid, "test", ev.target); return; }
+      var act = ev.target.getAttribute("data-act");
+      if (act) rowAction(uid, act, ev.target);
+    });
+
+    // 行内编辑：失焦即保存，不用再点"保存"
+    $("#acc-table").addEventListener("change", function (ev) {
+      var tr = ev.target.closest("tr[data-uid]");
+      if (!tr) return;
+      var uid = tr.getAttribute("data-uid");
+      if (ev.target.classList.contains("acc-note")) saveAccountField(uid, "note", ev.target.value);
+      else if (ev.target.classList.contains("acc-group")) saveAccountField(uid, "group", ev.target.value);
+      else if (ev.target.classList.contains("acc-weight")) {
+        var weight = parseInt(ev.target.value, 10);
+        if (!weight || weight < 1) { ev.target.value = "1"; weight = 1; }
+        saveAccountField(uid, "weight", weight);
+      }
+    });
+
+    $("#acc-pager").addEventListener("click", function (ev) {
+      var button = ev.target.closest("button[data-page-go]");
+      if (!button || button.disabled) return;
+      state.pageNo = parseInt(button.getAttribute("data-page-go"), 10) || 1;
+      renderAccounts();
+    });
+
+    $("#bulkbar").addEventListener("click", function (ev) {
+      var button = ev.target.closest("button[data-bulk]");
+      if (!button) return;
+      var action = button.getAttribute("data-bulk");
+      if (action === "clear") {
+        state.selected = Object.create(null);
+        renderAccounts();
+        return;
+      }
+      bulkAction(action);
+    });
+
+    // 日志
+    $("#log-lines").addEventListener("change", loadLogs);
+    $("#log-refresh-btn").addEventListener("click", loadLogs);
+    $("#log-search").addEventListener("input", function () {
+      clearTimeout(state.timers.logSearch);
+      state.timers.logSearch = setTimeout(loadLogs, 250);
+    });
+    $("#log-follow").addEventListener("change", function () {
+      state.logFollow = this.checked;
+      if (this.checked) every("logs", 3000, loadLogs);
+      else stopTimer("logs");
+    });
+    $("#log-copy-btn").addEventListener("click", function () {
+      var text = $("#log-body").textContent || "";
+      try { navigator.clipboard.writeText(text); toast("ok", "日志已复制", ""); }
+      catch (e) { toast("warn", "复制失败", "浏览器拒绝了剪贴板"); }
+    });
+
+    // 设置
+    $("#set-save").addEventListener("click", saveSettings);
+    $("#tunables-save").addEventListener("click", saveTunables);
+    $("#key-add").addEventListener("click", addKey);
+    $("#keys-table").addEventListener("click", function (ev) {
+      var button = ev.target.closest("button[data-key-del]");
+      if (button) deleteKey(button.getAttribute("data-key-del"));
+    });
+  }
+
+  // ---------------- 入口 ----------------
+
+  function main() {
+    bind();
+    setAddMode("link");
+    if (!state.token) {
+      showLogin();
+      return;
+    }
+    showApp();
+  }
+
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", main);
+  else main();
+})();

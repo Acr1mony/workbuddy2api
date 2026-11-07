@@ -215,6 +215,7 @@ X-Panel-Token: 1762500000.9f3c...
 | `POST /api/accounts/{uid}/refresh` | 强制刷新令牌 |
 | `POST /api/accounts/{uid}/checkin` | 每日签到（CN 域） |
 | `POST /api/accounts/{uid}/balance` | 查余额并写回账号 |
+| `POST /api/accounts/bulk` | `{"action":"test","uids":["..."]}` 或 `{"action":"disable","all":true,"realm":"cn"}`。`action` ∈ `enable`/`disable`/`test`/`refresh`/`balance`；单次最多 200 个；一个号失败不影响其余，返回 `{"ok":true,"total":N,"ok_count":M,"results":[{"uid","ok","detail"}]}` |
 
 账号行形状（**永不含 token**）：
 
@@ -242,8 +243,10 @@ X-Panel-Token: 1762500000.9f3c...
 
 | 方法与路径 | 说明 |
 | --- | --- |
-| `GET /api/settings` | 当前设置（**密码与 device token 不回明文**） |
-| `POST /api/settings` | `panel_password`（≥6 位）、`prompt_mode`（`passthrough`\|`sanitize`）、`api_key`、`listen`、`keys_add:[{key,name,realm,models}]`、`keys_delete:[name]` |
+| `GET /api/settings` | 当前设置（**密码与 device token 不回明文**）；`tunables` 数组给出可在线修改的调优项（`path`/`label`/`kind`/`restart`/`value`） |
+| `POST /api/settings` | `panel_password`（≥6 位）、`prompt_mode`（`passthrough`\|`sanitize`）、`api_key`、`listen`、`keys_add:[{key,name,realm,models}]`、`keys_delete:[name]`、`tunables:{配置路径: 值}` |
+
+`tunables` 的写入是**逐项校验**的：`duration` 接受 `"30m"`/`"200ms"` 或纯数字（按秒），`int`/`float` 拒绝负数，`schedule.checkin_hour` 不超过 23，`pool.strategy.*` 只接受 `weighted_random`/`round_robin`/`sequential_exhaust`。任何一项非法整单返回 `400 bad_value`、一个都不写；不认识的路径静默忽略（前向兼容）。`server.max_payload_mb` 标了 `restart: true`，改完要重启进程。
 
 ### 观测
 
@@ -251,7 +254,7 @@ X-Panel-Token: 1762500000.9f3c...
 | --- | --- |
 | `GET /api/usage` | 台账汇总：总量、按天/按密钥/按账号/按模型、最近 50 条 |
 | `GET /api/usage/recent?limit=50` | 最近请求明细 |
-| `GET /api/logs?lines=200` | 日志尾部（只读最后 256KB，不会把大文件读进内存） |
+| `GET /api/logs?lines=200` | 日志尾部，返回 `{"lines":["...", "..."]}`（只读最后 256KB，不会把大文件读进内存；`lines` 上限 2000） |
 | `GET /api/pool` | 池状态：可用/冷却/禁用、余额合计、各域策略、风控连坐剩余时间 |
 | `GET /api/scheduler` | 后台任务清单与上次/下次运行时间 |
 | `POST /api/scheduler/trigger` | `{"job":"keepalive"}` 立刻跑一次；不传 `job` 则跑全部到期任务 |
