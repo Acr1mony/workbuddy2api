@@ -1,0 +1,99 @@
+{
+  "listen": "127.0.0.1:8788",
+  "data_dir": "./data",
+  "config_version": 1,
+  "api_key": "",
+  "log_level": "INFO",
+  "server": {
+    "max_payload_mb": 16,
+    "request_timeout": 300,
+    "shutdown_grace": 5
+  },
+  "panel": {
+    "enabled": true,
+    "password": "admin",
+    "session_hours": 12,
+    "readonly": false
+  },
+  "logging": {
+    "request_archive_enabled": true,
+    "request_retention_days": 7,
+    "request_archive_max_mb": 100
+  },
+  "upstream": {
+    "timeout_seconds": 120,
+    "header_timeout_seconds": 120,
+    "idle_timeout_seconds": 300,
+    "user_agent": "",
+    "client_version": "",
+    "cli_version": "",
+    "client_name": "",
+    "device_token": "",
+    "device_token_file": "",
+    "ca_bundle": "",
+    "verify_tls": true,
+    "passthrough_ip": false,
+    "stream_heartbeat_seconds": 15,
+    "hosts": {
+      "cn": "",
+      "global": ""
+    }
+  },
+  "cooldown": {
+    "soft_rate": "600s",
+    "soft_rate_max": "2h",
+    "hard_rate": "10m",
+    "hard_rate_max": "6h",
+    "auth_dead": "24h"
+  },
+  "pool": {
+    "strategy": {
+      "cn": "weighted_random",
+      "global": "weighted_random"
+    },
+    "max_in_flight": 3,
+    "max_in_flight_global": 2,
+    "breaker_threshold": 3,
+    "breaker_cooldown": "30m",
+    "breaker_cooldown_max": "6h",
+    "degrade_threshold": 5,
+    "degrade_cooldown": "10m",
+    "degrade_cooldown_max": "2h",
+    "restriction_hold_seconds": 1800,
+    "min_pick_gap_ms": 100,
+    "prefer_expiring": true,
+    "expiring_soon": "168h",
+    "model_rates": {},
+    "credit_floor": 100,
+    "idle_weight_per_hour": 0.5,
+    "idle_weight_max": 5.0,
+    "rate_limit_retries": 2,
+    "cross_domain_fallback": false
+  },
+  "session_sticky": {
+    "enabled": true,
+    "ttl": "30m",
+    "gc_interval": "5m"
+  },
+  "schedule": {
+    "token_refresh_enabled": true,
+    "keepalive_minutes": 20,
+    "balance_refresh_enabled": true,
+    "balance_minutes": 180,
+    "checkin_enabled": true,
+    "checkin_hour": 9,
+    "checkin_realms": [
+      "cn"
+    ]
+  },
+  "models": {
+    "hidden": []
+  },
+  "prompt": {
+    "mode": "passthrough",
+    "file": ""
+  },
+  "features": {
+    "sanitize_blacklist_fingerprints": true
+  }
+}

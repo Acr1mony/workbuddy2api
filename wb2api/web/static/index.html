@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>workbuddy2api</title>
+<link rel="stylesheet" href="/panel/style.css">
+</head>
+<body>
+<div id="login" class="login hidden">
+  <form class="card" id="login-form">
+    <h1>workbuddy2api</h1>
+    <p class="muted">输入面板密码</p>
+    <input id="password" type="password" placeholder="密码" autocomplete="current-password" required>
+    <button type="submit">登录</button>
+    <p class="error" id="login-error"></p>
+  </form>
+</div>
+
+<div id="app" class="hidden">
+  <header>
+    <div class="brand">workbuddy2api <span id="version" class="muted"></span></div>
+    <nav>
+      <button class="tab active" data-tab="dashboard">概览</button>
+      <button class="tab" data-tab="accounts">账号</button>
+      <button class="tab" data-tab="settings">设置</button>
+    </nav>
+    <button id="logout" class="ghost">退出</button>
+  </header>
+
+  <main>
+    <section id="tab-dashboard" class="tab-panel active">
+      <div class="kpis">
+        <div class="kpi"><span class="label">请求</span><strong id="kpi-requests">-</strong></div>
+        <div class="kpi"><span class="label">错误</span><strong id="kpi-errors">-</strong></div>
+        <div class="kpi"><span class="label">Tokens</span><strong id="kpi-tokens">-</strong></div>
+        <div class="kpi"><span class="label">平均延迟</span><strong id="kpi-latency">-</strong></div>
+        <div class="kpi"><span class="label">缓存命中</span><strong id="kpi-cache">-</strong></div>
+      </div>
+
+      <div class="grid">
+        <div class="card">
+          <h2>账号池</h2>
+          <div id="pool" class="pool"></div>
+        </div>
+        <div class="card">
+          <h2>最近请求</h2>
+          <div class="scroll">
+            <table id="recent">
+              <thead><tr><th>时间</th><th>模型</th><th>账号</th><th>状态</th><th>耗时</th><th>Tokens</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>按模型</h2>
+        <div class="scroll">
+          <table id="by-model">
+            <thead><tr><th>模型</th><th>请求</th><th>错误</th><th>Tokens</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-accounts" class="tab-panel">
+      <div class="toolbar">
+        <select id="realm-filter">
+          <option value="">全部域</option>
+          <option value="cn">CN</option>
+          <option value="global">Global</option>
+        </select>
+        <button id="refresh-accounts" class="ghost">刷新列表</button>
+        <button id="show-add">添加账号</button>
+      </div>
+
+      <div class="card hidden" id="add-panel">
+        <h2>添加账号</h2>
+        <div class="row">
+          <label>域
+            <select id="add-realm">
+              <option value="cn">CN（copilot.tencent.com）</option>
+              <option value="global">Global（workbuddy.ai）</option>
+            </select>
+          </label>
+          <label>备注 <input id="add-note" placeholder="可选"></label>
+        </div>
+        <label>refresh token
+          <textarea id="add-refresh" rows="2" placeholder="粘贴 refresh token（推荐，可自动续期）"></textarea>
+        </label>
+        <label>或 access token
+          <textarea id="add-access" rows="2" placeholder="粘贴 access token（过期后需手动替换）"></textarea>
+        </label>
+        <div class="row">
+          <button id="add-submit">保存</button>
+          <button id="login-by-url" class="ghost">用登录链接添加</button>
+        </div>
+        <div id="login-flow" class="hidden">
+          <ol>
+            <li>在浏览器打开下面这条链接并完成登录：</li>
+            <li><a id="login-url" href="#" target="_blank" rel="noreferrer"></a></li>
+            <li>本页会自动轮询，成功后账号出现在列表里。</li>
+          </ol>
+          <p class="muted" id="login-state"></p>
+        </div>
+        <p class="error" id="add-error"></p>
+      </div>
+
+      <div class="card">
+        <div class="scroll">
+          <table id="accounts">
+            <thead><tr>
+              <th>昵称</th><th>域</th><th>额度</th><th>令牌到期</th><th>状态</th><th>操作</th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-settings" class="tab-panel">
+      <div class="card">
+        <h2>网关</h2>
+        <label>监听地址 <input id="set-listen" placeholder="127.0.0.1:8788"></label>
+        <label>默认 API key（留空 = 本机免鉴权）
+          <input id="set-apikey" placeholder="sk-...">
+        </label>
+        <label>prompt 模式
+          <select id="set-prompt">
+            <option value="passthrough">passthrough（原样转发）</option>
+            <option value="sanitize">sanitize（改写疑似指纹句）</option>
+          </select>
+        </label>
+        <p class="muted">sanitize 会把请求里疑似 Anthropic/Codex 客户端标识的句子改一个词——上游是逐字匹配的，但改写用户 prompt 始终有代价，默认关闭。</p>
+        <button id="save-gateway">保存</button>
+      </div>
+
+      <div class="card">
+        <h2>客户端密钥</h2>
+        <div class="scroll">
+          <table id="keys">
+            <thead><tr><th>名称</th><th>Key</th><th>域</th><th>模型</th><th>请求</th><th></th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="row">
+          <input id="key-name" placeholder="名称">
+          <input id="key-models" placeholder="模型白名单，如 deepseek* , gpt-*（留空=全部）">
+          <select id="key-realm">
+            <option value="">跟随请求</option>
+            <option value="cn">仅 CN</option>
+            <option value="global">仅 Global</option>
+          </select>
+          <button id="add-key">新增</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>面板密码</h2>
+        <label>新密码 <input id="set-password" type="password" placeholder="至少 6 位"></label>
+        <button id="save-password">修改</button>
+      </div>
+      <p class="error" id="settings-error"></p>
+    </section>
+  </main>
+</div>
+
+<script src="/panel/app.js"></script>
+</body>
+</html>

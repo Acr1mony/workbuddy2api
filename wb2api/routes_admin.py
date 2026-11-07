@@ -1,0 +1,459 @@
+"""面板 API：账号、设置、用量、日志、调度。
+
+设计取舍（与两个参考实现都不同）：
+
+* **登录发令牌，不用 cookie 里的明文密码**。令牌是 HMAC 签名的 ``<exp>.<sig>``，
+  放在 ``X-Panel-Token`` 头里（不放 query：query 会进 Referer 和访问日志）。
+* **面板关闭时整个 ``/panel`` 与 ``/api`` 前缀 404**，不返回 401——一个不存在的
+  路径比"需要密码"更少勾人去猜。
+* **账号行永不含 token**。``Account.masked()`` 只给掩码与到期时间，UI 需要的
+  信息全在里面，泄露面为零。
+"""
+
+from __future__ import annotations
+
+import hmac
+import time
+from typing import Any, Dict, List, Optional
+
+from . import identity, util
+from .billing import Billing
+from .httpserver import BadRequest, Response, Router, error_response, json_response
+from .log import get_logger
+from .service import ServiceError
+from .pool import throttle_until
+from .store import Account, ApiKey
+
+log = get_logger("panel")
+
+LOGIN_WINDOW = 60.0
+LOGIN_MAX_ATTEMPTS = 5
+
+
+class Panel:
+    def __init__(self, service: Any, cfg: Any) -> None:
+        from .httpserver import SessionAuth
+
+        self.service = service
+        self.cfg = cfg
+        self.store = service.store
+        self.auth = service.auth
+        self.pool = service.pool
+        self.billing = Billing(service.client, cfg)
+        self.sessions = SessionAuth(self.store, ttl_seconds=float(cfg.get("panel.session_hours", 12)) * 3600)
+        self._attempts: Dict[str, List[float]] = {}
+
+    # -- 开关与鉴权 ---------------------------------------------------------
+    def enabled(self) -> bool:
+        return bool(self.cfg.get("panel.enabled"))
+
+    def password(self) -> str:
+        return str(self.cfg.get("panel.password") or "admin")
+
+    def authenticated(self, req: Any) -> bool:
+        token = req.header("x-panel-token") or req.arg("token")
+        if not token:
+            raw = req.header("cookie")
+            for part in (raw or "").split(";"):
+                name, _, value = part.strip().partition("=")
+                if name == "wb2a_panel":
+                    token = value
+                    break
+        return self.sessions.verify(token)
+
+    def require(self, req: Any) -> None:
+        if not self.enabled():
+            raise BadRequest("panel disabled", 404, "panel_disabled")
+        if not self.authenticated(req):
+            raise BadRequest("需要登录", 401, "unauthorized")
+
+    def _throttled(self, ip: str) -> bool:
+        now = time.time()
+        history = [stamp for stamp in self._attempts.get(ip, []) if now - stamp < LOGIN_WINDOW]
+        self._attempts[ip] = history
+        return len(history) >= LOGIN_MAX_ATTEMPTS
+
+    def _note_attempt(self, ip: str) -> None:
+        self._attempts.setdefault(ip, []).append(time.time())
+
+
+def register(router: Router, panel: Panel) -> None:
+    # -- 登录 ---------------------------------------------------------------
+    router.add("POST", r"/panel/login", lambda req: _login(panel, req))
+    router.add("POST", r"/panel/logout", lambda req: json_response({"ok": True}))
+    router.add("GET", r"/panel/status", lambda req: _status(panel, req))
+
+    # -- 账号 ---------------------------------------------------------------
+    router.add("GET", r"/api/accounts", lambda req: _accounts(panel, req))
+    router.add("POST", r"/api/accounts/add", lambda req: _add_account(panel, req))
+    router.add("POST", r"/api/accounts/set", lambda req: _set_account(panel, req))
+    router.add("POST", r"/api/accounts/login/start", lambda req: _login_start(panel, req))
+    router.add("GET", r"/api/accounts/login/poll", lambda req: _login_poll(panel, req))
+    router.add(
+        "POST",
+        r"/api/accounts/(?P<uid>[^/]+)/(?P<action>enable|disable|delete|test|refresh|checkin|balance)",
+        lambda req, uid, action: _account_action(panel, req, uid, action),
+    )
+
+    # -- 设置 / 用量 / 日志 / 调度 ------------------------------------------
+    router.add("GET", r"/api/settings", lambda req: _settings_get(panel, req))
+    router.add("POST", r"/api/settings", lambda req: _settings_post(panel, req))
+    router.add("GET", r"/api/usage", lambda req: _usage(panel, req))
+    router.add("GET", r"/api/usage/recent", lambda req: _usage_recent(panel, req))
+    router.add("GET", r"/api/logs", lambda req: _logs(panel, req))
+    router.add("GET", r"/api/pool", lambda req: _pool(panel, req))
+    router.add("GET", r"/api/scheduler", lambda req: _scheduler(panel, req))
+    router.add("POST", r"/api/scheduler/trigger", lambda req: _scheduler_trigger(panel, req))
+
+
+# --------------------------------------------------------------------------
+# 登录
+# --------------------------------------------------------------------------
+
+
+def _login(panel: Panel, req: Any) -> Response:
+    if not panel.enabled():
+        return error_response(404, "panel disabled", "panel_disabled")
+    ip = req.client_ip or "?"
+    if panel._throttled(ip):
+        return error_response(429, "登录尝试过于频繁，请稍后再试", "too_many_attempts", kind="rate_limit_error")
+    body = req.json_body()
+    given = str(body.get("password") or "")
+    if not hmac.compare_digest(given, panel.password()):
+        panel._note_attempt(ip)
+        log.warning("面板登录失败：%s", ip)
+        return error_response(401, "密码错误", "bad_password")
+    token, expires = panel.sessions.issue()
+    return json_response({"ok": True, "token": token, "expires_at": expires})
+
+
+def _status(panel: Panel, req: Any) -> Response:
+    keys = panel.store.list_keys()
+    payload = {
+        "enabled": panel.enabled(),
+        "password_required": True,
+        "is_default_password": panel.password() in ("admin", ""),
+        "authenticated": panel.authenticated(req),
+        "api_key_set": bool(panel.cfg.get("api_key")) or bool(keys),
+        "version": _version(),
+    }
+    if not panel.enabled():
+        return json_response({"enabled": False})
+    return json_response(payload)
+
+
+def _version() -> str:
+    from . import VERSION
+
+    return VERSION
+
+
+# --------------------------------------------------------------------------
+# 账号
+# --------------------------------------------------------------------------
+
+
+def _accounts(panel: Panel, req: Any) -> Response:
+    panel.require(req)
+    realm = identity.normalize_realm(req.arg("realm")) if req.arg("realm") else ""
+    now = time.time()
+    rows = []
+    for account in panel.store.list_accounts(realm):
+        row = account.masked()
+        wait, window = throttle_until(account, "")
+        row["throttle_for"] = int(max(0.0, (wait or 0) - now))
+        row["throttle_reason"] = window
+        row["in_flight"] = getattr(account, "in_flight", 0)
+        rows.append(row)
+    return json_response({"accounts": rows, "realm": realm or "all"})
+
+
+def _add_account(panel: Panel, req: Any) -> Response:
+    panel.require(req)
+    body = req.json_body()
+    realm = identity.normalize_realm(body.get("realm") or "cn")
+    refresh_token = str(body.get("refresh_token") or "").strip()
+    access_token = str(body.get("access_token") or body.get("token") or "").strip()
+    if not refresh_token and not access_token:
+        return error_response(400, "需要 refresh_token 或 access_token", "missing_token")
+    account = Account(
+        refresh_token=refresh_token,
+        access_token=access_token,
+        realm=realm,
+        note=str(body.get("note") or ""),
+        proxy=str(body.get("proxy") or ""),
+        group=str(body.get("group") or ""),
+    )
+    account.ensure_ids()
+    if not access_token:
+        try:
+            panel.auth.refresh(account, force=True)
+        except Exception as exc:
+            return error_response(400, f"用该 refresh_token 换令牌失败: {exc}", "refresh_failed")
+    claimed = account.token_claims()
+    account.uid = str(claimed.get("uid") or account.uid or "")
+    account.enterprise_id = str(claimed.get("enterpriseId") or claimed.get("enterprise_id") or "")
+    panel.store.upsert_account(account)
+    log.info("新增账号 %s（%s）", account.label, realm)
+    return json_response({"ok": True, "account": account.masked()})
+
+
+def _set_account(panel: Panel, req: Any) -> Response:
+    panel.require(req)
+    body = req.json_body()
+    account = panel.store.get_account(str(body.get("uid") or ""))
+    if account is None:
+        return error_response(404, "账号不存在", "unknown_account")
+    for field, caster in (
+        ("weight", float),
+        ("note", str),
+        ("group", str),
+        ("proxy", str),
+        ("enabled", bool),
+    ):
+        if field in body:
+            try:
+                setattr(account, field, caster(body[field]))
+            except (TypeError, ValueError):
+                return error_response(400, f"{field} 类型不对", "bad_field")
+    account.updated_at = util.now()
+    panel.store.upsert_account(account)
+    return json_response({"ok": True, "account": account.masked()})
+
+
+def _account_action(panel: Panel, req: Any, uid: str, action: str) -> Response:
+    panel.require(req)
+    account = panel.store.get_account(uid)
+    if account is None:
+        return error_response(404, "账号不存在", "unknown_account")
+
+    if action == "enable":
+        account.enabled = True
+        panel.store.upsert_account(account)
+        return json_response({"ok": True})
+    if action == "disable":
+        account.enabled = False
+        panel.store.upsert_account(account)
+        return json_response({"ok": True})
+    if action == "delete":
+        panel.store.remove_account(account.key)
+        try:
+            panel.service.affinity.drop(account.key)
+        except Exception:  # 亲和表里没有也无所谓
+            pass
+        log.info("删除账号 %s", account.label)
+        return json_response({"ok": True})
+    if action == "test":
+        return _test(panel, account)
+    if action == "refresh":
+        try:
+            panel.auth.refresh(account, force=True)
+        except Exception as exc:
+            return error_response(400, f"刷新失败: {exc}", "refresh_failed")
+        panel.store.upsert_account(account)
+        return json_response({"ok": True, "expires_at": account.expires_at})
+    if action == "checkin":
+        ok, message = panel.billing.checkin(account, account.realm)
+        return json_response({"ok": ok, "message": message})
+    if action == "balance":
+        value = panel.billing.credits(account, account.realm)
+        if value is not None:
+            account.credit = value
+            account.credit_at = util.now()
+            panel.store.upsert_account(account)
+        return json_response({"ok": value is not None, "credits": value})
+    return error_response(400, f"未知操作 {action}", "bad_action")
+
+
+def _test(panel: Panel, account: Account) -> Response:
+    """用一次最小请求确认账号真的能用。
+
+    只测模型目录不够——目录接口对过期令牌也能返回缓存；必须打一次真 chat。
+    而且要允许它失败（这里不写冷却，免得测试把好号关掉）。
+    """
+    from .adapters import chat as chat_adapter
+
+    try:
+        panel.auth.ensure_token(account)
+        names = panel.service.catalog.names(account.realm) or panel.service.catalog.names("cn")
+        model = names[0] if names else "deepseek-v3"
+        body = {"model": model, "messages": [{"role": "user", "content": "ping"}], "stream": False, "max_tokens": 16}
+        meta_body = chat_adapter.prepare_request(body, panel.service.catalog.meta_map(account.realm))
+        import json as _json
+
+        payload = _json.dumps(meta_body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        meta = identity.ChatMeta.for_request(body)
+        headers = identity.chat_headers(account, panel.cfg, meta=meta, client_ip="127.0.0.1")
+        url = panel.service.client.base_url(account.realm) + "/v2/chat/completions"
+        response = panel.service.client.post(url, headers, raw_body=payload, proxy=account.proxy or "")
+        try:
+            first = ""
+            for line in response.iter_text(30.0):
+                if line.startswith("data:"):
+                    first = line[5:].strip()
+                    break
+        finally:
+            response.close()
+        ok = False
+        detail = ""
+        if first and first != "[DONE]":
+            try:
+                obj = _json.loads(first)
+            except ValueError:
+                ok = True  # 拿到了非 JSON 数据，说明流确实是真的
+            else:
+                ok = not (isinstance(obj, dict) and "error" in obj)
+                detail = _json.dumps(obj, ensure_ascii=False)[:200]
+        return json_response({"ok": ok, "model": model, "sample": (detail or first)[:200]})
+    except Exception as exc:
+        return json_response({"ok": False, "error": str(exc)[:300]})
+
+
+def _login_start(panel: Panel, req: Any) -> Response:
+    panel.require(req)
+    body = req.json_body()
+    realm = identity.normalize_realm(body.get("realm") or "cn")
+    session = panel.auth.start_login(realm)
+    return json_response({"ok": True, "state": session.state, "url": session.url, "realm": realm})
+
+
+def _login_poll(panel: Panel, req: Any) -> Response:
+    panel.require(req)
+    state = req.arg("state")
+    if not state:
+        return error_response(400, "缺少 state", "missing_state")
+    session = panel.auth.poll_login(state)
+    payload = {"state": session.status, "message": session.message}
+    if session.status == "ok":
+        account = getattr(session, "account", None)
+        payload["account"] = account.masked() if account is not None else None
+    return json_response(payload)
+
+
+# --------------------------------------------------------------------------
+# 设置
+# --------------------------------------------------------------------------
+
+
+def _settings_get(panel: Panel, req: Any) -> Response:
+    panel.require(req)
+    cfg = panel.cfg
+    return json_response(
+        {
+            "panel": {"enabled": cfg.get("panel.enabled"), "session_hours": cfg.get("panel.session_hours")},
+            "api_keys": [key.masked() for key in panel.store.list_keys()],
+            "default_api_key_set": bool(cfg.get("api_key")),
+            "upstream": {
+                "timeout_seconds": cfg.get("upstream.timeout_seconds"),
+                "idle_timeout_seconds": cfg.get("upstream.idle_timeout_seconds"),
+                "client_version": cfg.get("upstream.client_version"),
+                "cli_version": cfg.get("upstream.cli_version"),
+                "client_name": cfg.get("upstream.client_name"),
+            },
+            "pool": cfg.get("pool.strategy"),
+            "prompt_mode": cfg.get("prompt.mode"),
+            "listen": cfg.get("listen"),
+        }
+    )
+
+
+def _settings_post(panel: Panel, req: Any) -> Response:
+    panel.require(req)
+    body = req.json_body()
+    cfg = panel.cfg
+    if "panel_password" in body:
+        password = str(body["panel_password"] or "")
+        if len(password) < 6:
+            return error_response(400, "密码至少 6 位", "weak_password")
+        cfg.set("panel.password", password)
+    if "prompt_mode" in body:
+        mode = str(body["prompt_mode"])
+        if mode not in ("passthrough", "sanitize"):
+            return error_response(400, "prompt_mode 只能是 passthrough 或 sanitize", "bad_value")
+        cfg.set("prompt.mode", mode)
+    if "api_key" in body:
+        cfg.set("api_key", str(body["api_key"] or ""))
+    if "listen" in body:
+        cfg.set("listen", str(body["listen"]))
+    cfg.save()
+
+    for item in body.get("keys_add") or []:
+        key = ApiKey(
+            key=str(item.get("key") or util.rand_hex(24)),
+            name=str(item.get("name") or ""),
+            realm=str(item.get("realm") or ""),
+            models=[str(m) for m in (item.get("models") or [])],
+        )
+        panel.store.add_key(key)
+    for name in body.get("keys_delete") or []:
+        panel.store.remove_key(str(name))
+    return json_response({"ok": True})
+
+
+# --------------------------------------------------------------------------
+# 用量 / 日志 / 调度
+# --------------------------------------------------------------------------
+
+
+def _usage(panel: Panel, req: Any) -> Response:
+    panel.require(req)
+    return json_response(panel.service.ledger.summary())
+
+
+def _usage_recent(panel: Panel, req: Any) -> Response:
+    panel.require(req)
+    limit = max(1, min(500, int(req.arg("limit", "50") or 50)))
+    return json_response({"items": panel.service.ledger.recent(limit)})
+
+
+def _logs(panel: Panel, req: Any) -> Response:
+    panel.require(req)
+    limit = max(1, min(2000, int(req.arg("lines", "200") or 200)))
+    return json_response({"lines": read_tail(panel.cfg.get("logging.dir") or "./logs", limit)})
+
+
+def _pool(panel: Panel, req: Any) -> Response:
+    panel.require(req)
+    return json_response(panel.pool.stats())
+
+
+def _scheduler(panel: Panel, req: Any) -> Response:
+    panel.require(req)
+    scheduler = getattr(panel.service, "scheduler", None)
+    if scheduler is None:
+        return json_response({"running": False, "jobs": []})
+    return json_response(scheduler.snapshot())
+
+
+def _scheduler_trigger(panel: Panel, req: Any) -> Response:
+    panel.require(req)
+    scheduler = getattr(panel.service, "scheduler", None)
+    if scheduler is None:
+        return error_response(404, "调度器未启动", "no_scheduler")
+    name = req.json_body().get("job") or req.arg("job")
+    ok = scheduler.trigger(str(name)) if name else scheduler.run_once()
+    return json_response({"ok": ok})
+
+
+def read_tail(directory: str, limit: int) -> List[str]:
+    """读日志文件的最后 N 行（不把整个文件读进内存）。"""
+    import os
+
+    try:
+        names = [name for name in os.listdir(directory) if name.endswith(".log")]
+    except OSError:
+        return []
+    if not names:
+        return []
+    names.sort(key=lambda name: os.path.getmtime(os.path.join(directory, name)))
+    path = os.path.join(directory, names[-1])
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            block = min(size, 256 * 1024)
+            handle.seek(size - block)
+            data = handle.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    return data.splitlines()[-limit:]

@@ -1,0 +1,308 @@
+"""Configuration: defaults, file loading, environment overrides, validation.
+
+Precedence (lowest to highest): ``DEFAULTS`` -> ``config.json`` -> ``WB_*`` env.
+
+The file is intentionally flat-ish JSON: an operator should be able to edit it
+in Notepad, and the panel only ever writes a handful of keys back.  Unknown keys
+are preserved on save so a newer version's settings survive a downgrade.
+"""
+
+from __future__ import annotations
+
+import copy
+import os
+from typing import Any, Dict, List, Optional, Tuple
+
+from . import util
+
+DEFAULTS: Dict[str, Any] = {
+    # --- process -----------------------------------------------------------
+    "listen": "127.0.0.1:8788",
+    "data_dir": "./data",
+    "config_version": 1,
+    # Initial gateway key; the panel-managed key store takes over once it has
+    # at least one key.  Empty means "only the panel-managed keys work".
+    "api_key": "",
+    "log_level": "INFO",
+    # --- http --------------------------------------------------------------
+    "server": {
+        "max_payload_mb": 16,
+        "request_timeout": 300,
+        "shutdown_grace": 5,
+    },
+    "panel": {
+        "enabled": True,
+        "password": "admin",
+        "session_hours": 12,
+        "readonly": False,
+    },
+    "logging": {
+        "request_archive_enabled": True,
+        "request_retention_days": 7,
+        "request_archive_max_mb": 100,
+    },
+    # --- upstream ----------------------------------------------------------
+    "upstream": {
+        "timeout_seconds": 120,
+        "header_timeout_seconds": 120,
+        "idle_timeout_seconds": 300,
+        "user_agent": "",
+        "client_version": "",
+        "cli_version": "",
+        "client_name": "",
+        "device_token": "",
+        "device_token_file": "",
+        "ca_bundle": "",
+        "verify_tls": True,
+        "passthrough_ip": False,
+        "stream_heartbeat_seconds": 15,
+        "hosts": {"cn": "", "global": ""},
+    },
+    "cooldown": {
+        "soft_rate": "600s",
+        "soft_rate_max": "2h",
+        "hard_rate": "10m",
+        "hard_rate_max": "6h",
+        "auth_dead": "24h",
+    },
+    "pool": {
+        # 域键统一用 cn / global；读取时仍接受旧键名 domestic / international
+        "strategy": {"cn": "weighted_random", "global": "weighted_random"},
+        "max_in_flight": 3,
+        "max_in_flight_global": 2,
+        "breaker_threshold": 3,
+        "breaker_cooldown": "30m",
+        "breaker_cooldown_max": "6h",
+        "degrade_threshold": 5,
+        "degrade_cooldown": "10m",
+        "degrade_cooldown_max": "2h",
+        # 11140 连坐：900 秒内 2 个号被风控就整域暂停这么久（0 = 关闭）
+        "restriction_hold_seconds": 1800,
+        "min_pick_gap_ms": 100,
+        "prefer_expiring": True,
+        "expiring_soon": "168h",
+        "model_rates": {},
+        "credit_floor": 100,
+        "idle_weight_per_hour": 0.5,
+        "idle_weight_max": 5.0,
+        "rate_limit_retries": 2,
+        "cross_domain_fallback": False,
+    },
+    "session_sticky": {"enabled": True, "ttl": "30m", "gc_interval": "5m"},
+    "schedule": {
+        # 键名必须和 scheduler.py 读的一致，否则配置改了等于没改
+        "token_refresh_enabled": True,
+        "keepalive_minutes": 20,
+        "balance_refresh_enabled": True,
+        "balance_minutes": 180,
+        "checkin_enabled": True,
+        "checkin_hour": 9,
+        "checkin_realms": ["cn"],
+    },
+    "models": {"hidden": []},
+    "prompt": {"mode": "passthrough", "file": ""},
+    "features": {"sanitize_blacklist_fingerprints": True},
+}
+
+ENV_OVERRIDES: Dict[str, str] = {
+    "WB_LISTEN": "listen",
+    "WB_DATA_DIR": "data_dir",
+    "WB_API_KEY": "api_key",
+    "WB_LOG_LEVEL": "log_level",
+    "WB_PANEL_PASSWORD": "panel.password",
+    "WB_PANEL_ENABLED": "panel.enabled",
+    "WB_UPSTREAM_TIMEOUT": "upstream.timeout_seconds",
+    "WB_UPSTREAM_IDLE_TIMEOUT": "upstream.idle_timeout_seconds",
+    "WB_USER_AGENT": "upstream.user_agent",
+    "WB_CLIENT_VERSION": "upstream.client_version",
+    "WB_CLI_VERSION": "upstream.cli_version",
+    "WB_CLIENT_NAME": "upstream.client_name",
+    "WB_DEVICE_TOKEN": "upstream.device_token",
+    "WB_DEVICE_TOKEN_FILE": "upstream.device_token_file",
+    "WB_CA_BUNDLE": "upstream.ca_bundle",
+    "WB_MAX_PAYLOAD_MB": "server.max_payload_mb",
+    "WB_MAX_IN_FLIGHT": "pool.max_in_flight",
+    "WB_CREDIT_FLOOR": "pool.credit_floor",
+}
+
+_TRUE = {"1", "true", "yes", "on", "y", "t"}
+_FALSE = {"0", "false", "no", "off", "n", "f", ""}
+
+
+# 旧版本用 domestic / international 当域键；读配置时保留回落，
+# 这样升级不需要用户改配置文件（两套键名同时存在时以新键为准）。
+LEGACY_REALM_KEYS = {"cn": "domestic", "global": "international"}
+
+
+def realm_value(cfg: Any, prefix: str, realm: str, default: Any = None) -> Any:
+    """读 ``<prefix>.<realm>``，缺失时回落旧键名。cfg 可以是 Config 或普通 dict。"""
+    if cfg is None:
+        return default
+    getter = cfg.get if hasattr(cfg, "get") else None
+    if getter is None:
+        return default
+    value = getter(prefix + "." + realm)
+    if value in (None, ""):
+        legacy = LEGACY_REALM_KEYS.get(realm)
+        if legacy:
+            value = getter(prefix + "." + legacy)
+    return default if value in (None, "") else value
+
+
+def _coerce(value: str, template: Any) -> Any:
+    """Convert an env string to the type of the default it overrides."""
+    if isinstance(template, bool):
+        lowered = value.strip().lower()
+        if lowered in _TRUE:
+            return True
+        if lowered in _FALSE:
+            return False
+        return template
+    if isinstance(template, int) and not isinstance(template, bool):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return template
+    if isinstance(template, float):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return template
+    if isinstance(template, list):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return value
+
+
+def deep_merge(base: Dict[str, Any], overlay: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Recursive dict merge that keeps unknown keys from *overlay*."""
+    result = copy.deepcopy(base)
+    if not overlay:
+        return result
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = deep_merge(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+class Config:
+    """Mutable configuration object shared by the whole process."""
+
+    def __init__(self, path: Optional[str] = None, values: Optional[Dict[str, Any]] = None) -> None:
+        self.path = os.path.abspath(path) if path else None
+        self.values: Dict[str, Any] = deep_merge(DEFAULTS, values or {})
+        self._env_applied: Dict[str, str] = {}
+
+    # -- construction -------------------------------------------------------
+    @classmethod
+    def load(cls, path: Optional[str]) -> "Config":
+        values = util.read_json(path, None) if path else None
+        config = cls(path, values if isinstance(values, dict) else None)
+        config.apply_env(os.environ)
+        return config
+
+    def apply_env(self, environ: Dict[str, str]) -> None:
+        for env_name, dotted in ENV_OVERRIDES.items():
+            raw = environ.get(env_name)
+            if raw is None or raw == "":
+                continue
+            template = self.get(dotted)
+            self.set(dotted, _coerce(raw, template))
+            self._env_applied[dotted] = env_name
+
+    # -- access -------------------------------------------------------------
+    def get(self, dotted: str, default: Any = None) -> Any:
+        node: Any = self.values
+        for part in dotted.split("."):
+            if not isinstance(node, dict) or part not in node:
+                return default
+            node = node[part]
+        return node
+
+    def set(self, dotted: str, value: Any) -> None:
+        parts = dotted.split(".")
+        node = self.values
+        for part in parts[:-1]:
+            nxt = node.get(part)
+            if not isinstance(nxt, dict):
+                nxt = {}
+                node[part] = nxt
+            node = nxt
+        node[parts[-1]] = value
+
+    def as_dict(self) -> Dict[str, Any]:
+        return copy.deepcopy(self.values)
+
+    # -- persistence --------------------------------------------------------
+    def save(self) -> None:
+        if not self.path:
+            return
+        util.atomic_write_json(self.path, self.values)
+
+    def public_dict(self) -> Dict[str, Any]:
+        """Config view for the panel: secrets replaced by a mask marker."""
+        data = self.as_dict()
+        upstream = data.setdefault("upstream", {})
+        if upstream.get("device_token"):
+            upstream["device_token_set"] = True
+        upstream["device_token"] = ""
+        panel = data.setdefault("panel", {})
+        panel["password_set"] = bool(panel.get("password"))
+        panel["password"] = ""
+        return data
+
+    # -- derived values -----------------------------------------------------
+    @property
+    def data_dir(self) -> str:
+        return os.path.abspath(self.get("data_dir", "./data"))
+
+    def path_in_data(self, *parts: str) -> str:
+        return os.path.join(self.data_dir, *parts)
+
+    def listen_address(self) -> Tuple[str, int]:
+        raw = str(self.get("listen", "127.0.0.1:8788")).strip()
+        if raw.startswith(":"):
+            return "0.0.0.0", int(raw[1:])
+        if ":" in raw:
+            host, port = raw.rsplit(":", 1)
+            return (host or "127.0.0.1"), int(port)
+        return "127.0.0.1", int(raw or 8788)
+
+    def upstream_timeout(self) -> float:
+        return float(self.get("upstream.timeout_seconds", 120))
+
+    def idle_timeout(self) -> float:
+        return float(self.get("upstream.idle_timeout_seconds", 300))
+
+    # -- validation ---------------------------------------------------------
+    def validate(self) -> List[str]:
+        problems: List[str] = []
+        try:
+            host, port = self.listen_address()
+            if not (0 < port < 65536):
+                problems.append(f"listen port out of range: {port}")
+            del host
+        except (ValueError, TypeError):
+            problems.append(f"listen is not host:port -> {self.get('listen')!r}")
+
+        if int(self.get("server.max_payload_mb", 16)) <= 0:
+            problems.append("server.max_payload_mb must be > 0")
+        if self.get("upstream.verify_tls") is False and not self.get("upstream.ca_bundle"):
+            problems.append("upstream.verify_tls=false without a ca_bundle is unsafe")
+        for dotted in ("pool.max_in_flight", "pool.max_in_flight_global"):
+            if int(self.get(dotted, 0)) < 1:
+                problems.append(f"{dotted} must be >= 1")
+        if int(self.get("pool.credit_floor", 0)) < 0:
+            problems.append("pool.credit_floor must be >= 0")
+        for dotted in (
+            "cooldown.soft_rate",
+            "cooldown.hard_rate",
+            "pool.breaker_cooldown",
+            "session_sticky.ttl",
+        ):
+            if util.parse_duration(self.get(dotted), -1) < 0:
+                problems.append(f"{dotted} is not a duration: {self.get(dotted)!r}")
+        if not os.path.isdir(self.data_dir):
+            problems.append(f"data_dir does not exist yet (will be created): {self.data_dir}")
+        return problems

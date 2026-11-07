@@ -1,0 +1,78 @@
+"""客户端面路由：OpenAI 兼容的四个端点。
+
+只有四个，因为客户端只需要这些：
+
+===============  ======================================================
+POST /v1/chat/completions   主入口（流式/非流式）
+GET  /v1/models             模型列表（从上游目录聚合，按 realm 过滤）
+GET  /healthz               存活探针，**不需要鉴权**（反代挂了的告警靠它）
+GET  /status                人看的摘要：池状态、余额、最近错误
+===============  ======================================================
+
+``/status`` 与 ``/healthz`` 的分工是刻意的：探针不该暴露账号数量或余额，
+所以 ``/healthz`` 只回 ``{"ok": true}``。
+"""
+
+from __future__ import annotations
+
+from typing import Any, Callable
+
+from .httpserver import BadRequest, Response, Router, error_response, json_response
+from .service import ServiceError
+from .upstream import UpstreamError
+
+
+def guard(handler: Callable[..., Any]) -> Callable[..., Any]:
+    """把各层的异常统一翻译成 OpenAI 错误信封。
+
+    没有这一层，``dispatch`` 里的兜底会把每个预料之中的失败都变成 500。
+    """
+
+    def wrapper(req: Any, **params: Any) -> Response:
+        try:
+            return handler(req, **params)
+        except ServiceError as exc:
+            return error_response(exc.status, exc.message, exc.code, kind=exc.kind)
+        except BadRequest as exc:
+            return error_response(exc.status, exc.message, exc.code, kind="invalid_request_error")
+        except UpstreamError as exc:
+            return error_response(503, str(exc), "upstream_unavailable", kind="api_error")
+        except (BrokenPipeError, ConnectionResetError):
+            raise
+        except Exception as exc:  # 仍然兜底，但要留下堆栈
+            from .log import get_logger
+
+            get_logger("routes").exception("handler %s failed", getattr(handler, "__name__", handler))
+            return error_response(500, f"internal error: {exc}", "internal_error", kind="api_error")
+
+    return wrapper
+
+
+def register(router: Router, service: Any) -> None:
+    router.add("POST", r"/v1/chat/completions", guard(lambda req: service.chat_completions(req)))
+    router.add("GET", r"/v1/models", guard(lambda req: service.models(req)))
+    router.add("GET", r"/healthz", lambda req: json_response({"ok": True}))
+    router.add("GET", r"/status", guard(lambda req: json_response(service.status(req))))
+    # 有些客户端会先试 /v1/models/{id} 确认能力，回 404 比 500 友好。
+    router.add(
+        "GET",
+        r"/v1/models/(?P<model>[^/]+)",
+        guard(lambda req, model: _one_model(service, req, model)),
+    )
+
+
+def _one_model(service: Any, req: Any, model: str) -> Response:
+    from .httpserver import error_response as err
+
+    payload = service.models(req)
+    listing = payload.body if isinstance(payload.body, bytes) else b""
+    import json
+
+    try:
+        data = json.loads(listing.decode("utf-8")).get("data") or []
+    except ValueError:
+        data = []
+    for item in data:
+        if item.get("id") == model:
+            return json_response(item)
+    return err(404, f"model {model} not found", "model_not_found", kind="invalid_request_error")
