@@ -265,8 +265,16 @@ class Config:
 
     # -- persistence --------------------------------------------------------
     def save(self) -> None:
+        """就地写回配置文件；内存配置（path 为空）直接跳过。
+
+        数据目录可能是第一次创建（默认路径是 ``<data_dir>/config.json``），
+        所以这里顺手把父目录补出来，免得第一次改设置就 FileNotFoundError。
+        """
         if not self.path:
             return
+        parent = os.path.dirname(self.path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         util.atomic_write_json(self.path, self.values)
 
     def public_dict(self) -> Dict[str, Any]:

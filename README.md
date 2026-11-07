@@ -139,7 +139,13 @@ docs/                   架构、协议、API、部署、贡献指南
 
 ## 配置
 
-配置文件默认是 `./config.json`（可用 `-c` 或 `WB_CONFIG` 指定）。**首次运行自动生成**，字段与默认值见 [config.example.json](config.example.json)。
+配置文件的查找顺序（`-c` / `WB_CONFIG` 优先）：
+
+1. 显式指定的路径；
+2. 工作目录下的 `config.json`（如果本来就有）；
+3. **数据目录下的 `config.json`**（`<data_dir>/config.json`，默认 `./data/config.json`）。
+
+前两种之外不会往工作目录里写东西：以前默认路径写死成 `./config.json`，用 `python -m wb2api` 从仓库根启动时，面板改一次设置就会在仓库里凭空生成一个配置文件——现在这些改动落到数据目录里，重启后依然生效。字段与默认值见 [config.example.json](config.example.json)。
 
 改配置的三种方式，优先级从高到低：
 

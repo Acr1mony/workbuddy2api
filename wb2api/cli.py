@@ -21,9 +21,38 @@ from .config import Config
 from .log import get_logger, setup as setup_logging
 
 
+def _config(args: argparse.Namespace) -> Config:
+    """决定读哪个配置文件，以及"以后写回哪里"。
+
+    以前默认路径就是工作目录下的 ``config.json``，于是"跑一次测试"或"在面板里
+    改一次设置"都会在当前目录凭空生成/覆盖一个配置文件——用 ``python -m wb2api``
+    从仓库根启动时，这等于悄悄改掉使用者的配置。
+
+    现在的规则：显式给了 ``-c``/``WB_CONFIG`` 就用它；工作目录里本来就有
+    ``config.json`` 就用它；否则配置落在数据目录（``<data_dir>/config.json``），
+    既不会污染工作目录，面板里的改动也能在重启后留下来。
+    """
+    explicit = (getattr(args, "config", "") or "").strip()
+    if explicit:
+        return Config.load(explicit)
+    if os.path.exists("config.json"):
+        return Config.load("config.json")
+    base = Config.load(None)
+    base.apply_env(dict(os.environ))
+    data_dir = os.path.abspath(str(base.get("data_dir") or "./data"))
+    stored = os.path.join(data_dir, "config.json")
+    if os.path.exists(stored):
+        return Config.load(stored)
+    base.path = stored
+    return base
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="wb2api", description="WorkBuddy / CodeBuddy → OpenAI 兼容网关")
-    parser.add_argument("-c", "--config", default=os.environ.get("WB_CONFIG", "config.json"), help="配置文件路径")
+    parser.add_argument(
+        "-c", "--config", default=os.environ.get("WB_CONFIG", ""),
+        help="配置文件路径（默认：./config.json，没有就落到 <data_dir>/config.json）",
+    )
     sub = parser.add_subparsers(dest="command")
 
     serve = sub.add_parser("serve", help="启动网关（默认）")
@@ -53,8 +82,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"workbuddy2api {VERSION}")
         return 0
 
-    cfg = Config.load(args.config)
-    cfg.apply_env(dict(os.environ))
+    cfg = _config(args)
     setup_logging(
         str(cfg.get("logging.level") or cfg.get("log_level") or "INFO"),
         str(cfg.get("logging.dir") or "./logs"),
