@@ -1,0 +1,7 @@
+# 源码统一用 LF：Windows 上 PowerShell 的 Set-Content 会写 CRLF+BOM，
+# 一旦混进来，diff 全变、还有中文被 GB18030 二次解码的风险（见 docs/CONTRIBUTING.md）。
+* text=auto eol=lf
+
+*.png binary
+*.ico binary
+*.jpg binary
