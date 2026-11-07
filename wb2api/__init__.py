@@ -13,12 +13,12 @@
     sse.py          SSE 解析与 OpenAI 分块编码
     markup.py       DSML 内联工具调用的增量提取
     sanitize.py     出站请求体反指纹净化（可选）
-    models.py       模型目录（/v3/config 优先，带 TTL 与负缓存）
+    models.py       模型目录（/v3/config 优先，TTL + 负缓存 + 磁盘缓存 + 刷新节流）
     adapters/       协议转换（chat.completions）
     pool.py         选号、五类冷却窗口、会话粘滞、并发槽
-    sticky.py       会话 → 账号亲和表
+    sticky.py       会话 → 账号亲和表（按页换号，防单号被对话绑死）
     service.py      请求编排：鉴权、换号、流式边界、记账
-    scheduler.py    令牌保活（提前 6h）、余额刷新、签到、落盘
+    scheduler.py    令牌保活（提前 6h）、余额刷新、签到、活跃上报、配额探针、落盘
     usage.py        用量台账与面板聚合
     httpserver.py   极简 HTTP 框架（路由 / 请求 / 响应 / 面板会话）
     routes_openai.py  客户端面：/v1/chat/completions、/v1/models、/healthz、/status
@@ -28,5 +28,5 @@
     cli.py          命令行入口（serve / doctor / version / accounts）
 """
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 __version__ = VERSION
