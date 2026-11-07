@@ -126,11 +126,14 @@ data/
   accounts.json     账号（含 token —— 这是本项目的最高机密，注意文件权限）
   api_keys.json     客户端密钥（含 models / realm 绑定）
   runtime.json      运行态：面板签名密钥、池游标
+  catalog-<realm>.json  模型目录缓存（1 小时有效，重启不必再打一次上游）
   usage/
     usage-YYYY-MM-DD.jsonl   每请求一行，保留 N 天（默认 7）
 logs/
   wb2api.log        滚动 8MB × 5
 ```
+
+模型目录落盘是刻意的：这份清单只在"客户端会怎么想"的意义上有用，重启一次就重打一次上游纯属白给暴露面。缓存的 `fetched_at` 超过 `CACHE_TTL`（1 小时）就当作不存在，`invalidate()` 会连文件一起删——内存清了磁盘不清，下次启动又会捡回旧清单。
 
 写盘全部走 `util.atomic_write_json`（同目录临时文件 + `os.replace`），断电不会留下半截 JSON。台账用单次 `os.write` 追加，因为读方是 `except: continue`，**丢一行比写坏一行更糟**。
 

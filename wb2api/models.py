@@ -15,17 +15,21 @@ UA 和 ``X-Product`` 是硬要求：同一个接口换个 UA 就 400 ``12403``�
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from typing import Any, Dict, Iterable, List, Optional
 
-from . import identity
+from . import identity, util
 from .log import get_logger
 
 log = get_logger("models")
 
 CACHE_TTL = 3600.0
 NEGATIVE_TTL = 300.0
+# 磁盘缓存的文件名模板：进程重启后不必再打一次上游。这份目录是"上游会怎么想"
+# 的一部分，少打一次少一次暴露面。
+DISK_TEMPLATE = "catalog-{realm}.json"
 
 CONFIG_PATH = "/v3/config"
 CONSOLE_PATH = "/console/enterprises/personal/models"
@@ -225,6 +229,35 @@ def _build(entry: Dict[str, Any], model_id: str, realm: str) -> ModelInfo:
     )
 
 
+def _to_dict(info: ModelInfo) -> Dict[str, Any]:
+    """落盘用的形状：只留会被读的字段（``raw`` 是上游原文，缓存里不存）。"""
+    payload: Dict[str, Any] = {
+        "id": info.id,
+        "name": info.name,
+        "max_output": info.max_output,
+        "tags": list(info.tags),
+    }
+    if info.rate is not None:
+        payload["rate"] = info.rate
+    if info.reasoning:
+        payload["reasoning"] = dict(info.reasoning)
+    return payload
+
+
+def _from_dict(item: Dict[str, Any], realm: str) -> ModelInfo:
+    rate = item.get("rate")
+    reasoning = item.get("reasoning")
+    return ModelInfo(
+        id=str(item.get("id") or ""),
+        name=str(item.get("name") or ""),
+        realm=realm,
+        max_output=_as_int(item.get("max_output")),
+        rate=float(rate) if isinstance(rate, (int, float)) else None,
+        tags=[str(tag) for tag in item.get("tags") or []],
+        reasoning=dict(reasoning) if isinstance(reasoning, dict) else {},
+    )
+
+
 class ModelCatalog:
     """按域缓存模型清单。并发读走锁；失败走负缓存，别拿上游当靶子打。"""
 
@@ -235,6 +268,47 @@ class ModelCatalog:
         self._entries: Dict[str, List[ModelInfo]] = {}
         self._fetched_at: Dict[str, float] = {}
         self._negative_until: Dict[str, float] = {}
+        # 只有配置里真给了 data_dir 才用磁盘缓存：测试与嵌入式用法拿到的是
+        # 默认的 ""，不该去仓库根目录里翻别人的清单。
+        self._data_dir = str(cfg.get("data_dir") or "")
+        self._load_disk()
+
+    # -- 磁盘缓存 -----------------------------------------------------------
+    def _cache_path(self, realm: str) -> str:
+        return os.path.join(self._data_dir, DISK_TEMPLATE.format(realm=realm))
+
+    def _load_disk(self) -> None:
+        """进程启动时捡回上次的清单：重启不该等于"再打一次上游"。"""
+        if not self._data_dir:
+            return
+        for realm in ("cn", "global"):
+            path = self._cache_path(realm)
+            payload = util.read_json(path, None)
+            if not isinstance(payload, dict):
+                continue
+            fetched_at = float(payload.get("fetched_at") or 0)
+            if time.time() - fetched_at >= CACHE_TTL:
+                continue
+            entries = [_from_dict(item, realm) for item in payload.get("models") or [] if isinstance(item, dict)]
+            entries = [item for item in entries if item.id]
+            if not entries:
+                continue
+            self._entries[realm] = entries
+            self._fetched_at[realm] = fetched_at
+            log.info("%s: 从磁盘缓存恢复 %d 个模型", realm, len(entries))
+
+    def _save_disk(self, realm: str, entries: List[ModelInfo], fetched_at: float) -> None:
+        if not self._data_dir:
+            return
+        payload = {
+            "realm": realm,
+            "fetched_at": fetched_at,
+            "models": [_to_dict(item) for item in entries],
+        }
+        try:
+            util.atomic_write_json(self._cache_path(realm), payload)
+        except OSError as exc:  # 缓存写不了不该影响请求
+            log.debug("模型目录落盘失败: %s", exc)
 
     # -- 抓取 ---------------------------------------------------------------
     def _paths(self) -> Iterable[str]:
@@ -288,6 +362,8 @@ class ModelCatalog:
             else:
                 self._negative_until[realm] = now + NEGATIVE_TTL  # 别每 10 秒重试一次
                 log.warning("%s: 三个来源都没拿到模型清单（%ds 内不再重试）", realm, int(NEGATIVE_TTL))
+        if entries:
+            self._save_disk(realm, entries, now)
         return entries
 
     # -- 查询 ---------------------------------------------------------------
@@ -341,15 +417,19 @@ class ModelCatalog:
         return [info.id for info in self.entries(realm) if not self.hidden(info.id)]
 
     def invalidate(self, realm: str = "") -> None:
+        realms = [identity.normalize_realm(realm)] if realm else ["cn", "global"]
         with self._lock:
-            if realm:
-                self._entries.pop(identity.normalize_realm(realm), None)
-                self._fetched_at.pop(identity.normalize_realm(realm), None)
-                self._negative_until.pop(identity.normalize_realm(realm), None)
-            else:
-                self._entries.clear()
-                self._fetched_at.clear()
-                self._negative_until.clear()
+            for item in realms:
+                self._entries.pop(item, None)
+                self._fetched_at.pop(item, None)
+                self._negative_until.pop(item, None)
+        for item in realms:  # 内存清了磁盘也得清，否则下次启动又捡回旧清单
+            if not self._data_dir:
+                continue
+            try:
+                os.remove(self._cache_path(item))
+            except OSError:
+                pass
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:

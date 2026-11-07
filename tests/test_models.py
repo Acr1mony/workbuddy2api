@@ -4,6 +4,11 @@
 所以测试盯的是**判定结果**，不是实现细节。
 """
 
+import json
+import os
+import shutil
+import tempfile
+import time
 import unittest
 
 from wb2api import models
@@ -196,6 +201,91 @@ class TestCatalog(unittest.TestCase):
         self.assertEqual(item["object"], "model")
         self.assertEqual(item["max_output_tokens"], 4096)
         self.assertNotIn("context_length", item, "上游没给就别瞎填")
+
+
+class TestDiskCache(unittest.TestCase):
+    """重启不该等于"再打一次上游"；但缓存过期了就必须忘掉它。"""
+
+    PAYLOAD = {
+        models.CONFIG_PATH: {"data": {"models": [
+            {"id": "m1", "maxOutputTokens": 4096, "credits": "x0.11"},
+            {"id": "m2"},
+        ]}}
+    }
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="wb2a-catalog-")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _cfg(self):
+        return FakeCfg({"data_dir": self.tmp})
+
+    def _catalog(self, responses, cfg=None):
+        client = FakeClient(responses)
+        return models.ModelCatalog(client, cfg or self._cfg()), client
+
+    def _path(self, realm="cn"):
+        return os.path.join(self.tmp, "catalog-%s.json" % realm)
+
+    def _write_stale(self, age=7200.0):
+        payload = {
+            "realm": "cn",
+            "fetched_at": time.time() - age,
+            "models": [{"id": "old-model"}],
+        }
+        with open(self._path(), "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+
+    def test_fetch_writes_file(self):
+        catalog, _ = self._catalog(self.PAYLOAD, self._cfg())
+        catalog.fetch(FakeAccount(), "cn")
+        self.assertTrue(os.path.exists(self._path()), "抓到了就该落盘")
+        with open(self._path(), encoding="utf-8") as handle:
+            payload = json.load(handle)
+        self.assertEqual([item["id"] for item in payload["models"]], ["m1", "m2"])
+        self.assertNotIn("raw", payload["models"][0], "上游原文不进缓存")
+
+    def test_restart_reuses_file_without_upstream(self):
+        catalog, client = self._catalog(self.PAYLOAD, self._cfg())
+        catalog.fetch(FakeAccount(), "cn")
+        self.assertEqual(len(client.calls), 1)
+
+        client2 = FakeClient({})
+        revived = models.ModelCatalog(client2, self._cfg())
+        self.assertEqual([i.id for i in revived.entries("cn", chat_only=False)], ["m1", "m2"])
+        self.assertEqual(client2.calls, [], "新鲜缓存不该再打上游")
+        self.assertAlmostEqual(revived.rate("m1", "cn"), 0.11)
+        self.assertEqual(revived.get("m1", "cn").max_output, 4096)
+
+    def test_stale_file_is_ignored(self):
+        self._write_stale()
+        client = FakeClient(self.PAYLOAD)
+        catalog = models.ModelCatalog(client, self._cfg())
+        self.assertEqual(catalog.entries("cn", chat_only=False), [], "过期的清单不能用")
+        catalog.fetch(FakeAccount(), "cn")
+        self.assertEqual(len(client.calls), 1)
+
+    def test_corrupt_file_is_tolerated(self):
+        with open(self._path(), "w", encoding="utf-8") as handle:
+            handle.write("{not json")
+        client = FakeClient(self.PAYLOAD)
+        catalog = models.ModelCatalog(client, self._cfg())
+        catalog.fetch(FakeAccount(), "cn")
+        self.assertEqual(len(catalog.entries("cn", chat_only=False)), 2)
+
+    def test_invalidate_drops_file(self):
+        catalog, _ = self._catalog(self.PAYLOAD, self._cfg())
+        catalog.fetch(FakeAccount(), "cn")
+        catalog.invalidate("cn")
+        self.assertFalse(os.path.exists(self._path()), "内存清了磁盘也得清")
+        self.assertEqual(catalog.entries("cn", chat_only=False), [])
+
+    def test_no_data_dir_means_no_file(self):
+        catalog, _ = self._catalog(self.PAYLOAD)  # FakeCfg 没给 data_dir
+        catalog.fetch(FakeAccount(), "cn")
+        self.assertFalse(os.path.exists("catalog-cn.json"), "没配数据目录就不该往 cwd 写文件")
 
 
 if __name__ == "__main__":
