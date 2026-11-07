@@ -125,8 +125,11 @@ def product_of(account: Any) -> str:
 
 
 def new_message_id() -> str:
-    """32 hex，对齐官方 X-Request-ID / X-Conversation-Message-ID。"""
-    return util.rand_hex(16)
+    """32 hex，对齐官方 X-Request-ID / X-Conversation-Message-ID。
+
+    长度是硬要求：官方是 UUIDv4 去横线的 32 位，16 位一眼就是自造的。
+    """
+    return util.rand_hex(32)
 
 
 def _valid_trace_id(text: str) -> bool:
@@ -293,7 +296,7 @@ def chat_headers(
     realm = normalize_realm(getattr(account, "realm", "cn"))
     info = realm_info(realm)
     product = product_of(account)
-    headers = common_headers(account, cfg, accept="application/json, text/plain, */*")
+    headers = common_headers(account, cfg, accept="application/json, text/event-stream")
     access_token = getattr(account, "access_token", "") or ""
     uid = getattr(account, "uid", "") or ""
 
@@ -451,6 +454,7 @@ def anonymous_headers(realm: str, cfg: Any) -> Dict[str, str]:
 # --------------------------------------------------------------------------
 
 _device_cache: Dict[str, str] = {}
+_device_cached_at: Dict[str, float] = {}
 _device_lock = threading.Lock()
 
 

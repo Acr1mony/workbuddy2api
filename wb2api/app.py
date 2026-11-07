@@ -60,7 +60,10 @@ def banner(cfg: Any) -> str:
     lines = [
         f"workbuddy2api {VERSION}",
         f"  listen : http://{host}:{port}",
+        f"  openai : base_url=http://{host}:{port}/v1",
         f"  panel  : {'http://%s:%s/panel/' % (host, port) if cfg.get('panel.enabled') else 'disabled'}",
-        f"  keys   : {'configured' if cfg.get('api_key') else 'none (local use)'}",
+        f"  keys   : {'configured' if cfg.get('api_key') else 'none (local open mode)'}",
     ]
+    if cfg.get("panel.enabled") and str(cfg.get("panel.password") or "admin") in ("admin", ""):
+        lines.append("  ! panel 仍在用默认密码 admin，请登录后立刻修改")
     return "\n".join(lines)

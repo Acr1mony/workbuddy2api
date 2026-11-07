@@ -57,7 +57,9 @@ class Billing:
         """读账号余额；读不到返回 None（不代表 0）。"""
         try:
             payload = self._call(account, realm, "GET", RESOURCE_PATH)
-        except UpstreamError as exc:
+        except (UpstreamError, ValueError) as exc:
+            # ValueError：上游 200 但回了 HTML/空体（网关错误页），json() 解不出来。
+            # 这一样是"读不到"，返回 None，别让调度循环整个炸掉。
             log.debug("读取额度失败 %s: %s", getattr(account, "label", "?"), exc)
             return None
         value = _dig_credit(payload)
@@ -69,18 +71,18 @@ class Billing:
         """每日签到。CN 域才有；企业号会被拒（10001），那是正常的。"""
         try:
             payload = self._call(account, realm, "POST", CHECKIN_PATH, {})
-        except UpstreamError as exc:
+        except (UpstreamError, ValueError) as exc:
             return False, str(exc)
         code = payload.get("code")
         message = str(payload.get("msg") or payload.get("message") or "")
-        if code in (0, None):
+        if code in (0, "0", None):
             return True, message or "已签到"
         return False, f"{code}: {message}"
 
     def usage_breakdown(self, account: Any, realm: str) -> Optional[Dict[str, Any]]:
         try:
             return self._call(account, realm, "GET", USAGE_PATH)
-        except UpstreamError as exc:
+        except (UpstreamError, ValueError) as exc:
             log.debug("读取用量失败: %s", exc)
             return None
 
@@ -89,7 +91,7 @@ class Billing:
         try:
             self._call(account, realm, "POST", REPORT_PATH, payload)
             return True
-        except UpstreamError as exc:
+        except (UpstreamError, ValueError) as exc:
             log.debug("上报失败: %s", exc)
             return False
 
@@ -121,8 +123,13 @@ def _dig_credit(payload: Any) -> Optional[float]:
             if value is not None:
                 candidates.append((CREDIT_KEYS.index(key), value))
     if not candidates:
-        # 有些版本直接给一个裸数字。
-        for node in _walk(payload):
+        # 有些版本直接给一个裸数字——但只在 data 信封里面找：整个 payload 里乱扫会把
+        # code=0 读成"余额 0"（面板显示假数据、pool 的 credit_floor 还会把账号踢掉），
+        # 把 code=11100 读成"余额 11100"。没有 data 层就老实返回 None。
+        scope = payload.get("data") if isinstance(payload, dict) else None
+        if scope is None:
+            return None
+        for node in _walk(scope):
             value = _as_number(node)
             if value is not None:
                 return value

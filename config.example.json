@@ -16,9 +16,11 @@
     "readonly": false
   },
   "logging": {
-    "request_archive_enabled": true,
-    "request_retention_days": 7,
-    "request_archive_max_mb": 100
+    "level": "INFO",
+    "dir": "./logs"
+  },
+  "usage": {
+    "retention_days": 7
   },
   "upstream": {
     "timeout_seconds": 120,
@@ -30,6 +32,7 @@
     "client_name": "",
     "device_token": "",
     "device_token_file": "",
+    "device_token_mode": "auto",
     "ca_bundle": "",
     "verify_tls": true,
     "passthrough_ip": false,
@@ -87,7 +90,8 @@
     ]
   },
   "models": {
-    "hidden": []
+    "hidden": [],
+    "default": ""
   },
   "prompt": {
     "mode": "passthrough",

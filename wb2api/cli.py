@@ -42,7 +42,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     cfg = Config.load(args.config)
     cfg.apply_env(dict(os.environ))
-    setup_logging(str(cfg.get("logging.level") or "INFO"), str(cfg.get("logging.dir") or "./logs"))
+    setup_logging(
+        str(cfg.get("logging.level") or cfg.get("log_level") or "INFO"),
+        str(cfg.get("logging.dir") or "./logs"),
+    )
 
     if command == "doctor":
         return _doctor(cfg)
@@ -50,16 +53,18 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 
 def _doctor(cfg: Config) -> int:
-    problems = cfg.validate()
+    errors, warnings = cfg.validate_split()
     print(f"config : {cfg.path}")
     print(f"data   : {cfg.data_dir}")
     print(f"listen : {cfg.listen_address()}")
     print(f"panel  : {cfg.get('panel.enabled')}")
-    if not problems:
+    for warning in warnings:
+        print(f"提示：{warning}")
+    if not errors:
         print("检查通过。")
         return 0
     print("问题：")
-    for problem in problems:
+    for problem in errors:
         print(f"  - {problem}")
     return 1
 

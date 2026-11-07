@@ -1,4 +1,23 @@
-# WorkBuddy upstream chat protocol — implementation spec
+# 上游协议规格（WorkBuddy / CodeBuddy ⇄ 网关）
+
+本文是这个仓库的**协议事实清单**：上游要求什么、拒绝什么、错误码意味着什么。内容整理自两个参考实现的源码及其注释里的实测结论；本项目的 `wb2api/identity.py`、`wb2api/adapters/chat.py`、`wb2api/service.py`、`wb2api/sanitize.py` 逐条实现了这里的东西。
+
+建议阅读顺序：§0 传输 → §1 请求头 → §2 请求体改写 → §3 响应与流式 → §4 错误码 → 其余细节。每个结论后面附 `path:line` 出处，便于回查（路径相对 `_ref/panel` 与 `_ref/hub`，那两个参考仓库不包含在本仓库内）。
+
+模块对应关系：
+
+| 本文小节 | 实现位置 |
+| --- | --- |
+| §0 传输、§1 请求头 | `wb2api/identity.py`（`chat_headers` / `ChatMeta` / 会话 id 派生）、`wb2api/upstream.py`（连接与超时） |
+| §2 请求体改写 | `wb2api/adapters/chat.py`（`prepare_request` 的固定管线） |
+| §3 响应与流式 | `wb2api/adapters/chat.py`（`stream_frames` / `aggregate` / `normalize_usage`）、`wb2api/sse.py`、`wb2api/markup.py` |
+| §4 错误码 | `wb2api/service.py`（`_absorb` 决策表与 `_client_error` 信封映射）、`wb2api/pool.py`（五类时间窗） |
+| 指纹净化 | `wb2api/sanitize.py`（默认关闭，`prompt.mode="sanitize"` 时启用） |
+| 模型目录 | `wb2api/models.py` |
+
+---
+
+## 附：原始调研记录（英文，带源码行号）
 
 Sources: `panel/internal/upstream/*.go` (Go reference impl) and `hub/wb_proxy.py` + `hub/wb_identity.py` + `hub/wb_catalog.py` (Python reference impl). Citations are `path:line` relative to `_ref/panel` and `_ref/hub`.
 

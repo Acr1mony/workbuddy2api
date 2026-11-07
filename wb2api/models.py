@@ -118,13 +118,17 @@ class ModelInfo:
         return meta
 
     def as_openai(self) -> Dict[str, Any]:
-        return {
+        payload: Dict[str, Any] = {
             "id": self.id,
             "object": "model",
             "created": 0,
             "owned_by": "workbuddy",
             "name": self.name,
         }
+        if self.max_output:
+            # 只报上游真给了的数：瞎填一个 context_length 会让客户端算出错误的截断策略。
+            payload["max_output_tokens"] = self.max_output
+        return payload
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"<ModelInfo {self.id} realm={self.realm} rate={self.rate}>"

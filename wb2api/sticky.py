@@ -64,10 +64,17 @@ def session_key(headers: Dict[str, str], body: Optional[Dict[str, Any]], prefix_
 class SessionAffinity:
     """会话 -> 账号 MRU。纯内存，重启即失效（重启后上游缓存本来就凉了）。"""
 
-    def __init__(self, ttl: float = 1800.0, max_entries: int = 5000, history: int = 3) -> None:
+    def __init__(
+        self,
+        ttl: float = 1800.0,
+        max_entries: int = 5000,
+        history: int = 3,
+        enabled: bool = True,
+    ) -> None:
         self.ttl = float(ttl)
         self.max_entries = int(max_entries)
         self.history = max(1, int(history))
+        self.enabled = bool(enabled)
         self._map: Dict[str, Tuple[List[str], float]] = {}
         self._lock = threading.Lock()
         self.hits = 0
@@ -76,7 +83,7 @@ class SessionAffinity:
     # -- 查询 ---------------------------------------------------------------
     def candidates(self, key: str) -> List[str]:
         """返回该会话偏好的账号 uid 列表（最近的在前）。"""
-        if not key:
+        if not key or not self.enabled:
             return []
         with self._lock:
             entry = self._map.get(key)

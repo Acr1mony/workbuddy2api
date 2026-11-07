@@ -220,9 +220,16 @@ class AuthFlow:
         if not force and not account.token_expired(skew=300):
             return True
 
-        with self._refresh_locks(account.key):
+        # 进锁前先记下自己看到的令牌：refresh token 是一次性的，等锁期间别人可能已经换过一轮。
+        snapshot = (account.access_token, account.refresh_token)
+        with self._refresh_locks.get(account.key):
             # 双重检查：等锁期间别的线程可能已经刷新过了。
             fresh = self.store.get_account(account.uid) or account
+            rotated = (fresh.access_token, fresh.refresh_token) != snapshot
+            if rotated and not fresh.token_expired(skew=180):
+                # force=True 也一样：别人刚刷出可用令牌，再拿我们手里那份旧令牌去打上游，
+                # 只会把新令牌一起弄失效（refresh token 一次性，重放必然 12153）。
+                return True
             if not force and not fresh.token_expired(skew=300):
                 return True
             return self._do_refresh(fresh, proxy=proxy or getattr(fresh, "proxy", "") or "")
@@ -250,6 +257,10 @@ class AuthFlow:
             code = payload.get("code")
             if _is_dead_refresh(payload, message):
                 self._mark_dead(account, f"刷新令牌已失效（code={code}）：{message or '需要重新登录'}")
+            elif not access and code in (0, "0", None):
+                # 200 + code 0 却没有 accessToken：这次 refresh token 已被上游消费掉，
+                # 拿旧令牌重试只会一直失败，按废号处理，别再打上游。
+                self._mark_dead(account, "刷新成功但上游没有返回 accessToken，refresh token 可能已被消费")
             else:
                 account.last_error = f"刷新失败：{message or code}"
                 account.failures += 1

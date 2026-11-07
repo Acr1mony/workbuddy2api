@@ -18,7 +18,7 @@ import threading
 import time
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
-from . import identity, sse
+from . import identity, sse, util
 from .adapters import chat as chat_adapter
 from .log import get_logger
 from .markup import MARKUP_HINT
@@ -102,8 +102,10 @@ class GatewayService:
         self.client = client or UpstreamClient(cfg)
         self.auth = AuthFlow(self.client, store, cfg)
         self.catalog = ModelCatalog(self.client, cfg)
+        sticky_on = bool(cfg.get("session_sticky.enabled", True)) if cfg else True
         self.affinity = SessionAffinity(
-            ttl=float(cfg.get("session_sticky.ttl_seconds", 1800)) if cfg else 1800.0,
+            ttl=float(util.parse_duration(cfg.get("session_sticky.ttl", "30m"), 1800)) if cfg else 1800.0,
+            enabled=sticky_on,
         )
         self.pool = Pool(store, cfg, self.affinity)
         self.ledger = UsageLedger(
@@ -530,6 +532,9 @@ class GatewayService:
         self.catalog.fetch(accounts[0], realm)
 
     def status(self, request: Any = None) -> Dict[str, Any]:
+        # /status 里有账号数量、余额合计与用量：这些不该匿名可见，所以和 /v1/* 同等待遇。
+        if request is not None:
+            self.authenticate(request.bearer() or request.arg("api_key"))
         return {
             "ok": True,
             "listening": str(self.cfg.get("listen") or ""),

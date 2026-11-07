@@ -13,6 +13,9 @@ import copy
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
+#: ``validate()`` 里用来标记"可以放行的告警"的前缀（doctor 据此决定退出码）。
+WARNING_PREFIX = "warning: "
+
 from . import util
 
 DEFAULTS: Dict[str, Any] = {
@@ -37,9 +40,12 @@ DEFAULTS: Dict[str, Any] = {
         "readonly": False,
     },
     "logging": {
-        "request_archive_enabled": True,
-        "request_retention_days": 7,
-        "request_archive_max_mb": 100,
+        "level": "INFO",
+        "dir": "./logs",
+    },
+    # 用量台账（append-only JSONL，按天一个文件）
+    "usage": {
+        "retention_days": 7,
     },
     # --- upstream ----------------------------------------------------------
     "upstream": {
@@ -52,6 +58,7 @@ DEFAULTS: Dict[str, Any] = {
         "client_name": "",
         "device_token": "",
         "device_token_file": "",
+        "device_token_mode": "auto",
         "ca_bundle": "",
         "verify_tls": True,
         "passthrough_ip": False,
@@ -99,7 +106,8 @@ DEFAULTS: Dict[str, Any] = {
         "checkin_hour": 9,
         "checkin_realms": ["cn"],
     },
-    "models": {"hidden": []},
+    # 模型目录：hidden 支持 "prefix*" 通配；default 是请求里没带 model 时的兜底
+    "models": {"hidden": [], "default": ""},
     "prompt": {"mode": "passthrough", "file": ""},
     "features": {"sanitize_blacklist_fingerprints": True},
 }
@@ -243,6 +251,10 @@ class Config:
     def public_dict(self) -> Dict[str, Any]:
         """Config view for the panel: secrets replaced by a mask marker."""
         data = self.as_dict()
+        # 初始网关密钥同样是秘密：面板只需要知道"设没设"，不需要明文。
+        # 与 panel.password_set 保持一致，未设置时也返回 False，面板无需区分"缺失"和"未设置"。
+        data["api_key_set"] = bool(data.get("api_key"))
+        data["api_key"] = ""
         upstream = data.setdefault("upstream", {})
         if upstream.get("device_token"):
             upstream["device_token_set"] = True
@@ -304,5 +316,18 @@ class Config:
             if util.parse_duration(self.get(dotted), -1) < 0:
                 problems.append(f"{dotted} is not a duration: {self.get(dotted)!r}")
         if not os.path.isdir(self.data_dir):
-            problems.append(f"data_dir does not exist yet (will be created): {self.data_dir}")
+            # 首启时目录还不存在是正常的（serve 会创建）。用前缀区分"告警"和"错误"，
+            # 否则 doctor 在全新安装上永远返回 1，谁都不会再信它的退出码。
+            problems.append(f"{WARNING_PREFIX}data_dir does not exist yet (will be created): {self.data_dir}")
         return problems
+
+    def validate_split(self) -> Tuple[List[str], List[str]]:
+        """``(errors, warnings)``：只有 errors 该让 doctor 失败。"""
+        errors: List[str] = []
+        warnings: List[str] = []
+        for problem in self.validate():
+            if problem.startswith(WARNING_PREFIX):
+                warnings.append(problem[len(WARNING_PREFIX):])
+            else:
+                errors.append(problem)
+        return errors, warnings

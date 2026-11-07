@@ -71,7 +71,11 @@ def parse_duration(value: Any, default: float = 0.0) -> float:
     if not match:
         return default
     amount, unit = float(match.group(1)), match.group(2)
-    return amount * _DURATION_UNITS.get(unit, default)
+    # 未知单位必须整体回落：`amount * default` 会把 "5x" 变成 5*default，
+    # 传 -1 做"合法与否"探测时会被误判成 -5。
+    if unit not in _DURATION_UNITS:
+        return default
+    return amount * _DURATION_UNITS[unit]
 
 
 def format_duration(seconds: float) -> str:

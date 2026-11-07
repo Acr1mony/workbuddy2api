@@ -170,6 +170,8 @@ class Scheduler:
             if not account.enabled or not account.refresh_token:
                 continue
             expires = float(account.expires_at or 0)
+            # expires == 0 表示"到期时间未知"（静态密钥就是这种）。未知时续一次是划算的：
+            # 刷新响应会带回真实 expiresIn，之后它就和别的账号一样被 48h 规则管住。
             if expires and (expires - now) > KEEPALIVE_AHEAD:
                 continue
             try:

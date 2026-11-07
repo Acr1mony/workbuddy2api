@@ -80,7 +80,7 @@ class Panel:
 def register(router: Router, panel: Panel) -> None:
     # -- 登录 ---------------------------------------------------------------
     router.add("POST", r"/panel/login", lambda req: _login(panel, req))
-    router.add("POST", r"/panel/logout", lambda req: json_response({"ok": True}))
+    router.add("POST", r"/panel/logout", lambda req: _logout(panel, req))
     router.add("GET", r"/panel/status", lambda req: _status(panel, req))
 
     # -- 账号 ---------------------------------------------------------------
@@ -124,7 +124,18 @@ def _login(panel: Panel, req: Any) -> Response:
         log.warning("面板登录失败：%s", ip)
         return error_response(401, "密码错误", "bad_password")
     token, expires = panel.sessions.issue()
-    return json_response({"ok": True, "token": token, "expires_at": expires})
+    # 同时发 cookie：前端把令牌放 localStorage（刷新方便），cookie 兜底那些
+    # 直接用浏览器打开 /api/... 的场合。HttpOnly 是为了让 XSS 拿不到令牌。
+    max_age = max(0, int(expires - time.time()))
+    cookie = (
+        f"{panel.sessions.COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}"
+    )
+    return json_response({"ok": True, "token": token, "expires_at": expires}, headers={"Set-Cookie": cookie})
+
+
+def _logout(panel: Panel, req: Any) -> Response:
+    cookie = f"{panel.sessions.COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"
+    return json_response({"ok": True}, headers={"Set-Cookie": cookie})
 
 
 def _status(panel: Panel, req: Any) -> Response:
