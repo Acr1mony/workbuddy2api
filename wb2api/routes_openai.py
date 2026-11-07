@@ -79,4 +79,13 @@ def _one_model(service: Any, req: Any, model: str) -> Response:
     for item in data:
         if item.get("id") == model:
             return json_response(item)
+    # 区分"不存在"和"没给你开"：后者是配置问题，说清楚比 404 省一轮排查。
+    known = set(service.catalog.names("cn")) | set(service.catalog.names("global"))
+    if model in known:
+        return err(
+            403,
+            f"model {model} is not allowed for this API key",
+            "model_not_allowed",
+            kind="invalid_request_error",
+        )
     return err(404, f"model {model} not found", "model_not_found", kind="invalid_request_error")

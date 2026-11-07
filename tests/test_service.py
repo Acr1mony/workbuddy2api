@@ -15,9 +15,10 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from wb2api import models
 from wb2api.config import Config
 from wb2api.service import GatewayService, ServiceError, parse_reset_clock
-from wb2api.store import Account, Store
+from wb2api.store import Account, ApiKey, Store
 from wb2api.upstream import UpstreamError
 
 
@@ -368,6 +369,42 @@ class ServiceTest(unittest.TestCase):
         list(svc.chat_completions(req).stream)
         self.assertEqual(svc.affinity.candidates("conv-img"), [],
                          "媒体请求钉在同一个号上只会让它的画像更反常")
+
+
+class ModelsListingTest(ServiceTest):
+    """"看见的"必须等于"能用的"：不然客户端要拿 400 才知道自己调不动。"""
+
+    def _service_with_catalog(self):
+        svc, client = self.service([])
+        svc.catalog._entries["cn"] = [
+            models.ModelInfo(id="deepseek-v4-flash", realm="cn", max_output=8192),
+            models.ModelInfo(id="glm-5.3", realm="cn", max_output=8192),
+        ]
+        svc.catalog._fetched_at["cn"] = time.time()
+        return svc
+
+    def _request(self, token=""):
+        from wb2api.httpserver import Request
+
+        headers = {"Authorization": "Bearer " + token} if token else {}
+        return Request("GET", "/v1/models", {}, headers, b"", ("1.2.3.4", 1))
+
+    def test_open_mode_lists_everything(self):
+        svc = self._service_with_catalog()
+        payload = json.loads(svc.models(self._request()).body)
+        self.assertEqual([item["id"] for item in payload["data"]], ["deepseek-v4-flash", "glm-5.3"])
+
+    def test_key_whitelist_narrows_the_listing(self):
+        svc = self._service_with_catalog()
+        svc.store.add_key(ApiKey(key="sk-glm", name="glm", models=["glm-*"]))
+        payload = json.loads(svc.models(self._request("sk-glm")).body)
+        self.assertEqual([item["id"] for item in payload["data"]], ["glm-5.3"])
+
+    def test_key_exclusions_are_applied(self):
+        svc = self._service_with_catalog()
+        svc.store.add_key(ApiKey(key="sk-no", name="no", excluded_models=["glm-5.3"]))
+        payload = json.loads(svc.models(self._request("sk-no")).body)
+        self.assertEqual([item["id"] for item in payload["data"]], ["deepseek-v4-flash"])
 
 
 if __name__ == "__main__":

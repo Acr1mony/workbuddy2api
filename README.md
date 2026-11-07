@@ -89,6 +89,10 @@ wb2a serve          # 或 workbuddy2api serve
 
 ---
 
+## API Key 能看见什么
+
+GET /v1/models 会按这把 key 的 models（白名单，支持 prefix*）和 excluded_models 过滤：**看得见的就等于调得动的**。直接点名一个没开的模型会回 403 model_not_allowed（不是 404——模型是好的，是你的 key 没开），客户端不用靠猜。
+
 ## 面板
 
 `http://127.0.0.1:8788/panel/`，五个页面，全部零构建（原生 JS + 一份 CSS），断网也能用：

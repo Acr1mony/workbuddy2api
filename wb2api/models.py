@@ -422,8 +422,17 @@ class ModelCatalog:
                 return True
         return False
 
-    def openai_list(self, realm: str = "cn") -> Dict[str, Any]:
-        data = [info.as_openai() for info in self.entries(realm) if not self.hidden(info.id)]
+    def openai_list(self, realm: str = "cn", allowed: Any = None) -> Dict[str, Any]:
+        """列出可用模型；`allowed` 是可选的 `(model_id) -> bool` 过滤器。
+
+        不过滤会让客户端看见一堆自己调不动的模型：拿到 400 model_not_allowed 之后
+        还得人工回来改配置。按 key 的白名单过滤，"看见的"就等于"能用的"。
+        """
+        data = [
+            info.as_openai()
+            for info in self.entries(realm)
+            if not self.hidden(info.id) and (allowed is None or allowed(info.id))
+        ]
         return {"object": "list", "data": data}
 
     def names(self, realm: str = "cn") -> List[str]:

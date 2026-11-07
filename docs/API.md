@@ -141,11 +141,13 @@ data: [DONE]
 {"object": "list", "data": [{"id": "deepseek-v3", "object": "model", "created": 0, "owned_by": "workbuddy", "context_length": 65536, "max_output_tokens": 8192}]}
 ```
 
-列表来自上游 `/v3/config`（三层回落，缓存 1 小时），已过滤掉补全类/图像/视频模型。`models.hidden` 里配置的模型（支持 `prefix*`）不会出现。
+列表来自上游 `/v3/config`（三层回落，缓存 1 小时，落盘一份给重启用），已过滤掉补全类/图像/视频模型。`models.hidden` 里配置的模型（支持 `prefix*`）不会出现。
+
+**列表同时按当前 API key 的 `models`/`excluded_models` 过滤**：看得见的就等于调得动的，客户端不必靠 400 才发现自己被限了模型。本地开放模式（没配任何 key）则全列。
 
 ### `GET /v1/models/{id}`
 
-单个模型对象；不存在返回 404 `model_not_found`。
+单个模型对象；不存在返回 404 `model_not_found`，**存在但这把 key 没开**返回 403 `model_not_allowed`（这是配置问题，不是模型有问题，说清楚省一轮排查）。
 
 ### `GET /healthz`
 

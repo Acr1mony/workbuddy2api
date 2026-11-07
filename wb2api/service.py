@@ -641,7 +641,8 @@ class GatewayService:
         key = self.authenticate(token)
         realm = self.resolve_realm(request.arg("realm"), key, request.header("X-Realm"))
         self._ensure_catalog(realm)
-        return json_response(self.catalog.openai_list(realm))
+        allowed = key.allows_model if key is not None else None
+        return json_response(self.catalog.openai_list(realm, allowed))
 
     def _ensure_catalog(self, realm: str) -> None:
         if self.catalog.names(realm):
