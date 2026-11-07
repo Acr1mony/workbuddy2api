@@ -299,5 +299,29 @@ class TestDeviceToken(unittest.TestCase):
         self.assertEqual(identity.device_token_for(FakeAccount(), cfg), "")
 
 
+class TestStableIdHeaders(unittest.TestCase):
+    """X-Machine-ID / X-Session-ID 是 chat 的可选项（hub 抓包不带、panel 抓包带）。"""
+
+    def test_sent_by_default(self):
+        headers = identity.chat_headers(FakeAccount(), FakeCfg())
+        self.assertEqual(headers.get("X-Machine-ID"), identity.machine_id(FakeAccount()))
+        self.assertEqual(headers.get("X-Session-ID"), identity.session_id(FakeAccount()))
+        self.assertEqual(len(headers["X-Machine-ID"]), 36)
+
+    def test_can_be_disabled_for_chat_only(self):
+        cfg = FakeCfg({"upstream": {"send_stable_ids": False}})
+        headers = identity.chat_headers(FakeAccount(), cfg)
+        self.assertNotIn("X-Machine-ID", headers)
+        self.assertNotIn("X-Session-ID", headers)
+        # 计费/刷新走自己的一套头，不受这个开关影响
+        self.assertEqual(identity.billing_headers(FakeAccount(), cfg),
+                         identity.billing_headers(FakeAccount(), FakeCfg()))
+
+    def test_ids_are_stable_across_calls(self):
+        first = identity.chat_headers(FakeAccount(), FakeCfg())["X-Machine-ID"]
+        second = identity.chat_headers(FakeAccount(), FakeCfg())["X-Machine-ID"]
+        self.assertEqual(first, second, "同一账号的机器 id 跨请求恒定，否则等于每次都在换机器")
+
+
 if __name__ == "__main__":
     unittest.main()

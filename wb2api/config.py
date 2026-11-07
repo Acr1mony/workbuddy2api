@@ -59,6 +59,10 @@ DEFAULTS: Dict[str, Any] = {
         "device_token": "",
         "device_token_file": "",
         "device_token_mode": "auto",
+        # chat 请求是否带 X-Machine-ID / X-Session-ID（由 uid 派生的稳定 id）。
+        # panel 的抓包带、hub 5.8.4 的抓包不带，两边都能跑通；带上是更"像插件"的形状，
+        # 但如果上游开始按机器 id 做频率风控，关掉它就是最后一道退路。
+        "send_stable_ids": True,
         "ca_bundle": "",
         "verify_tls": True,
         "passthrough_ip": False,

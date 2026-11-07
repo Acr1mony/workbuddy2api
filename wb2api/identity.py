@@ -279,7 +279,8 @@ def _attribution(client_name: str, client_version: str) -> Dict[str, str]:
     }
 
 
-def common_headers(account: Any, cfg: Any, *, accept: str = "application/json") -> Dict[str, str]:
+def common_headers(account: Any, cfg: Any, *, accept: str = "application/json",
+                   include_ids: bool = True) -> Dict[str, str]:
     realm = normalize_realm(getattr(account, "realm", "cn"))
     info = realm_info(realm)
     headers = {
@@ -296,12 +297,13 @@ def common_headers(account: Any, cfg: Any, *, accept: str = "application/json") 
         "X-CodeBuddy-Request": "1",
         "Accept-Language": info["language"],
     }
-    machine = machine_id(account)
-    session = session_id(account)
-    if machine:
-        headers["X-Machine-ID"] = machine
-    if session:
-        headers["X-Session-ID"] = session
+    if include_ids:
+        machine = machine_id(account)
+        session = session_id(account)
+        if machine:
+            headers["X-Machine-ID"] = machine
+        if session:
+            headers["X-Session-ID"] = session
     return headers
 
 
@@ -316,7 +318,13 @@ def chat_headers(
     realm = normalize_realm(getattr(account, "realm", "cn"))
     info = realm_info(realm)
     product = product_of(account)
-    headers = common_headers(account, cfg, accept="application/json, text/event-stream")
+    # hub 5.8.4 的抓包里 chat 请求不带 X-Machine-ID/X-Session-ID，panel 带；两边都能跑通，
+    # 说明这是可选项。默认跟 panel（带），想更接近旧客户端就关掉。
+    include_ids = True
+    if cfg is not None:
+        include_ids = bool(cfg.get("upstream.send_stable_ids", True))
+    headers = common_headers(account, cfg, accept="application/json, text/event-stream",
+                             include_ids=include_ids)
     access_token = getattr(account, "access_token", "") or ""
     uid = getattr(account, "uid", "") or ""
 

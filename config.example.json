@@ -33,6 +33,7 @@
     "device_token": "",
     "device_token_file": "",
     "device_token_mode": "auto",
+    "send_stable_ids": true,
     "ca_bundle": "",
     "verify_tls": true,
     "passthrough_ip": false,

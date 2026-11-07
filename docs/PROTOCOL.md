@@ -391,3 +391,6 @@ Classification helpers to copy: `Classify(status, body)` with `hardMarkers` (ins
   属于「静默丢弃」，只看 HTTP 状态会以为成功。`conversationId` 不需要真实存在（服务端不校验一致性），
   自己造一个 `wb2api-<毫秒>` 即可；`timestamp`/`presentAt` 用毫秒。企业号上报虽然也 200，但 growth 体系对它
   一律 403（`growth system is only available for personal users`），**零收益**，所以调用前就跳过，别白打一次请求。
+- **X-Machine-ID/X-Session-ID 在 chat 上是可选项**：panel 的抓包带（由 uid 稳定派生），hub 5.8.4 的抓包里 chat 不带，
+  两边都能跑通 → 说明服务端不依赖它。我们的默认跟 panel（带，更像插件），配置项 upstream.send_stable_ids=false
+  可以关掉——如果哪天上游开始按机器 id 做频率风控，这是最后一道退路。计费/刷新端点不受这个开关影响。
