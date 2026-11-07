@@ -110,7 +110,8 @@
   },
   "models": {
     "hidden": [],
-    "default": ""
+    "default": "",
+    "min_refresh_seconds": 30
   },
   "prompt": {
     "mode": "sanitize",

@@ -139,7 +139,10 @@ DEFAULTS: Dict[str, Any] = {
         "quota_probe_minutes": 10,
     },
     # 模型目录：hidden 支持 "prefix*" 通配；default 是请求里没带 model 时的兜底
-    "models": {"hidden": [], "default": ""},
+    "models": {"hidden": [], "default": "",
+               # force 刷新模型目录的最小间隔（秒）：面板连点、多进程同时冷启动
+               # 都会变成一串 /v3/config 请求，那正是"同一机器 id 高频拉目录"的形状。
+               "min_refresh_seconds": 30},
     # 出站请求体的反指纹净化。默认开：上游对 Claude Code / Codex 模板句和
     # 字面量 "11-128" 是**逐字匹配**，命中就整单拒（400 11-128）。
     # 想要原样透传自己的 prompt 就显式改成 "passthrough"。

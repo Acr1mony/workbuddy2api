@@ -267,7 +267,13 @@ class ModelCatalog:
         self._lock = threading.RLock()
         self._entries: Dict[str, List[ModelInfo]] = {}
         self._fetched_at: Dict[str, float] = {}
+        self._attempted_at: Dict[str, float] = {}
         self._negative_until: Dict[str, float] = {}
+        # force 刷新之间的最小间隔：面板连点、多进程冷启动都会变成一串 /v3/config。
+        try:
+            self.min_refresh = float(cfg.get("models.min_refresh_seconds", 30) or 0)
+        except (TypeError, ValueError):
+            self.min_refresh = 30.0
         # 只有配置里真给了 data_dir 才用磁盘缓存：测试与嵌入式用法拿到的是
         # 默认的 ""，不该去仓库根目录里翻别人的清单。
         self._data_dir = str(cfg.get("data_dir") or "")
@@ -338,6 +344,13 @@ class ModelCatalog:
                     return cached
                 if now < self._negative_until.get(realm, 0):
                     return self._entries.get(realm, [])
+            else:
+                # force 也不许把它当按钮连打：面板连点、多个进程同时冷启动都会变成
+                # 一串 /v3/config 请求，这是"同一机器 id 高频拉目录"的标准形状。
+                last_try = self._attempted_at.get(realm, 0)
+                if now - last_try < self.min_refresh:
+                    return self._entries.get(realm, [])
+            self._attempted_at[realm] = now
         entries: List[ModelInfo] = []
         for path in self._paths():
             url = self.client.base_url(realm) + path

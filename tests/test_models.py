@@ -288,5 +288,34 @@ class TestDiskCache(unittest.TestCase):
         self.assertFalse(os.path.exists("catalog-cn.json"), "没配数据目录就不该往 cwd 写文件")
 
 
+class TestRefreshThrottle(unittest.TestCase):
+    """force 刷新不是按钮：连点不该变成一串 /v3/config。"""
+
+    PAYLOAD = {"data": {"models": [{"id": "m1"}]}}
+
+    def test_second_force_is_dropped(self):
+        client = FakeClient({models.CONFIG_PATH: self.PAYLOAD})
+        catalog = models.ModelCatalog(client, FakeCfg())
+        catalog.fetch(FakeAccount(), "cn", force=True)
+        catalog.fetch(FakeAccount(), "cn", force=True)
+        self.assertEqual(len(client.calls), 1, "30 秒内的第二次 force 直接用缓存")
+        self.assertEqual([info.id for info in catalog.entries("cn", chat_only=False)], ["m1"])
+
+    def test_window_can_be_turned_off(self):
+        client = FakeClient({models.CONFIG_PATH: self.PAYLOAD})
+        catalog = models.ModelCatalog(client, FakeCfg({"models": {"min_refresh_seconds": 0}}))
+        catalog.fetch(FakeAccount(), "cn", force=True)
+        catalog.fetch(FakeAccount(), "cn", force=True)
+        self.assertEqual(len(client.calls), 2, "0 = 关闭限流，真需要时能强制刷新")
+
+    def test_after_window_it_fetches_again(self):
+        client = FakeClient({models.CONFIG_PATH: self.PAYLOAD})
+        catalog = models.ModelCatalog(client, FakeCfg({"models": {"min_refresh_seconds": 30}}))
+        catalog.fetch(FakeAccount(), "cn", force=True)
+        catalog._attempted_at["cn"] = time.time() - 31
+        catalog.fetch(FakeAccount(), "cn", force=True)
+        self.assertEqual(len(client.calls), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
