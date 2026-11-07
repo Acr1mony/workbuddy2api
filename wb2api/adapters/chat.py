@@ -33,6 +33,12 @@ KNOWN_ROLES = {"system", "user", "assistant", "tool", "function"}
 DEFAULT_REASONING_EFFORT = "high"
 # 目录没预热时按名字判断是否推理模型；宁可多带字段也别少带（少带 = 没有思考输出）。
 REASONING_MARKERS = ("deepseek", "reasoner", "thinking", "o1-", "o3-", "o4-", "claude-3-7", "claude-sonnet-4")
+# 这些模型名字里没有思考字样，却对"缺 effort"敏感：不带 reasoning_effort 直接 11150。
+# 实测 glm 系列就是这一类——它不需要 thinking 字段，但需要显式的思考档位。
+EFFORT_ONLY_MARKERS = ("glm-",)
+
+# 内容审核打回时用的中性系统提示词：只说"你是个助手"，不携带任何项目/身份线索。
+NEUTRAL_SYSTEM_PROMPT = "You are a helpful assistant."
 
 # 上游 usage 里缓存命中字段的别名，统一成 OpenAI 规范名。
 _CACHE_PAIRS = (
@@ -82,6 +88,7 @@ def prepare_request(
         # 放在配对之后：配对会删除消息，白洗一遍是浪费，删掉的消息也不需要洗。
         request_sanitize.sanitize_messages(obj.get("messages"))
     _inject_thinking(obj, model_meta, reasoning_model)
+    _ensure_reasoning_effort(obj, model_meta, reasoning_model)
     _clamp_reasoning_effort(obj, model_meta)
     if reasoning_model:
         _backfill_reasoning(obj)
@@ -409,6 +416,32 @@ def _supported_efforts(meta: Dict[str, Any]) -> List[str]:
     return [str(item).lower() for item in raw if isinstance(item, str)]
 
 
+def _ensure_reasoning_effort(
+    obj: Dict[str, Any], model_meta: Optional[Dict[str, Any]], reasoning_model: bool
+) -> None:
+    """给"必须带档位"的模型补一个合法档位。
+
+    glm 这类模型名里没有思考字样、也不需要 ``thinking`` 字段，但缺 ``reasoning_effort``
+    会直接 11150。档位优先取目录里的 ``defaultEffort``，其次取它支持的最弱档，
+    最后才用 ``high``——补错档位比不补好，因为不补是硬错误。
+    """
+    if reasoning_model:
+        return  # 推理模型已经由 _inject_thinking 处理
+    model = str(obj.get("model") or "").lower()
+    if not any(marker in model for marker in EFFORT_ONLY_MARKERS):
+        return
+    meta = _meta_for(str(obj.get("model") or ""), model_meta)
+    current = obj.get("reasoning_effort") or obj.get("reasoningEffort")
+    if isinstance(current, str) and current.strip():
+        return
+    supported = _supported_efforts(meta)
+    effort = meta.get("defaultEffort") if isinstance(meta, dict) else None
+    if not isinstance(effort, str) or not effort.strip():
+        known = [item for item in supported if item in EFFORT_RANK and EFFORT_RANK[item] > 0]
+        effort = min(known, key=lambda item: EFFORT_RANK[item]) if known else DEFAULT_REASONING_EFFORT
+    obj["reasoning_effort"] = str(effort).strip().lower()
+
+
 def _clamp_reasoning_effort(obj: Dict[str, Any], model_meta: Optional[Dict[str, Any]]) -> None:
     """把请求档位降到模型支持的档位，避免出站带非法档位（11150）。"""
     model = str(obj.get("model") or "")
@@ -553,6 +586,85 @@ def _call_id(call: Any) -> str:
 # --------------------------------------------------------------------------
 # 响应侧
 # --------------------------------------------------------------------------
+
+
+_MEDIA_PART_TYPES = (
+    "image_url", "input_image", "image",
+    "video_url", "input_video",
+    "audio_url", "input_audio",
+    "file", "input_file",
+)
+
+
+def has_media(body: Dict[str, Any]) -> bool:
+    """请求里有没有非文本内容（图片/音频/文件）。
+
+    媒体请求不该绑会话亲和：同一张图被反复提交和多轮对话无关，把这种请求钉在
+    一个号上只会让该号的请求画像更反常（审计原话：媒体路径应禁用亲和）。
+    """
+    messages = (body or {}).get("messages")
+    if not isinstance(messages, list):
+        return False
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and str(part.get("type") or "").lower() in _MEDIA_PART_TYPES:
+                return True
+    return False
+
+
+def neutralize_payload(raw: bytes) -> Optional[bytes]:
+    """把系统提示词换成中性最小版，供内容审核打回后的唯一一次重试。
+
+    只动 ``role == "system"`` 的消息：用户自己的话一个字都不改（改了就是在替用户
+    说话，也可能把请求变成本意不同的东西）。没有 system 消息时返回 ``None``——
+    同一份内容原样重发只会再被拦一次，纯浪费一次风控计数。
+    """
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    messages = obj.get("messages")
+    if not isinstance(messages, list):
+        return None
+    system_messages = [
+        item for item in messages
+        if isinstance(item, dict) and str(item.get("role") or "") == "system"
+    ]
+    if not system_messages:
+        return None
+    if all(_plain_text(item) == NEUTRAL_SYSTEM_PROMPT for item in system_messages):
+        # 本来就已经是中性提示词（多数是 prepare_request 自动补的那句），
+        # 原样重发只是白烧一次风控计数。
+        return None
+    kept = [
+        item for item in messages
+        if not (isinstance(item, dict) and str(item.get("role") or "") == "system")
+    ]
+    obj["messages"] = [{"role": "system", "content": NEUTRAL_SYSTEM_PROMPT}] + kept
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _plain_text(message: Any) -> str:
+    """取一条消息的纯文本内容（用于比较提示词是否已经"足够中性"）。"""
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and str(item.get("type") or "") == "text":
+                parts.append(str(item.get("text") or ""))
+        return "".join(parts).strip()
+    return ""
 
 
 def normalize_usage(usage: Dict[str, Any]) -> Dict[str, Any]:

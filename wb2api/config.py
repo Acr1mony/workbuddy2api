@@ -129,7 +129,7 @@ DEFAULTS: Dict[str, Any] = {
     # 出站请求体的反指纹净化。默认开：上游对 Claude Code / Codex 模板句和
     # 字面量 "11-128" 是**逐字匹配**，命中就整单拒（400 11-128）。
     # 想要原样透传自己的 prompt 就显式改成 "passthrough"。
-    "prompt": {"mode": "sanitize", "file": ""},
+    "prompt": {"mode": "sanitize", "file": "", "content_retry": True},
     "features": {},
 }
 

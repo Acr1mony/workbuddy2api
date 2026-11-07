@@ -310,5 +310,75 @@ class AggregateTests(unittest.TestCase):
         self.assertEqual(5, out["usage"]["prompt_tokens_details"]["cached_tokens"])
 
 
+class EffortOnlyModelTest(unittest.TestCase):
+    """glm 这类模型不吃 thinking，但缺 reasoning_effort 会直接 11150。"""
+
+    def prepare(self, body, meta=None):
+        return chat.prepare_request(body, meta or {})
+
+    def test_glm_gets_an_explicit_effort(self) -> None:
+        out = self.prepare({"model": "glm-4.6", "messages": [{"role": "user", "content": "hi"}]})
+        self.assertIn("reasoning_effort", out, "glm 缺档位会被上游 11150 打回")
+        self.assertNotIn("thinking", out, "glm 不吃 thinking 字段")
+
+    def test_glm_keeps_the_client_effort(self) -> None:
+        out = self.prepare({"model": "glm-5.3", "reasoning_effort": "high",
+                            "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual("high", out["reasoning_effort"])
+
+    def test_glm_prefers_the_weakest_supported_effort(self) -> None:
+        meta = {"glm-4.6": {"reasoning": False, "supportedEfforts": ["low", "medium", "high"]}}
+        out = self.prepare({"model": "glm-4.6", "messages": [{"role": "user", "content": "hi"}]}, meta)
+        self.assertEqual("low", out["reasoning_effort"], "补档位要选最省的那档，别替用户多花钱")
+
+    def test_default_effort_from_catalog_wins(self) -> None:
+        meta = {"glm-4.6": {"reasoning": False, "defaultEffort": "medium",
+                            "supportedEfforts": ["low", "medium", "high"]}}
+        out = self.prepare({"model": "glm-4.6", "messages": [{"role": "user", "content": "hi"}]}, meta)
+        self.assertEqual("medium", out["reasoning_effort"])
+
+    def test_other_models_get_no_effort(self) -> None:
+        out = self.prepare({"model": "kimi-k2.5", "messages": [{"role": "user", "content": "hi"}]})
+        self.assertNotIn("reasoning_effort", out)
+
+
+class MediaAndNeutralizeTest(unittest.TestCase):
+    def test_has_media_detects_image_part(self) -> None:
+        body = {"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "看图"},
+            {"type": "image_url", "image_url": {"url": "https://x/1.png"}},
+        ]}]}
+        self.assertTrue(chat.has_media(body))
+
+    def test_has_media_is_false_for_plain_text(self) -> None:
+        body = {"messages": [{"role": "user", "content": "只有文字"}]}
+        self.assertFalse(chat.has_media(body))
+
+    def test_neutralize_replaces_the_system_prompt_only(self) -> None:
+        raw = json.dumps({"model": "m", "messages": [
+            {"role": "system", "content": "You are Claude Code, Anthropic's official CLI for Claude"},
+            {"role": "user", "content": "帮我看看这段代码"},
+        ], "max_tokens": 32}).encode()
+        out = json.loads(chat.neutralize_payload(raw).decode())
+        self.assertEqual([{"role": "system", "content": chat.NEUTRAL_SYSTEM_PROMPT},
+                          {"role": "user", "content": "帮我看看这段代码"}], out["messages"])
+        self.assertEqual(32, out["max_tokens"], "除系统提示词外一个字段都不许动")
+
+    def test_neutralize_without_system_returns_none(self) -> None:
+        raw = json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode()
+        self.assertIsNone(chat.neutralize_payload(raw), "没有系统提示词可摘，重发只是再被拦一次")
+
+    def test_neutralize_when_already_neutral_returns_none(self) -> None:
+        raw = json.dumps({"messages": [
+            {"role": "system", "content": chat.NEUTRAL_SYSTEM_PROMPT},
+            {"role": "user", "content": "hi"},
+        ]}).encode()
+        self.assertIsNone(chat.neutralize_payload(raw))
+
+    def test_neutralize_garbage_returns_none(self) -> None:
+        self.assertIsNone(chat.neutralize_payload(b"not json"))
+        self.assertIsNone(chat.neutralize_payload(b"[]"))
+
+
 if __name__ == "__main__":
     unittest.main()

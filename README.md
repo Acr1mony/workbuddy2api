@@ -79,11 +79,12 @@ wb2a serve          # 或 workbuddy2api serve
 
 | 层   | 处理                                                                                                                                                                                                                                |
 | --- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 请求体 | `stream` 强制为真、`max_completion_tokens` 翻译、GPT 系 `max_tokens` 抬到 ≥16、`tool_choice` 对象→字符串、`stop` 字符串→数组、工具名/schema 修复、`developer→system`、图片部件归一、工具消息配对（合并/重排/剔孤儿）、推理模型 `thinking` + `reasoning_effort` 双发、历史 `reasoning_content` 回填 |
+| 请求体 | `stream` 强制为真、`max_completion_tokens` 翻译、GPT 系 `max_tokens` 抬到 ≥16、`tool_choice` 对象→字符串、`stop` 字符串→数组、工具名/schema 修复、`developer→system`、图片部件归一、工具消息配对（合并/重排/剔孤儿）、推理模型 `thinking` + `reasoning_effort` 双发、历史 `reasoning_content` 回填、glm 类模型缺档位时补最省的一档（否则 11150） |
 | 请求头 | 完整会话头族（`X-Conversation-ID` 等 5 个 id、`X-Machine-ID`/`X-Session-ID` 由 uid 派生、`X-CodeBuddy-Request: 1`）、按域切换 UA / Origin / `X-Domain`                                                                                                |
 | 响应  | SSE → OpenAI 流式（含 `delta.reasoning_content`、`tool_calls` 增量）；非流式在本地聚合；正文里漏出来的 DSML 工具标记被抠成真正的 `tool_calls`                                                                                                                        |
-| 账号  | 令牌自动刷新（单飞，防一次性 refresh token 被并发烧掉）、48 小时前置保活、余额查询、每日签到                                                                                                                                                                           |
+| 账号  | 令牌自动刷新（单飞，防一次性 refresh token 被并发烧掉）、6 小时前置保活（刷越勤越危险）、余额查询、每日签到                                                                                                                                                                       |
 | 池   | 加权随机选号、会话粘滞（同一对话尽量打同一账号，否则上游 prefix 缓存全废）、并发槽、软冷却/熔断/降级/风控连坐五类时间窗、失败转移最多 3 次                                                                                                                                                      |
+| 防封  | 同账号最小间隔 200ms、定时任务随机错峰、403 分三路处置（11140 风控 / 边缘 WAF / 凭证失效，风控绝不换号）、内容审核打回时摘掉系统提示词重试一次、媒体请求不绑会话、连接池按凭据分池、半读连接不回池、链路抖动记在出口上而不是账号上                                                        |
 | 观测  | 每请求一行 JSONL 台账（tokens、TTFT、命中缓存、账套、账号）、面板实时 KPI                                                                                                                                                                                   |
 
 ---

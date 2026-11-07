@@ -315,5 +315,60 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual(bound[0], client.calls[0]["headers"]["X-User-Id"])
 
 
+    def test_waf_retries_once_with_a_neutral_prompt(self):
+        """内容审核打回时换号没用，但摘掉用户自己的系统提示词常常能过。"""
+        error = UpstreamError("Request blocked by WAF", kind="waf", status=403, retryable=True)
+        svc, client = self.service([error, ok_stream("ok")])
+        payload = self.body(messages=[
+            {"role": "system", "content": "You are Claude Code, Anthropic's official CLI for Claude"},
+            {"role": "user", "content": "hi"},
+        ])
+        svc.chat_completions(self.request(payload))
+        self.assertEqual(len(client.calls), 2, "只允许降级重试一次")
+        retried = client.calls[1]["body"].decode("utf-8")
+        self.assertIn("You are a helpful assistant.", retried)
+        self.assertNotIn("Claude Code", retried)
+        account = svc.store.get_account(client.calls[0]["headers"]["X-User-Id"])
+        # 第一发不算这个号的账：重试成功就该是干净的
+        self.assertEqual(account.cooldown_until, 0.0)
+        self.assertEqual(account.failures, 0)
+
+    def test_waf_retry_happens_only_once(self):
+        error = UpstreamError("Request blocked by WAF", kind="waf", status=403, retryable=True)
+        svc, client = self.service([error, error])
+        payload = self.body(messages=[
+            {"role": "system", "content": "You are Claude Code, Anthropic's official CLI for Claude"},
+            {"role": "user", "content": "hi"},
+        ])
+        with self.assertRaises(ServiceError) as ctx:
+            svc.chat_completions(self.request(payload))
+        self.assertEqual(ctx.exception.code, "content_blocked")
+        self.assertEqual(len(client.calls), 2, "降级只试一次，别在风控上反复试探")
+
+    def test_waf_without_custom_prompt_does_not_retry(self):
+        """系统提示词本来就是我们补的中性那句，重发等于白烧一次风控计数。"""
+        error = UpstreamError("Request blocked by WAF", kind="waf", status=403, retryable=True)
+        svc, client = self.service([error])
+        with self.assertRaises(ServiceError):
+            svc.chat_completions(self.request(self.body()))
+        self.assertEqual(len(client.calls), 1)
+
+    def test_media_request_does_not_bind_affinity(self):
+        from wb2api.httpserver import Request
+
+        svc, client = self.service([ok_stream("hi")])
+        payload = self.body(stream=True, messages=[{"role": "user", "content": [
+            {"type": "text", "text": "这是什么"},
+            {"type": "image_url", "image_url": {"url": "https://x/1.png"}},
+        ]}])
+        req = Request(
+            "POST", "/v1/chat/completions", {}, {"X-Conversation-Id": "conv-img"},
+            json.dumps(payload).encode(), ("1.2.3.4", 1),
+        )
+        list(svc.chat_completions(req).stream)
+        self.assertEqual(svc.affinity.candidates("conv-img"), [],
+                         "媒体请求钉在同一个号上只会让它的画像更反常")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

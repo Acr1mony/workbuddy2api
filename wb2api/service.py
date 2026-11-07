@@ -186,6 +186,10 @@ class GatewayService:
         payload = json.dumps(meta_body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
         stick = make_session_key(request.headers, body)
+        if chat_adapter.has_media(body):
+            # 媒体请求不绑亲和：同一张图被反复提交和多轮对话无关，钉在同一个号上
+            # 只会让这个号的请求画像更反常。
+            stick = ""
         # 有的抓包环境里官方 chat 不带稳定的 conversation id，这时"派生"反而更显眼，
         # 所以留一个开关：关掉就退回每轮随机（老行为）。
         hint = stick if bool(self.cfg.get("upstream.derive_conversation_id", True)) else ""
@@ -247,6 +251,7 @@ class GatewayService:
         exclude: List[str] = []
         last_error: Optional[UpstreamError] = None
         attempts = 0
+        neutralized = False  # 内容审核降级只允许一次
         while attempts <= MAX_ROTATE:
             attempts += 1
             account = self.pool.select(
@@ -292,6 +297,17 @@ class GatewayService:
                 if err.kind in ("timeout", "transient") or err.status >= 500:
                     # 链路问题记在出口上：记到账号头上会让一次网络抖动把整池打断
                     self.egress.note_failure(Egress.key_for(url, proxy), err.message or "")
+                if err.kind == "waf" and not neutralized and self.cfg.get("prompt.content_retry", True):
+                    # 内容审核打回时换号没用（同一份内容在哪个号上都会被拦），
+                    # 但把用户自带的系统提示词换成中性最小版常常能过。只试一次，
+                    # 且这一次不记冷却——同一份请求的第二发不该算这个号的账。
+                    neutral = chat_adapter.neutralize_payload(payload)
+                    if neutral is not None:
+                        neutralized = True
+                        payload = neutral
+                        self.pool.release(account)
+                        log.info("内容审核打回（%s）：改用中性提示词重试一次", model)
+                        continue
                 rotate, auth_retry = self._absorb(account, err, model, realm)
                 self.pool.release(account)
                 if auth_retry:
