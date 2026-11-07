@@ -365,5 +365,26 @@ class CorruptLineTest(UsageBase):
         self.assertEqual(ledger.summary()["total"]["requests"], 1)
 
 
+class RecentAfterRestartTest(UsageBase):
+    """重启后"最近请求"不能是空的——总数有值而列表为空，最像 bug。"""
+
+    def test_replayed_records_show_up_in_recent(self):
+        first = self.ledger()
+        first.record(self.event(model="m-1"))
+        first.record(self.event(model="m-2"))
+
+        revived = self.ledger()
+        revived.load()
+        recent = revived.recent(10)
+        self.assertEqual([item["model"] for item in recent], ["m-2", "m-1"], "最新在前")
+        self.assertEqual(revived.summary()["total"]["requests"], 2, "回放仍然只算一次")
+
+    def test_recent_survives_a_fresh_day(self):
+        ledger = self.ledger()
+        ledger.record(self.event(ts=time.time() - 86400, day=day_of(time.time() - 86400)))
+        ledger.record(self.event())
+        self.assertEqual([item["model"] for item in ledger.recent(5)], ["deepseek-v3", "deepseek-v3"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

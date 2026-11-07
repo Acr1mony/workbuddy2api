@@ -546,6 +546,7 @@
             "</div>" +
           "</td>" +
           '<td><div class="row-actions">' +
+            '<button class="ghost tiny-btn acc-detail">详情</button>' +
             '<button class="ghost tiny-btn acc-test">测试</button>' +
             '<button class="ghost tiny-btn" data-act="refresh">续期</button>' +
             '<button class="ghost tiny-btn" data-act="balance">查额度</button>' +
@@ -586,6 +587,103 @@
 
   function selectedUids() {
     return Object.keys(state.selected);
+  }
+
+  // ---------------- 单号详情 ----------------
+  var WINDOW_LABELS = [
+    ["cooldown_until", "限流冷却"],
+    ["breaker_until", "熔断"],
+    ["degrade_until", "降权"],
+    ["balance_until", "余额耗尽"],
+    ["restricted_until", "风控封禁"]
+  ];
+
+  function closeAccountDetail() {
+    var drawer = $("#acc-detail");
+    if (drawer) drawer.hidden = true;
+  }
+
+  function openAccountDetail(uid) {
+    var drawer = $("#acc-detail");
+    if (!drawer) return;
+    drawer.hidden = false;
+    $("#detail-title").textContent = "账号详情";
+    $("#detail-body").innerHTML = '<p class="muted">加载中…</p>';
+    api("/api/accounts/" + encodeURIComponent(uid)).then(function (data) {
+      renderAccountDetail(data || {});
+    }).catch(function (err) {
+      $("#detail-body").innerHTML = '<p class="muted">' + esc(err.message || "加载失败") + "</p>";
+    });
+  }
+
+  function detailRow(label, value) {
+    return '<div class="detail-row"><span class="muted">' + esc(label) + "</span><span>" + value + "</span></div>";
+  }
+
+  function renderAccountDetail(data) {
+    var a = data.account || {};
+    var usage = data.usage || {};
+    var now = Date.now() / 1000;
+    var html = "";
+    $("#detail-title").textContent = a.nickname || (a.uid || "").slice(0, 8) || "账号详情";
+
+    html += '<div class="detail-section">';
+    html += detailRow("昵称", esc(a.nickname || "—"));
+    html += detailRow("域", '<span class="badge">' + esc(a.realm || "cn") + "</span>");
+    html += detailRow("UID", '<span class="mono tiny">' + esc(a.uid || "") + "</span>");
+    html += detailRow("状态", a.disabled ? '<span class="badge bad">已停用</span>' : '<span class="badge ok">启用中</span>');
+    html += detailRow("余额", a.credit === null || a.credit === undefined ? '<span class="muted">未知</span>' : esc(fmtCredit(a.credit)));
+    html += detailRow("令牌", (a.has_refresh_token ? "可续期" : (a.has_access_token ? "仅 access" : "无令牌")) +
+      (a.token_expired ? " · <span class=\"badge bad\">已过期</span>" : ""));
+    html += detailRow("到期", esc(a.token_expires_at ? fmtTime(a.token_expires_at) : "—"));
+    html += detailRow("在途", esc(String(a.in_flight || 0)));
+    html += "</div>";
+
+    if (a.last_error) {
+      html += '<div class="detail-section"><div class="muted tiny">最近错误</div>' +
+        '<pre class="log tiny">' + esc(a.last_error) + "</pre></div>";
+    }
+
+    var windows = [];
+    WINDOW_LABELS.forEach(function (pair) {
+      var until = a[pair[0]];
+      if (until && until > now) windows.push(pair[1] + " 还剩 " + fmtCountdown(until - now));
+    });
+    if (windows.length) {
+      html += '<div class="detail-section"><div class="muted tiny">为什么现在不接单</div>' +
+        windows.map(function (text) { return '<div class="badge warn">' + esc(text) + "</div>"; }).join(" ") +
+        "</div>";
+    }
+
+    var models = data.model_cooldowns || {};
+    var modelKeys = Object.keys(models);
+    if (modelKeys.length) {
+      html += '<div class="detail-section"><div class="muted tiny">被单独封的模型</div>' +
+        modelKeys.map(function (name) {
+          return detailRow(name, esc(fmtCountdown(models[name]["for"] || 0)));
+        }).join("") + "</div>";
+    }
+
+    html += '<div class="detail-section"><div class="muted tiny">这个号花掉的</div>';
+    html += detailRow("请求数", esc(String(usage.requests || 0)) + "（失败 " + esc(String(usage.errors || 0)) + "）");
+    html += detailRow("消耗积分", esc(fmtCredit(usage.credits || 0)));
+    html += detailRow("tokens", "入 " + esc(fmtNum(usage.prompt_tokens || 0)) + " · 出 " + esc(fmtNum(usage.completion_tokens || 0)));
+    html += detailRow("平均延迟", usage.requests ? esc(Math.round((usage.latency_ms || 0) / usage.requests)) + " ms" : "—");
+    html += "</div>";
+
+    var recent = data.recent || [];
+    if (recent.length) {
+      html += '<div class="detail-section"><div class="muted tiny">最近请求</div>' +
+        recent.map(function (item) {
+          var ok = Number(item.status || 0) >= 200 && Number(item.status || 0) < 400;
+          return '<div class="detail-row"><span class="muted tiny">' + esc(fmtTime(item.at)) + "</span><span>" +
+            '<span class="badge ' + (ok ? "ok" : "bad") + '">' + esc(String(item.status || "—")) + "</span> " +
+            esc(item.model || "") + ' <span class="muted tiny">' + esc(String(item.elapsed_ms || 0)) + " ms · " +
+            esc(fmtCredit(item.credit || 0)) + "</span></span></div>";
+        }).join("") + "</div>";
+    }
+
+    $("#detail-body").innerHTML = html;
   }
 
   function rowAction(uid, action, button) {
@@ -1108,6 +1206,11 @@
       renderAccounts();
     });
 
+    $("#detail-close").addEventListener("click", closeAccountDetail);
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape") closeAccountDetail();
+    });
+
     $("#acc-table").addEventListener("click", function (ev) {
       var tr = ev.target.closest("tr[data-uid]");
       if (!tr) return;
@@ -1118,6 +1221,7 @@
         renderAccounts();
         return;
       }
+      if (ev.target.classList.contains("acc-detail")) { openAccountDetail(uid); return; }
       if (ev.target.classList.contains("acc-test")) { rowAction(uid, "test", ev.target); return; }
       var act = ev.target.getAttribute("data-act");
       if (act) rowAction(uid, act, ev.target);

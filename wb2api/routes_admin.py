@@ -100,6 +100,9 @@ def register(router: Router, panel: Panel) -> None:
     router.add("POST", r"/api/accounts/bulk", lambda req: _bulk_action(panel, req))
     router.add("GET", r"/api/accounts/export", lambda req: _export_accounts(panel, req))
     router.add("POST", r"/api/accounts/import", lambda req: _import_accounts(panel, req))
+    # 单号详情放在 export/import 之后：路由器按注册顺序匹配，否则 "export" 会被
+    # 当成一个 uid。
+    router.add("GET", r"/api/accounts/(?P<uid>[^/]+)", lambda req, uid: _account_detail(panel, req, uid))
     router.add(
         "POST",
         r"/api/accounts/(?P<uid>[^/]+)/(?P<action>enable|disable|delete|test|refresh|checkin|balance)",
@@ -302,6 +305,43 @@ def _set_account(panel: Panel, req: Any) -> Response:
     account.updated_at = util.now()
     panel.store.upsert_account(account)
     return json_response({"ok": True, "account": account.masked()})
+
+
+def _account_detail(panel: Panel, req: Any, uid: str) -> Response:
+    """单个账号的全貌：为什么现在不接单 + 它最近花掉了什么。
+
+    列表页只有一行，真正的因果都在这里：冷却到几点、因为什么、熔断重试到第几档、
+    哪些模型被单独封了、这个号今天消耗了多少积分、最近几次请求是成是败。
+    """
+    panel.require(req)
+    account = panel.store.get_account(uid)
+    if account is None:
+        return error_response(404, "账号不存在", "unknown_account")
+    now = time.time()
+    wait, window = throttle_until(account, "")
+    row = account.masked()
+    row["throttle_for"] = int(max(0.0, (wait or 0) - now))
+    row["throttle_reason"] = window
+    row["in_flight"] = getattr(account, "in_flight", 0)
+
+    summary = panel.service.ledger.summary()
+    usage = dict(summary.get("by_account", {}).get(account.uid) or {})
+    recent = [
+        item
+        for item in summary.get("recent") or []
+        if str(item.get("account") or "") == account.uid
+    ][:20]
+    return json_response(
+        {
+            "account": row,
+            "usage": usage,
+            "recent": recent,
+            "model_cooldowns": {
+                model: {"until": until, "for": int(max(0.0, float(until or 0) - now))}
+                for model, until in (row.get("model_cooldowns") or {}).items()
+            },
+        }
+    )
 
 
 def _account_action(panel: Panel, req: Any, uid: str, action: str) -> Response:

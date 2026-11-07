@@ -138,6 +138,10 @@ class UsageLedger:
                         continue
                     if isinstance(record, dict):
                         self._apply(record)
+                        # 回放也要进 recent：否则重启后面板的"最近请求"是空的，
+                        # 而同一页上的总数却是有值的——这种不一致最容易被当成 bug 报。
+                        self._recent.append(record)
+                        del self._recent[:-500]
         except OSError:
             pass
 

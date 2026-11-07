@@ -409,3 +409,43 @@ pre.log {
 @media (prefers-reduced-motion: reduce) {
   .toast { animation: none; }
 }
+
+/* 单号详情抽屉：列表一行讲不完的因果都在这 */
+.drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  width: min(420px, 100vw);
+  height: 100vh;
+  background: var(--bg-card);
+  border-left: 1px solid var(--line);
+  box-shadow: -8px 0 24px rgba(0, 0, 0, 0.28);
+  display: flex;
+  flex-direction: column;
+  z-index: 40;
+}
+.drawer[hidden] { display: none; }
+.drawer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+}
+.drawer-body { padding: 12px 14px; overflow-y: auto; flex: 1 1 auto; }
+.detail-section { border-bottom: 1px dashed var(--line); padding: 8px 0; }
+.detail-section:last-child { border-bottom: none; }
+.detail-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+  padding: 2px 0;
+}
+.detail-row > span:last-child { text-align: right; word-break: break-all; }
+.drawer .badge { margin-right: 4px; }
+
+@media (max-width: 900px) {
+  .drawer { width: 100vw; }
+}

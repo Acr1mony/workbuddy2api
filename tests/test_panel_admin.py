@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import json
+import time
 import unittest
 
 from tests.test_app import ServerCase
@@ -218,6 +220,59 @@ class TestBackup(ServerCase):
         )
         self.assertEqual(status, 400)
         self.assertEqual(self.json_of(data)["error"]["code"], "bad_request")
+
+
+class TestAccountDetail(ServerCase):
+    """单号详情：列表一行讲不完的因果（窗口、模型封禁、这个号花掉的）。"""
+
+    def _seed(self, uid="uid-detail"):
+        token = self.panel_token()
+        account = make_account(uid)
+        account.cooldown_until = time.time() + 600
+        account.cooldown_reason = "429 scoped"
+        account.model_cooldowns["glm-4.6"] = {"until": time.time() + 300, "reason": "model blocked"}
+        self.app.store.upsert_account(account)
+        return token, account
+
+    def test_unknown_account_is_404(self):
+        token = self.panel_token()
+        status, _headers, data = self.request(
+            "GET", "/api/accounts/nobody", headers={"X-Panel-Token": token}
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(self.json_of(data)["error"]["code"], "unknown_account")
+
+    def test_detail_explains_the_window_and_usage(self):
+        token, account = self._seed()
+        status, _headers, data = self.request(
+            "GET", "/api/accounts/" + account.uid, headers={"X-Panel-Token": token}
+        )
+        self.assertEqual(status, 200)
+        payload = self.json_of(data)
+        row = payload["account"]
+        self.assertEqual(row["uid"], account.uid)
+        self.assertGreater(row["throttle_for"], 0, "冷却中就该报剩余秒数")
+        self.assertTrue(row["throttle_reason"])
+        self.assertIn("usage", payload)
+        self.assertIn("recent", payload)
+        cooldowns = payload["model_cooldowns"]
+        self.assertIn("glm-4.6", cooldowns)
+        self.assertGreater(cooldowns["glm-4.6"]["for"], 0)
+        self.assertNotIn("tok-" + account.uid, json.dumps(payload), "详情里绝不能出现令牌明文")
+        self.assertTrue(row["has_access_token"])
+
+    def test_export_route_still_wins_over_detail(self):
+        token = self.panel_token()
+        status, headers, _data = self.request(
+            "GET", "/api/accounts/export", headers={"X-Panel-Token": token}
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("attachment", headers.get("content-disposition", ""))
+
+    def test_requires_panel_token(self):
+        _token, account = self._seed()
+        status, _headers, _data = self.request("GET", "/api/accounts/" + account.uid)
+        self.assertEqual(status, 401)
 
 
 if __name__ == "__main__":

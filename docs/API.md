@@ -223,6 +223,7 @@ X-Panel-Token: 1762500000.9f3c...
 | `POST /api/accounts/bulk` | `{"action":"test","uids":["..."]}` 或 `{"action":"disable","all":true,"realm":"cn"}`。`action` ∈ `enable`/`disable`/`test`/`refresh`/`balance`；单次最多 200 个；一个号失败不影响其余，返回 `{"ok":true,"total":N,"ok_count":M,"results":[{"uid","ok","detail"}]}` |
 | `GET /api/accounts/export` | 下载账号备份（`Content-Disposition: attachment`，`Cache-Control: no-store`）。**含明文 refresh token**——不做脱敏，脱敏的备份 restore 不回来等于假备份 |
 | `POST /api/accounts/import` | `{"accounts":[...]}`（也接受裸数组）。merge 语义：同 uid 覆盖，其余保留，**从不删除**；每行独立判定，坏行只计入 `skipped`。返回 `{"ok":true,"added":N,"updated":M,"skipped":K}` |
+| `GET /api/accounts/{uid}` | 单号详情：`{"account":{…账号行 + throttle_for/throttle_reason…},"usage":{requests,ok,errors,prompts…},"recent":[…最近 20 条该号的请求…],"model_cooldowns":{"<model>":{"until","for"}}}`。用来回答"这个号现在为什么不接单" |
 
 账号行形状（**永不含 token**）：
 
