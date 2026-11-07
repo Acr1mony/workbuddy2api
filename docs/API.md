@@ -220,6 +220,7 @@ X-Panel-Token: 1762500000.9f3c...
 | `POST /api/accounts/{uid}/refresh` | 强制刷新令牌 |
 | `POST /api/accounts/{uid}/checkin` | 每日签到（CN 域） |
 | `POST /api/accounts/{uid}/balance` | 查余额并写回账号 |
+| `POST /api/accounts/{uid}/report` | 活跃上报（点亮连登天数 / 解锁 first_buddy）。企业号直接回 `{"ok":false,"message":"企业号没有活跃体系，上报是零收益"}`，**一次请求都不发** |
 | `POST /api/accounts/bulk` | `{"action":"test","uids":["..."]}` 或 `{"action":"disable","all":true,"realm":"cn"}`。`action` ∈ `enable`/`disable`/`test`/`refresh`/`balance`；单次最多 200 个；一个号失败不影响其余，返回 `{"ok":true,"total":N,"ok_count":M,"results":[{"uid","ok","detail"}]}` |
 | `GET /api/accounts/export` | 下载账号备份（`Content-Disposition: attachment`，`Cache-Control: no-store`）。**含明文 refresh token**——不做脱敏，脱敏的备份 restore 不回来等于假备份 |
 | `POST /api/accounts/import` | `{"accounts":[...]}`（也接受裸数组）。merge 语义：同 uid 覆盖，其余保留，**从不删除**；每行独立判定，坏行只计入 `skipped`。返回 `{"ok":true,"added":N,"updated":M,"skipped":K}` |
@@ -263,7 +264,7 @@ X-Panel-Token: 1762500000.9f3c...
 | `GET /api/usage` | 台账汇总：总量、按天/按密钥/按账号/按模型、最近 50 条 |
 | `GET /api/usage/recent?limit=50` | 最近请求明细 |
 | `GET /api/logs?lines=200` | 日志尾部，返回 `{"lines":["...", "..."]}`（只读最后 256KB，不会把大文件读进内存；`lines` 上限 2000） |
-| `GET /api/pool` | 池状态：可用/冷却/禁用、余额合计、各域策略、风控连坐剩余时间 |
+| `GET /api/pool` | 池状态：可用/冷却/禁用、余额合计、各域策略、风控连坐剩余时间；`affinity` 子对象给出会话粘滞的 `sessions`/`hits`/`misses`/`hit_rate`/`page_size`/`rotations`（命中率低说明粘滞没起作用，首字延迟会变差；`rotations` 高说明有长会话在按页换号） |
 | `GET /api/scheduler` | 后台任务清单与上次/下次运行时间 |
 | `POST /api/scheduler/trigger` | `{"job":"keepalive"}` 立刻跑一次；不传 `job` 则跑全部到期任务 |
 

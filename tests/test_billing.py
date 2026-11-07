@@ -14,7 +14,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from wb2api.billing import Billing, CHECKIN_PATH, RESOURCE_PATH
+from wb2api.billing import Billing, CHECKIN_PATH, REPORT_PATH, RESOURCE_PATH
 from wb2api.store import Account
 from wb2api.upstream import UpstreamError
 
@@ -282,6 +282,51 @@ class HeadersTest(BillingBase):
         account = self.account(realm="cn", device_token="dev-1", product="cli")
         headers = self.headers_for(account)
         self.assertNotIn("X-Device-Token", headers)
+
+
+class ReportTest(BillingBase):
+    """活跃上报：上游要的是**数组**，且事件里缺 userId 会被静默丢弃。
+
+    这是最容易被写成"看起来成功了但什么也没发生"的接口：返回 200、业务 code 0、
+    连登天数不动。所以形状必须按抓包给全。
+    """
+
+    def test_report_posts_an_array_with_user_id(self):
+        billing, client = self.flow([{"code": 0, "msg": "OK"}])
+        ok = billing.report(self.account(uid="u-42"), "cn")
+        self.assertTrue(ok)
+        call = client.calls[0]
+        self.assertEqual(call["method"], "POST")
+        self.assertTrue(call["url"].endswith(REPORT_PATH))
+        body = json.loads(call["body"].decode("utf-8"))
+        self.assertIsInstance(body, list, "契约就是数组，给对象会 400")
+        self.assertEqual(len(body), 1)
+        event = body[0]
+        self.assertEqual(event["eventCode"], "chat_request_send")
+        self.assertEqual(event["userId"], "u-42", "缺 userId → 200 但连登不涨")
+        for key in ("conversationId", "requestId", "rootRequestId", "parentConversationId",
+                    "agentName", "agentType", "requestModelId", "requestModelName"):
+            self.assertTrue(event.get(key), "%s 不能为空" % key)
+        self.assertGreater(event["timestamp"], 1_600_000_000_000, "时间戳是毫秒")
+
+    def test_report_accepts_an_explicit_payload(self):
+        billing, client = self.flow([{"code": 0}])
+        payload = [{"eventCode": "chat_request_send", "userId": "u-1"}]
+        self.assertTrue(billing.report(self.account(), "global", payload))
+        self.assertEqual(json.loads(client.calls[0]["body"].decode("utf-8")), payload)
+
+    def test_report_failure_is_not_an_exception(self):
+        billing, _client = self.flow([UpstreamError("boom", kind="transient", status=500)])
+        self.assertFalse(billing.report(self.account(), "cn"),
+                         "上报失败绝不能让调用方崩——它只是个顺手的动作")
+
+    def test_event_ids_can_be_pinned(self):
+        from wb2api.billing import chat_request_event
+
+        event = chat_request_event(self.account(uid="u-9"), conversation_id="conv-1", request_id="req-1")
+        self.assertEqual(event["conversationId"], "conv-1")
+        self.assertEqual(event["requestId"], "req-1")
+        self.assertEqual(event["rootRequestId"], "req-1")
 
 
 if __name__ == "__main__":

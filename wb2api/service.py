@@ -116,6 +116,7 @@ class GatewayService:
         self.affinity = SessionAffinity(
             ttl=float(util.parse_duration(cfg.get("session_sticky.ttl", "30m"), 1800)) if cfg else 1800.0,
             enabled=sticky_on,
+            page_size=int(cfg.get("session_sticky.page_size", 3)) if cfg else 0,
         )
         self.pool = Pool(store, cfg, self.affinity)
         self.egress = Egress.from_config(cfg)

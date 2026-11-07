@@ -275,5 +275,82 @@ class TestAccountDetail(ServerCase):
         self.assertEqual(status, 401)
 
 
+class TestPoolAffinity(ServerCase):
+    """池状态里带上会话亲和：命中率低 = 粘滞没起作用（TTFT 会很难看）。"""
+
+    def test_pool_reports_affinity(self):
+        token = self.panel_token()
+        status, _headers, data = self.request("GET", "/api/pool", headers={"X-Panel-Token": token})
+        self.assertEqual(status, 200)
+        payload = self.json_of(data)
+        self.assertIn("ready", payload)
+        aff = payload["affinity"]
+        self.assertIn("sessions", aff)
+        self.assertIn("hit_rate", aff)
+        self.assertIn("page_size", aff)
+        self.assertEqual(aff["page_size"], self.app.service.affinity.page_size)
+
+    def test_affinity_counts_a_bind(self):
+        token = self.panel_token()
+        self.app.service.affinity.bind("conv-1", "uid-a")
+        status, _headers, data = self.request("GET", "/api/pool", headers={"X-Panel-Token": token})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.json_of(data)["affinity"]["sessions"], 1)
+
+
+class TestReportAction(ServerCase):
+    """活跃上报：企业号面板上直接说不做，别让人以为"点过了"。"""
+
+    class _Billing:
+        def __init__(self):
+            self.calls = []
+
+        def report(self, account, realm, payload=None, **kw):
+            self.calls.append((account.uid, realm))
+            return True
+
+    def _stub(self):
+        stub = self._Billing()
+        self.app.panel.billing = stub
+        return stub
+
+    def test_report_marks_the_account(self):
+        token = self.panel_token()
+        account = make_account("uid-report")
+        self.app.store.upsert_account(account)
+        stub = self._stub()
+        status, _headers, data = self.request(
+            "POST", "/api/accounts/uid-report/report", headers={"X-Panel-Token": token}
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(self.json_of(data)["ok"])
+        self.assertEqual(stub.calls, [("uid-report", "cn")])
+        saved = self.app.store.get_account("uid-report")
+        self.assertTrue(saved.extra.get("reported_at"), "上报成功要留痕，否则第二天看不出做过没有")
+
+    def test_enterprise_account_is_refused_with_a_reason(self):
+        token = self.panel_token()
+        account = make_account("uid-ent")
+        account.enterprise_id = "ent-42"
+        self.app.store.upsert_account(account)
+        stub = self._stub()
+        status, _headers, data = self.request(
+            "POST", "/api/accounts/uid-ent/report", headers={"X-Panel-Token": token}
+        )
+        self.assertEqual(status, 200)
+        payload = self.json_of(data)
+        self.assertFalse(payload["ok"])
+        self.assertIn("企业", payload["message"])
+        self.assertEqual(stub.calls, [], "企业号上报零收益，一次都不该发")
+
+    def test_report_unknown_account_is_404(self):
+        token = self.panel_token()
+        self._stub()
+        status, _headers, _data = self.request(
+            "POST", "/api/accounts/nobody/report", headers={"X-Panel-Token": token}
+        )
+        self.assertEqual(status, 404)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -35,6 +35,9 @@ class FakeAccount:
         self.credit = 0.0
         self.credit_at = 0.0
         self.label = "@" + uid
+        self.enterprise_id = ""
+        self.product = ""
+        self.extra = {}
 
     @property
     def enabled(self):
@@ -179,13 +182,14 @@ class TestJobDue(unittest.TestCase):
 class TestRegistration(unittest.TestCase):
     def test_all_enabled_by_default(self):
         scheduler = Scheduler(FakeService([]), FakeCfg())
-        self.assertEqual(set(scheduler.jobs), {"keepalive", "balance", "checkin", "housekeeping", "flush"})
+        self.assertEqual(set(scheduler.jobs), {"keepalive", "balance", "checkin", "report", "housekeeping", "flush"})
 
     def test_disabled_jobs_are_not_registered(self):
         cfg = FakeCfg({"schedule": {
             "token_refresh_enabled": False,
             "balance_refresh_enabled": False,
             "checkin_enabled": False,
+            "report_enabled": False,
         }})
         scheduler = Scheduler(FakeService([]), cfg)
         self.assertEqual(set(scheduler.jobs), {"housekeeping", "flush"})
@@ -194,6 +198,60 @@ class TestRegistration(unittest.TestCase):
         cfg = FakeCfg({"schedule": {"keepalive_minutes": 5}})
         scheduler = Scheduler(FakeService([]), cfg)
         self.assertEqual(scheduler.jobs["keepalive"].interval, 300)
+
+    def test_report_runs_at_its_hour(self):
+        cfg = FakeCfg({"schedule": {"report_hour": 14}})
+        scheduler = Scheduler(FakeService([]), cfg)
+        self.assertEqual(scheduler.jobs["report"].at_hour, 14)
+
+
+class TestReportActivity(unittest.TestCase):
+    """活跃上报：企业号零收益要跳过，禁用号不发，成功才记 time。"""
+
+    def setUp(self):
+        # 账号之间的 1~3 秒错峰是防封号的，不是被测逻辑：这里把它替换成空操作，
+        # 否则每个用例都要真睡两秒。
+        from unittest import mock
+
+        patcher = mock.patch("wb2api.scheduler._spread", lambda: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_reports_personal_accounts_in_both_realms(self):
+        accounts = [FakeAccount("cn1", realm="cn"), FakeAccount("g1", realm="global")]
+        service = FakeService(accounts)
+        scheduler = Scheduler(service, FakeCfg())
+        result = scheduler.report_activity()
+        self.assertIn("reported=2", result)
+        self.assertEqual(len(service.client.calls), 2)
+        self.assertTrue(all(url.endswith("/v2/report") for _m, url in service.client.calls))
+        self.assertTrue(all(a.extra.get("reported_at") for a in accounts))
+
+    def test_enterprise_accounts_are_skipped(self):
+        personal = FakeAccount("p1")
+        corporate = FakeAccount("e1")
+        corporate.enterprise_id = "ent-1"
+        service = FakeService([personal, corporate])
+        result = Scheduler(service, FakeCfg()).report_activity()
+        self.assertIn("reported=1", result)
+        self.assertIn("skipped_enterprise=1", result)
+        self.assertEqual(len(service.client.calls), 1, "企业号上报是零收益，不该多发一次请求")
+
+    def test_disabled_and_tokenless_are_skipped(self):
+        disabled = FakeAccount("d1", enabled=False)
+        tokenless = FakeAccount("t1")
+        tokenless.access_token = ""
+        service = FakeService([disabled, tokenless])
+        result = Scheduler(service, FakeCfg()).report_activity()
+        self.assertIn("reported=0", result)
+        self.assertEqual(service.client.calls, [])
+
+    def test_realm_filter_from_config(self):
+        accounts = [FakeAccount("cn1", realm="cn"), FakeAccount("g1", realm="global")]
+        cfg = FakeCfg({"schedule": {"report_realms": ["cn"]}})
+        service = FakeService(accounts)
+        Scheduler(service, cfg).report_activity()
+        self.assertEqual(len(service.client.calls), 1)
 
 
 class TestRunOnce(unittest.TestCase):

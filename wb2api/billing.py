@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 from . import identity
@@ -36,13 +37,20 @@ CREDIT_KEYS = (
 )
 
 
+# 上报里带的模型：默认用一个真实存在的聊天模型。上游只把它当"用户在用什么"的
+# 统计维度，不校验它与账号权限（企业号除外，那种账号的上报零收益，调用方跳过）。
+REPORT_MODEL_ID = "deepseek-v4-flash"
+REPORT_MODEL_NAME = "DeepSeek V4 Flash"
+
+
 class Billing:
     def __init__(self, client: UpstreamClient, cfg: Any) -> None:
         self.client = client
         self.cfg = cfg
 
     # -- 单次请求 -----------------------------------------------------------
-    def _call(self, account: Any, realm: str, method: str, path: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _call(self, account: Any, realm: str, method: str, path: str, body: Any = None) -> Dict[str, Any]:
+        # body 允许是 list：活跃上报的契约就是一个数组（一条上报一条事件）。
         url = self.client.base_url(realm) + path
         headers = identity.billing_headers(account, self.cfg)
         raw = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else b""
@@ -93,14 +101,83 @@ class Billing:
             log.debug("读取用量失败: %s", exc)
             return None
 
-    def report(self, account: Any, realm: str, payload: Dict[str, Any]) -> bool:
-        """活跃上报。失败无关紧要，绝不因为它影响请求。"""
+    def report(self, account: Any, realm: str, payload: Any = None,
+               *, conversation_id: str = "", request_id: str = "",
+               model_id: str = REPORT_MODEL_ID, model_name: str = REPORT_MODEL_NAME) -> bool:
+        """活跃上报：点亮连登天数 / 解锁 first_buddy 任务。
+
+        上游要的是**数组**（一条上报一条 `chat_request_send` 事件），且事件里
+        `userId` 必填——缺了它接口照样 200，但连登天数不动（静默丢弃）。
+        `conversationId` 不需要真实存在，服务端不校验一致性。
+
+        失败无关紧要，绝不因为它影响任何请求。
+        """
+        if payload is None:
+            payload = [chat_request_event(
+                account,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                model_id=model_id,
+                model_name=model_name,
+            )]
         try:
             self._call(account, realm, "POST", REPORT_PATH, payload)
             return True
         except (UpstreamError, ValueError) as exc:
             log.debug("上报失败: %s", exc)
             return False
+
+
+def chat_request_event(account: Any, *, conversation_id: str = "", request_id: str = "",
+                       model_id: str = REPORT_MODEL_ID,
+                       model_name: str = REPORT_MODEL_NAME) -> Dict[str, Any]:
+    """构造一条 `chat_request_send` 事件。
+
+    字段按上游客户端抓包形状给全（缺字段不会报错，但补全更像真客户端）；
+    `timestamp`/`presentAt` 用毫秒。
+    """
+    now_ms = int(time.time() * 1000)
+    uid = str(getattr(account, "uid", "") or "")
+    conversation_id = conversation_id or f"wb2api-{now_ms}"
+    request_id = request_id or conversation_id
+    return {
+        "eventCode": "chat_request_send",
+        "timestamp": now_ms,
+        "reportDelay": 0,
+        "mode": "craft",
+        "conversationId": conversation_id,
+        "requestId": request_id,
+        "inputLength": 12,
+        "requestModelId": model_id,
+        "requestModelName": model_name,
+        "isPlan": False,
+        "isAutoExecuteTerminal": False,
+        "isAutoModify": False,
+        "codebaseEnable": False,
+        "maxToken": 0,
+        "maxSteps": 0,
+        "temperature": 0,
+        "maxRetries": 0,
+        "mentionContexts": [],
+        "knowledgeId": [],
+        "knowledgeName": [],
+        "codebaseId": "",
+        "mentionContextCount": 0,
+        "command": "",
+        "expertId": "",
+        "recommendId": "",
+        "skillId": "",
+        "skillCount": 0,
+        "totalCount": 0,
+        "fileUri": "",
+        "presentAt": now_ms,
+        "traceId": "",
+        "rootRequestId": request_id,
+        "parentConversationId": conversation_id,
+        "agentName": "default",
+        "agentType": "conversation",
+        "userId": uid,
+    }
 
 
 def _walk(node: Any, depth: int = 0) -> Iterable[Any]:

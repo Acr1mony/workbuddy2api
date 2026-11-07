@@ -105,7 +105,7 @@ def register(router: Router, panel: Panel) -> None:
     router.add("GET", r"/api/accounts/(?P<uid>[^/]+)", lambda req, uid: _account_detail(panel, req, uid))
     router.add(
         "POST",
-        r"/api/accounts/(?P<uid>[^/]+)/(?P<action>enable|disable|delete|test|refresh|checkin|balance)",
+        r"/api/accounts/(?P<uid>[^/]+)/(?P<action>enable|disable|delete|test|refresh|checkin|balance|report)",
         lambda req, uid, action: _account_action(panel, req, uid, action),
     )
 
@@ -385,6 +385,14 @@ def _account_action(panel: Panel, req: Any, uid: str, action: str) -> Response:
             account.credit_at = util.now()
             panel.store.upsert_account(account)
         return json_response({"ok": value is not None, "credits": value})
+    if action == "report":
+        if getattr(account, "enterprise_id", ""):
+            return json_response({"ok": False, "message": "企业号没有活跃体系，上报是零收益"})
+        ok = panel.billing.report(account, account.realm)
+        if ok:
+            account.extra["reported_at"] = util.now()
+            panel.store.upsert_account(account)
+        return json_response({"ok": ok, "message": "已上报" if ok else "上报失败（不影响任何请求）"})
     return error_response(400, f"未知操作 {action}", "bad_action")
 
 
@@ -540,6 +548,7 @@ TUNABLES = (
     ("pool.strategy.cn", "cn 域选号策略", "str", False),
     ("pool.strategy.global", "global 域选号策略", "str", False),
     ("session_sticky.ttl", "会话粘滞有效期", "duration", False),
+    ("session_sticky.page_size", "一个会话在单号上最多跑几轮", "int", False),
     ("schedule.keepalive_minutes", "令牌保活间隔（分钟）", "int", False),
     ("schedule.balance_minutes", "余额刷新间隔（分钟）", "int", False),
     ("schedule.checkin_hour", "每日签到小时（0-23）", "int", False),
@@ -733,7 +742,11 @@ def _logs(panel: Panel, req: Any) -> Response:
 
 def _pool(panel: Panel, req: Any) -> Response:
     panel.require(req)
-    return json_response(panel.pool.stats())
+    stats = panel.pool.stats()
+    # 会话亲和也是池的一部分：命中率低说明粘滞没起作用（TTFT 会很差），
+    # rotations 高说明有人在长会话里不停换页。
+    stats["affinity"] = panel.service.affinity.stats()
+    return json_response(stats)
 
 
 def _scheduler(panel: Panel, req: Any) -> Response:

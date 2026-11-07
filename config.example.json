@@ -83,7 +83,8 @@
   "session_sticky": {
     "enabled": true,
     "ttl": "30m",
-    "gc_interval": "5m"
+    "gc_interval": "5m",
+    "page_size": 3
   },
   "schedule": {
     "token_refresh_enabled": true,
@@ -94,6 +95,12 @@
     "checkin_hour": 9,
     "checkin_realms": [
       "cn"
+    ],
+    "report_enabled": true,
+    "report_hour": 10,
+    "report_realms": [
+      "cn",
+      "global"
     ]
   },
   "models": {

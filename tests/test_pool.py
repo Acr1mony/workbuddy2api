@@ -365,5 +365,57 @@ class StickyKeyTests(unittest.TestCase):
         self.assertEqual(aff.candidates("k"), ["f", "e", "d"])
 
 
+class AffinityPageTests(unittest.TestCase):
+    """分页轮转：一个会话不能永远钉在同一个号上。
+
+    代价是这一页的 prompt cache 作废，所以只在"确实有别的候选"时才轮。
+    """
+
+    def test_rotation_happens_after_page_size_turns(self) -> None:
+        aff = sticky.SessionAffinity(history=3, page_size=3)
+        aff.bind("k", "a")
+        aff.bind("k", "b")
+        aff.bind("k", "c")
+        self.assertEqual(aff.candidates("k")[0], "c")
+
+        aff.bind("k", "c")  # 第 2 轮
+        self.assertEqual(aff.candidates("k")[0], "c")
+        aff.bind("k", "c")  # 第 3 轮 → 跑满一页，让位
+        self.assertEqual(aff.candidates("k")[0], "b", "跑满一页后队头挪到队尾，第二个候选接手")
+        self.assertEqual(sorted(aff.candidates("k")), ["a", "b", "c"], "换人不是丢人")
+        self.assertEqual(aff.rotations, 1)
+
+    def test_single_account_never_rotates(self) -> None:
+        aff = sticky.SessionAffinity(history=3, page_size=1)
+        for _ in range(5):
+            aff.bind("k", "only")
+        self.assertEqual(aff.candidates("k"), ["only"])
+        self.assertEqual(aff.rotations, 0)
+
+    def test_page_size_zero_keeps_old_behaviour(self) -> None:
+        aff = sticky.SessionAffinity(history=3, page_size=0)
+        aff.bind("k", "a")
+        aff.bind("k", "b")
+        for _ in range(10):
+            aff.bind("k", "b")
+        self.assertEqual(aff.candidates("k")[0], "b")
+        self.assertEqual(aff.rotations, 0)
+
+    def test_demote_resets_the_turn_counter(self) -> None:
+        aff = sticky.SessionAffinity(history=3, page_size=2)
+        aff.bind("k", "a")
+        aff.bind("k", "b")
+        aff.bind("k", "b")  # 跑满 → 轮到 a
+        self.assertEqual(aff.candidates("k")[0], "a")
+        aff.demote("k", "a")  # a 失败被摘掉，轮次重新算
+        self.assertEqual(aff.candidates("k"), ["b"])
+
+    def test_stats_expose_paging(self) -> None:
+        aff = sticky.SessionAffinity(page_size=2)
+        aff.bind("k", "a")
+        self.assertEqual(aff.stats()["page_size"], 2)
+        self.assertEqual(aff.stats()["rotations"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

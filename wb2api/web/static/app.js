@@ -382,8 +382,18 @@
         "</div>" +
         '<div class="muted tiny">余额合计 ' + esc(fmtCredit(pool.credits)) +
         (pool.credit_unknown ? " · " + pool.credit_unknown + " 个号余额未知" : "") + "</div>" +
+        affinityLine(pool.affinity) +
       "</div>" +
       (holds.length ? '<div class="muted tiny" style="color:var(--warn)">' + esc(holds.join("；")) + "</div>" : "");
+  }
+
+  // 亲和命中率高 = 同一段对话一直落在同一个号上（TTFT 低、不白烧 prompt）；
+  // rotations 高 = 长会话在按页换号，说明有人真的在连续用。
+  function affinityLine(aff) {
+    if (!aff) return "";
+    var bits = ["会话粘滞 " + fmtNum(aff.sessions) + " 个 · 命中率 " + fmtPct(aff.hit_rate)];
+    if (aff.page_size) bits.push("每 " + aff.page_size + " 轮换号（已换 " + fmtNum(aff.rotations) + " 次）");
+    return '<div class="muted tiny">' + esc(bits.join(" · ")) + "</div>";
   }
 
   function renderScheduler(sched) {
@@ -551,6 +561,7 @@
             '<button class="ghost tiny-btn" data-act="refresh">续期</button>' +
             '<button class="ghost tiny-btn" data-act="balance">查额度</button>' +
             (a.realm === "cn" ? '<button class="ghost tiny-btn" data-act="checkin">签到</button>' : "") +
+            '<button class="ghost tiny-btn" data-act="report" title="活跃上报：点亮连登天数，企业号是零收益">上报</button>' +
             (a.disabled
               ? '<button class="ghost tiny-btn" data-act="enable">启用</button>'
               : '<button class="ghost tiny-btn" data-act="disable">停用</button>') +
@@ -689,7 +700,8 @@
   function rowAction(uid, action, button) {
     var labels = {
       enable: "启用账号", disable: "停用账号", delete: "删除账号",
-      refresh: "续期令牌", checkin: "签到", balance: "查余额", test: "测试账号"
+      refresh: "续期令牌", checkin: "签到", balance: "查余额", test: "测试账号",
+      report: "活跃上报"
     };
     var text = labels[action] || action;
     var account = state.accounts.filter(function (a) { return a.uid === uid; })[0];

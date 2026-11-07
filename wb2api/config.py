@@ -113,9 +113,8 @@ DEFAULTS: Dict[str, Any] = {
         "rate_limit_retries": 2,
         "cross_domain_fallback": False,
     },
-    "session_sticky": {"enabled": True, "ttl": "30m", "gc_interval": "5m"},
-    "schedule": {
-        # 键名必须和 scheduler.py 读的一致，否则配置改了等于没改
+    "session_sticky": {"enabled": True, "ttl": "30m", "gc_interval": "5m", "page_size": 3},
+    "schedule": {        # 键名必须和 scheduler.py 读的一致，否则配置改了等于没改
         "token_refresh_enabled": True,
         "keepalive_minutes": 60,
         "balance_refresh_enabled": True,
@@ -123,6 +122,10 @@ DEFAULTS: Dict[str, Any] = {
         "checkin_enabled": True,
         "checkin_hour": 9,
         "checkin_realms": ["cn"],
+        # 活跃上报：点亮连登天数 / 解锁 first_buddy 任务。企业号会自动跳过（零收益）。
+        "report_enabled": True,
+        "report_hour": 10,
+        "report_realms": ["cn", "global"],
     },
     # 模型目录：hidden 支持 "prefix*" 通配；default 是请求里没带 model 时的兜底
     "models": {"hidden": [], "default": ""},

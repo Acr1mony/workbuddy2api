@@ -386,3 +386,8 @@ Classification helpers to copy: `Classify(status, body)` with `hardMarkers` (ins
   `reasoning_content` 里（思考与回答共享预算）。这不是 bug，但探测脚本别拿 16 当「够用」。
 - 每日签到在 CN 存在：`POST /v2/billing/meter/daily-checkin`，body `{}`；已签到回业务错（文案「今天已签到，请明天再来」），
   不是 HTTP 错误，别当账号故障处理。
+- **活跃上报是「数组 + 必填 userId」**：`POST /v2/report`，body 是 `[{"eventCode":"chat_request_send", ...}]`
+  （**数组**，给对象会 400）。事件里 `userId` 必填——缺了它接口照样回 200 + `code:0`，但连登天数不动，
+  属于「静默丢弃」，只看 HTTP 状态会以为成功。`conversationId` 不需要真实存在（服务端不校验一致性），
+  自己造一个 `wb2api-<毫秒>` 即可；`timestamp`/`presentAt` 用毫秒。企业号上报虽然也 200，但 growth 体系对它
+  一律 403（`growth system is only available for personal users`），**零收益**，所以调用前就跳过，别白打一次请求。

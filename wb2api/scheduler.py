@@ -19,7 +19,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 
 from .log import get_logger
-from . import util
+from . import identity, util
 
 log = get_logger("scheduler")
 
@@ -102,6 +102,8 @@ class Scheduler:
             self.add(Job("balance", self.refresh_balances, interval=balance_minutes * 60))
         if schedule.get("checkin_enabled", True):
             self.add(Job("checkin", self.checkin, at_hour=checkin_hour))
+        if schedule.get("report_enabled", True):
+            self.add(Job("report", self.report_activity, at_hour=int(schedule.get("report_hour", 10) or 10)))
         self.add(Job("housekeeping", self.housekeeping, interval=300))
         self.add(Job("flush", self.flush, interval=60))
 
@@ -241,10 +243,50 @@ class Scheduler:
                 done += 1 if ok else 0
         return f"checkin={done}"
 
+    def report_activity(self) -> str:
+        """活跃上报：每个号每天一条，点亮连登天数 / 解锁 first_buddy。
+
+        企业号显式跳过：上报接口对它照样回 200，但 growth 体系对个人号之外一律
+        403（`growth system is only available for personal users`），也就是零收益。
+        这种"静默无效"最容易被当成"已经在做了"，所以宁可少发一次请求。
+        """
+        from .billing import Billing
+
+        billing = Billing(self.service.client, self.cfg)
+        realms = self._schedule_cfg().get("report_realms") or ["cn", "global"]
+        realms = [identity.normalize_realm(item) for item in realms]
+        done = 0
+        skipped = 0
+        seen = 0
+        for account in self.service.store.list_accounts():
+            if not account.enabled or not account.access_token:
+                continue
+            realm = identity.normalize_realm(account.realm)
+            if realm not in realms:
+                continue
+            if getattr(account, "enterprise_id", "") or getattr(account, "product", "") == "enterprise":
+                skipped += 1
+                continue
+            if seen:
+                _spread()
+            seen += 1
+            ok = billing.report(account, realm)
+            if ok:
+                done += 1
+                extra = getattr(account, "extra", None)
+                if isinstance(extra, dict):
+                    extra["reported_at"] = util.now()
+            if seen % 20 == 0:
+                self.service.store.save_accounts()
+        if done:
+            self.service.store.save_accounts()
+        return f"reported={done} skipped_enterprise={skipped}"
+
     def housekeeping(self) -> str:
         self.service.affinity.gc()
         removed = self.service.ledger.prune() if hasattr(self.service.ledger, "prune") else 0
-        return f"affinity={self.service.affinity.stats().get('size', 0)} pruned={removed}"
+        aff = self.service.affinity.stats()
+        return f"affinity={aff.get('sessions', 0)} rotated={aff.get('rotations', 0)} pruned={removed}"
 
     def flush(self) -> str:
         self.service.pool.flush()

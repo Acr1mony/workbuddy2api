@@ -70,15 +70,21 @@ class SessionAffinity:
         max_entries: int = 5000,
         history: int = 3,
         enabled: bool = True,
+        page_size: int = 0,
     ) -> None:
         self.ttl = float(ttl)
         self.max_entries = int(max_entries)
         self.history = max(1, int(history))
         self.enabled = bool(enabled)
+        # 分页轮转：同一个会话在一个号上跑满 page_size 轮就让位给下一个候选。
+        # 0 = 关闭（老行为：一个超长会话会一直钉在一个号上）。
+        self.page_size = max(0, int(page_size))
         self._map: Dict[str, Tuple[List[str], float]] = {}
+        self._turns: Dict[str, int] = {}
         self._lock = threading.Lock()
         self.hits = 0
         self.misses = 0
+        self.rotations = 0
 
     # -- 查询 ---------------------------------------------------------------
     def candidates(self, key: str) -> List[str]:
@@ -104,15 +110,27 @@ class SessionAffinity:
         now = util.now()
         with self._lock:
             uids, _ = self._map.get(key, ([], 0.0))
+            same_head = bool(uids) and uids[0] == uid
+            turns = (self._turns.get(key, 0) + 1) if same_head else 1
             uids = [u for u in uids if u != uid]
             uids.insert(0, uid)
-            self._map[key] = (uids[: self.history], now + self.ttl)
+            uids = uids[: self.history]
+            if self.page_size and turns >= self.page_size and len(uids) > 1:
+                # 跑满一页：当前号移到队尾，让下一个请求换个人。
+                # 代价是这一页的 prompt cache 作废，换来的是"一个号不会被一段超长
+                # 会话连续占死"——连续几十轮同一账号是上游最容易盯上的形状。
+                uids = uids[1:] + uids[:1]
+                turns = 0
+                self.rotations += 1
+            self._map[key] = (uids, now + self.ttl)
+            self._turns[key] = turns
             if len(self._map) > self.max_entries:
                 self._gc_locked(now)
                 if len(self._map) > self.max_entries:
                     # 还是超：按过期时间清掉最老的一批，别让字典无限长。
                     for stale in sorted(self._map, key=lambda k: self._map[k][1])[: len(self._map) - self.max_entries]:
                         self._map.pop(stale, None)
+                        self._turns.pop(stale, None)
 
     def demote(self, key: str, uid: str) -> None:
         """只摘掉失败的账号，其余保留（它们上游可能还有这个对话的 prefix）。"""
@@ -126,12 +144,15 @@ class SessionAffinity:
             remaining = [u for u in uids if u != uid]
             if remaining:
                 self._map[key] = (remaining, expires)
+                self._turns[key] = 0
             else:
                 self._map.pop(key, None)
+                self._turns.pop(key, None)
 
     def drop(self, key: str) -> None:
         with self._lock:
             self._map.pop(key, None)
+            self._turns.pop(key, None)
 
     # -- 维护 ---------------------------------------------------------------
     def gc(self) -> int:
@@ -142,6 +163,7 @@ class SessionAffinity:
         dead = [key for key, (_uids, expires) in self._map.items() if expires <= now]
         for key in dead:
             self._map.pop(key, None)
+            self._turns.pop(key, None)
         return len(dead)
 
     def stats(self) -> Dict[str, Any]:
@@ -153,9 +175,12 @@ class SessionAffinity:
                 "misses": self.misses,
                 "hit_rate": round(self.hits * 100.0 / total, 1) if total else 0.0,
                 "ttl_seconds": self.ttl,
+                "page_size": self.page_size,
+                "rotations": self.rotations,
             }
 
     def reset_stats(self) -> None:
         with self._lock:
             self.hits = 0
             self.misses = 0
+            self.rotations = 0
