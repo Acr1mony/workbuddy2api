@@ -174,8 +174,12 @@ class GatewayService:
         meta_body["model"] = model
         payload = json.dumps(meta_body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
-        meta = identity.ChatMeta.for_request(body, request.header("X-Trace-Id") or request.header("X-B3-TraceId"))
         stick = make_session_key(request.headers, body)
+        meta = identity.ChatMeta.for_request(
+            body,
+            request.header("X-Trace-Id") or request.header("X-B3-TraceId"),
+            session_hint=stick,
+        )
         tool_names = _tool_names(meta_body)
         completion_id = "chatcmpl-" + identity.new_message_id()[:24]
 
@@ -255,6 +259,7 @@ class GatewayService:
 
             try:
                 self._ensure_ready(account, realm)
+                self._pace(account)
                 url = self.client.base_url(realm) + CHAT_PATH
                 headers = identity.chat_headers(
                     account, self.cfg, meta=meta, client_ip=request.client_ip
@@ -290,6 +295,18 @@ class GatewayService:
         raise self._client_error(error, realm, model) if error is not None else ServiceError(
             "上游持续失败", 503, "upstream_unavailable", "api_error"
         )
+
+    def _pace(self, account: Any) -> None:
+        """同账号两次出站请求之间留最小间隔。
+
+        真人不会 200ms 连发；被 agent 驱动的客户端会。对上游来说"同一机器 id
+        高频调用"是最像脚本的特征，所以宁可让客户端多等一会儿。
+        """
+        delay = self.pool.pace_delay(account)
+        if delay > 0:
+            log.debug("账号 %s 节奏等待 %.0fms", account.label, delay * 1000)
+            time.sleep(min(delay, 5.0))
+        self.pool.note_chat_sent(account)
 
     def _ensure_ready(self, account: Any, realm: str) -> None:
         """出站前确保令牌可用；未过期就不碰上游（刷新令牌是一次性的，别乱用）。"""

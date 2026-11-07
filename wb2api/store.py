@@ -110,6 +110,7 @@ class Account:
     # 只在进程内有效，不落盘（重启后并发槽与 LRU 序号本来就该归零）
     used_seq: int = 0
     in_flight: int = 0
+    last_chat_at: float = 0.0  # 上一次真的打到上游的时间，给请求节奏用
 
     extra: Dict[str, Any] = field(default_factory=dict)
 

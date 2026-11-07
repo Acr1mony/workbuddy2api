@@ -86,6 +86,10 @@ DEFAULTS: Dict[str, Any] = {
         # 11140 连坐：900 秒内 2 个号被风控就整域暂停这么久（0 = 关闭）
         "restriction_hold_seconds": 1800,
         "min_pick_gap_ms": 100,
+        # 同一账号两次出站请求的最小间隔。真人不会 200ms 连发，被 agent 驱动的
+        # 客户端会；对上游来说"同一机器 id 高频调用"是最像脚本的特征。
+        # 0 = 关闭。
+        "min_request_interval": "200ms",
         "prefer_expiring": True,
         "expiring_soon": "168h",
         "model_rates": {},

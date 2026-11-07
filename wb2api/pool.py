@@ -375,6 +375,27 @@ class Pool:
             account.used_seq = self._used_seq
             account.last_used_at = util.now()
 
+    # -- 请求节奏 -----------------------------------------------------------
+    def min_interval(self) -> float:
+        """同一账号两次出站请求之间的最小间隔（秒）。
+
+        真人不会在 200ms 内连发十个请求，但一个被 agent 驱动的客户端会。上游
+        看到的是"同一个机器 id 的高频调用"，这是最容易被判成脚本的特征。
+        默认 200ms 只压掉明显的连发，正常聊天完全感觉不到。
+        """
+        return max(0.0, self._duration(("pool", "min_request_interval"), 0.2))
+
+    def pace_delay(self, account: Account, now: Optional[float] = None) -> float:
+        """距离这个账号"可以再发一条"还差多少秒（0 表示现在就能发）。"""
+        interval = self.min_interval()
+        if interval <= 0 or not account.last_chat_at:
+            return 0.0
+        now = util.now() if now is None else now
+        return max(0.0, interval - (now - account.last_chat_at))
+
+    def note_chat_sent(self, account: Account) -> None:
+        account.last_chat_at = util.now()
+
     # -- 记账：成功 ---------------------------------------------------------
     def note_success(self, account: Account, *, model: str = "", session_key: str = "") -> None:
         """一次真正跑通的请求，是"账号确实解禁了"的唯一证据。"""

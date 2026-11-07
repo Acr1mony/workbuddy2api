@@ -216,6 +216,33 @@ class ModelBlockTests(PoolTestBase):
         self.assertEqual(self.pool.model_blocked("cn", "glm-4.6"), {})
 
 
+class PaceTests(PoolTestBase):
+    """"同一账号连发"是最像脚本的特征，节奏必须可测。"""
+
+    def test_default_interval_is_200ms(self) -> None:
+        self.assertAlmostEqual(self.pool.min_interval(), 0.2, places=3)
+
+    def test_delay_counts_down_after_a_request(self) -> None:
+        a = self.add("a")
+        self.assertEqual(self.pool.pace_delay(a), 0.0, "没发过请求就不用等")
+        self.pool.note_chat_sent(a)
+        first = self.pool.pace_delay(a)
+        self.assertGreater(first, 0.0)
+        self.assertLessEqual(first, 0.2)
+        time.sleep(0.05)
+        self.assertLess(self.pool.pace_delay(a), first, "时间过去之后等待应该变短")
+
+    def test_zero_disables(self) -> None:
+        self.cfg.set("pool.min_request_interval", 0)
+        a = self.add("a")
+        self.pool.note_chat_sent(a)
+        self.assertEqual(self.pool.pace_delay(a), 0.0)
+
+    def test_interval_accepts_human_duration(self) -> None:
+        self.cfg.set("pool.min_request_interval", "1.5s")
+        self.assertAlmostEqual(self.pool.min_interval(), 1.5, places=3)
+
+
 class SelectionTests(PoolTestBase):
     def test_credit_floor_blocks_only_paid_models(self) -> None:
         self.cfg.set("pool.credit_floor", 100)

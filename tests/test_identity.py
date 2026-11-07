@@ -148,6 +148,25 @@ class TestConversationId(unittest.TestCase):
         self.assertEqual(first.conversation_request_id, second.conversation_request_id)
         self.assertNotEqual(first.message_id, second.message_id, "每次请求都是新消息")
 
+    def test_conversation_id_is_stable_for_a_session(self):
+        """客户端不带 conversation_id 时，同一段对话必须拿到同一个会话 id。
+
+        每轮随机等于告诉上游"这个客户端几分钟里开了几十个会话"。
+        """
+        body = body_with({"role": "user", "content": "x"})
+        first = identity.ChatMeta.for_request(body, session_hint="conv-key-1")
+        second = identity.ChatMeta.for_request(body, session_hint="conv-key-1")
+        self.assertEqual(first.conversation_id, second.conversation_id)
+        self.assertEqual(len(first.conversation_id), 32)
+        other = identity.ChatMeta.for_request(body, session_hint="conv-key-2")
+        self.assertNotEqual(first.conversation_id, other.conversation_id)
+
+    def test_body_conversation_id_wins_over_session_hint(self):
+        body = body_with({"role": "user", "content": "x"})
+        body["conversation_id"] = "client-conv"
+        meta = identity.ChatMeta.for_request(body, session_hint="ignored")
+        self.assertEqual(meta.conversation_id, "client-conv")
+
 
 class TestChatHeaders(unittest.TestCase):
     def test_required_headers_cn(self):

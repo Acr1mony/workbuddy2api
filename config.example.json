@@ -64,6 +64,7 @@
     "degrade_cooldown_max": "2h",
     "restriction_hold_seconds": 1800,
     "min_pick_gap_ms": 100,
+    "min_request_interval": "200ms",
     "prefer_expiring": true,
     "expiring_soon": "168h",
     "model_rates": {},

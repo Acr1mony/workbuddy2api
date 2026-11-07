@@ -232,10 +232,21 @@ class ChatMeta:
         self.message_id = message_id or new_message_id()
 
     @classmethod
-    def for_request(cls, body: Dict[str, Any], inbound_trace: str = "") -> "ChatMeta":
+    def for_request(
+        cls, body: Dict[str, Any], inbound_trace: str = "", session_hint: str = ""
+    ) -> "ChatMeta":
+        """按请求体生成会话头族。
+
+        ``X-Conversation-ID`` 必须**跨轮稳定**：客户端不带 conversation_id 时，
+        官方客户端也不会每一轮换一个新会话。用会话键派生（同一段对话恒定），
+        而不是每轮随机——否则上游看到的是"一个客户端在几分钟里开了几十个会话"。
+        """
         key = turn_key(body)
+        conversation = conversation_id_from_body(body)
+        if not conversation and session_hint:
+            conversation = hashlib.sha256(f"wb2a:conv:{session_hint}".encode("utf-8")).hexdigest()[:32]
         return cls(
-            conversation_id=conversation_id_from_body(body),
+            conversation_id=conversation,
             conversation_request_id=request_id_for_key(key) if key else "",
             trace_id=inbound_trace,
         )
