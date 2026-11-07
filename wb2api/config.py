@@ -101,6 +101,10 @@ DEFAULTS: Dict[str, Any] = {
         # 内容审核 / 边缘 WAF 拦截（403 但不是 11140）时的短避让。它跟账号健康无关：
         # 换号、刷令牌都没用，反而是"换号继续打"最容易连坐。
         "waf_cooldown": "60s",
+        # 配额耗尽（402 / 6004）之后的验证探针：解禁点 + grace 打一发 16 token 的
+        # 最小请求确认额度回来了；没恢复就退到 retry 之后再探。避免让真实流量去撞。
+        "quota_probe_grace": "60s",
+        "quota_probe_retry": "6h",
         "prefer_expiring": True,
         "expiring_soon": "168h",
         "model_rates": {},
@@ -126,6 +130,9 @@ DEFAULTS: Dict[str, Any] = {
         "report_enabled": True,
         "report_hour": 10,
         "report_realms": ["cn", "global"],
+        # 配额耗尽后到期探针：到解禁点主动打一发 16 token 的最小请求确认额度回来了
+        "quota_probe_enabled": True,
+        "quota_probe_minutes": 10,
     },
     # 模型目录：hidden 支持 "prefix*" 通配；default 是请求里没带 model 时的兜底
     "models": {"hidden": [], "default": ""},

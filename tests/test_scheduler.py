@@ -38,6 +38,7 @@ class FakeAccount:
         self.enterprise_id = ""
         self.product = ""
         self.extra = {}
+        self.balance_until = 0.0
 
     @property
     def enabled(self):
@@ -60,9 +61,13 @@ class FakePool:
         self.dead = []
         self.revived = []
         self.flushed = 0
+        self.succeeded = []
 
     def note_auth_dead(self, account, message):
         self.dead.append(account.uid)
+
+    def note_success(self, account, model="", session_key=""):
+        self.succeeded.append(account.uid)
 
     def revive(self, account, balance_changed=False):
         self.revived.append((account.uid, balance_changed))
@@ -182,7 +187,8 @@ class TestJobDue(unittest.TestCase):
 class TestRegistration(unittest.TestCase):
     def test_all_enabled_by_default(self):
         scheduler = Scheduler(FakeService([]), FakeCfg())
-        self.assertEqual(set(scheduler.jobs), {"keepalive", "balance", "checkin", "report", "housekeeping", "flush"})
+        self.assertEqual(set(scheduler.jobs),
+                         {"keepalive", "balance", "checkin", "report", "quota_probe", "housekeeping", "flush"})
 
     def test_disabled_jobs_are_not_registered(self):
         cfg = FakeCfg({"schedule": {
@@ -190,6 +196,7 @@ class TestRegistration(unittest.TestCase):
             "balance_refresh_enabled": False,
             "checkin_enabled": False,
             "report_enabled": False,
+            "quota_probe_enabled": False,
         }})
         scheduler = Scheduler(FakeService([]), cfg)
         self.assertEqual(set(scheduler.jobs), {"housekeeping", "flush"})
@@ -324,6 +331,81 @@ class TestCheckin(unittest.TestCase):
         scheduler = Scheduler(service, FakeCfg())
         scheduler.checkin()
         self.assertEqual([r for r in service.store.realm_queries if r], ["cn"])
+
+
+class TestQuotaProbe(unittest.TestCase):
+    """配额到期探针：花 16 个 token 换掉"让真实流量去撞墙"。"""
+
+    def setUp(self):
+        from unittest import mock
+
+        patcher = mock.patch("wb2api.scheduler._spread", lambda: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.probes = []
+        self.ok = True
+
+    def _patch_probe(self, scheduler_module=None):
+        from unittest import mock
+        import wb2api.probe as probe_module
+
+        def fake(service, account, model=""):
+            self.probes.append(account.uid)
+            return self.ok, {"model": "m", "error": "" if self.ok else "402"}
+
+        patcher = mock.patch.object(probe_module, "probe_account", fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_no_balance_window_does_nothing(self):
+        self._patch_probe()
+        service = FakeService([FakeAccount()])
+        result = Scheduler(service, FakeCfg()).quota_probe()
+        self.assertIn("probed=0", result)
+        self.assertEqual(self.probes, [])
+
+    def test_first_sighting_only_schedules_the_probe(self):
+        self._patch_probe()
+        account = FakeAccount()
+        account.balance_until = 1000.0
+        service = FakeService([account])
+        result = Scheduler(service, FakeCfg()).quota_probe()
+        self.assertIn("probed=0", result, "第一次看到只登记时间，不该立刻探")
+        self.assertEqual(self.probes, [])
+        self.assertGreater(account.extra.get("quota_probe_at", 0), 1000.0,
+                           "约定在解禁点之后 grace 秒才探")
+
+    def test_due_probe_recovering_clears_the_window(self):
+        self._patch_probe()
+        account = FakeAccount()
+        account.balance_until = time.time() + 60
+        account.extra["quota_probe_at"] = time.time() - 1
+        service = FakeService([account])
+        result = Scheduler(service, FakeCfg()).quota_probe()
+        self.assertIn("probed=1", result)
+        self.assertIn("recovered=1", result)
+        self.assertEqual(self.probes, ["u1"])
+        self.assertIn("u1", service.pool.succeeded, "探通了就按成功记账（解禁的唯一证据）")
+        self.assertNotIn("quota_probe_at", account.extra)
+
+    def test_failed_probe_backs_off(self):
+        self.ok = False
+        self._patch_probe()
+        account = FakeAccount()
+        account.balance_until = time.time() + 60
+        account.extra["quota_probe_at"] = time.time() - 1
+        service = FakeService([account])
+        result = Scheduler(service, FakeCfg()).quota_probe()
+        self.assertIn("probed=1", result)
+        self.assertIn("recovered=0", result)
+        self.assertEqual(service.pool.succeeded, [], "没恢复就不能记成功")
+        self.assertGreater(account.extra["quota_probe_at"], time.time() + 3600,
+                           "没恢复就退到几小时后再探，别在重置点附近连打")
+
+    def test_probe_job_is_registered(self):
+        scheduler = Scheduler(FakeService([]), FakeCfg())
+        self.assertIn("quota_probe", scheduler.jobs)
+        self.assertEqual(scheduler.jobs["quota_probe"].interval, 600)
 
 
 if __name__ == "__main__":

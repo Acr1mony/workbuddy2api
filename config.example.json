@@ -71,6 +71,8 @@
     "min_pick_gap_ms": 100,
     "min_request_interval": "200ms",
     "waf_cooldown": "60s",
+    "quota_probe_grace": "60s",
+    "quota_probe_retry": "6h",
     "prefer_expiring": true,
     "expiring_soon": "168h",
     "model_rates": {},
@@ -101,7 +103,9 @@
     "report_realms": [
       "cn",
       "global"
-    ]
+    ],
+    "quota_probe_enabled": true,
+    "quota_probe_minutes": 10
   },
   "models": {
     "hidden": [],

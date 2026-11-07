@@ -90,6 +90,18 @@ class Scheduler:
         value = self.cfg.get("schedule") if self.cfg else {}
         return value if isinstance(value, dict) else {}
 
+    def _duration(self, path: tuple, default: float) -> float:
+        """配置里的时长写成 ``"60s"`` 这种人话，读的时候换成秒。"""
+        raw = self.cfg.get(".".join(path), None) if self.cfg else None
+        if raw is None or raw == "":
+            return default
+        if isinstance(raw, (int, float)):
+            return float(raw)
+        try:
+            return float(util.parse_duration(str(raw)))
+        except (TypeError, ValueError):
+            return default
+
     def _register(self) -> None:
         schedule = self._schedule_cfg()
         interval_minutes = int(schedule.get("keepalive_minutes", 20) or 20)
@@ -104,6 +116,9 @@ class Scheduler:
             self.add(Job("checkin", self.checkin, at_hour=checkin_hour))
         if schedule.get("report_enabled", True):
             self.add(Job("report", self.report_activity, at_hour=int(schedule.get("report_hour", 10) or 10)))
+        if schedule.get("quota_probe_enabled", True):
+            self.add(Job("quota_probe", self.quota_probe,
+                         interval=int(schedule.get("quota_probe_minutes", 10) or 10) * 60))
         self.add(Job("housekeeping", self.housekeeping, interval=300))
         self.add(Job("flush", self.flush, interval=60))
 
@@ -281,6 +296,54 @@ class Scheduler:
         if done:
             self.service.store.save_accounts()
         return f"reported={done} skipped_enterprise={skipped}"
+
+    def quota_probe(self) -> str:
+        """配额耗尽后的验证探针：到期后主动打一发最小请求，而不是等真实流量去撞。
+
+        402 带重置时间时账号会被挂到那一刻（甚至是次日 04:00）。到点之后"额度真的回来了"
+        没有任何本地证据——真实流量的第一次尝试会拿一个很可能失败的请求去试，代价是
+        用户看到一次失败、账号多记一次失败计数。这里花 16 个 token 先探一次，成功就
+        按"真跑通了"清窗口（note_success 是解禁的唯一证据）。
+        """
+        from .probe import probe_account
+
+        now = time.time()
+        grace = self._duration(("pool", "quota_probe_grace"), 60.0)
+        retry = self._duration(("pool", "quota_probe_retry"), 6 * 3600)
+        probed = 0
+        recovered = 0
+        seen = 0
+        for account in self.service.store.list_accounts():
+            if not account.enabled or not account.access_token:
+                continue
+            until = float(getattr(account, "balance_until", 0) or 0)
+            if not until:
+                account.extra.pop("quota_probe_at", None)
+                continue
+            due = float(account.extra.get("quota_probe_at", 0) or 0)
+            if not due:
+                # 第一次看到这个号挂起：约定在解禁之后 grace 秒探一次。
+                account.extra["quota_probe_at"] = until + grace
+                continue
+            if due > now:
+                continue
+            if seen:
+                _spread()
+            seen += 1
+            probed += 1
+            ok, detail = probe_account(self.service, account)
+            if ok:
+                self.service.pool.note_success(account)
+                account.extra.pop("quota_probe_at", None)
+                recovered += 1
+                log.info("配额已恢复 %s（%s）", account.label, detail.get("model", ""))
+            else:
+                # 还没恢复：退到 6 小时后再探，别在重置点附近连打。
+                account.extra["quota_probe_at"] = now + retry
+                log.info("配额仍未恢复 %s: %s", account.label, str(detail.get("error", ""))[:120])
+        if seen:
+            self.service.store.save_accounts()
+        return f"probed={probed} recovered={recovered}"
 
     def housekeeping(self) -> str:
         self.service.affinity.gc()
