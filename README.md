@@ -71,6 +71,16 @@ wb2a serve          # 或 workbuddy2api serve
 - 安装后 `wb2a` 与 `workbuddy2api` 两个命令等价；数据目录默认取当前工作目录下的 `data/`，可用 `WB_DATA_DIR` 改。
 - 不想装也行：`python -m wb2api serve` 与本机源码目录完全等价，功能上没有区别。
 
+### 在终端里加账号（服务器上没有浏览器时）
+
+```powershell
+wb2a login                  # 打印授权链接，等你在任意设备上点完
+wb2a login --realm global   # 另一个域
+wb2a login --no-wait --json # 只要链接（脚本/远程会话用）
+```
+
+网关正在跑时，`login` 会把这次登录**交给面板进程**去完成——同一份 `accounts.json` 只能有一个写者，CLI 自己落盘会被面板下一次保存覆盖。面板没跑时它才自己起 auth 流程，令牌照样写回同一个数据目录。
+
 ---
 
 ## 它具体做了什么

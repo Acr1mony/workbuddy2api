@@ -64,6 +64,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     sub.add_parser("doctor", help="检查配置与数据目录")
     sub.add_parser("version", help="打印版本")
 
+    login = sub.add_parser("login", help="加一个账号（打印授权链接，等浏览器完成）")
+    login.add_argument("--realm", default="cn", choices=("cn", "global"), help="哪个域（默认 cn）")
+    login.add_argument("--proxy", default="", help="走代理发起与轮询（http://host:port）")
+    login.add_argument("--timeout", type=float, default=600.0, help="等待秒数（默认 600）")
+    login.add_argument("--no-wait", action="store_true", help="只打印链接就退出")
+    login.add_argument("--json", action="store_true", help="输出 JSON（给脚本用）")
+
     accounts = sub.add_parser("accounts", help="账号管理（不需要面板）")
     accounts.add_argument(
         "action",
@@ -91,6 +98,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if command == "doctor":
         return _doctor(cfg)
+    if command == "login":
+        return _login(cfg, args)
     if command == "accounts":
         return _accounts(cfg, args)
     return _serve(cfg, args)
@@ -266,6 +275,130 @@ def _accounts(cfg: Config, args: argparse.Namespace) -> int:
                 print(f"{account.label} → {credits:.2f}")
         return 0
     return 1
+
+
+def _panel_base(cfg: Config) -> str:
+    host, port = cfg.listen_address()
+    if host in ("", "0.0.0.0", "::"):
+        host = "127.0.0.1"
+    return "http://%s:%d" % (host, port)
+
+
+def _panel_call(base: str, method: str, path: str, body: Any = None,
+                token: str = "", timeout: float = 15.0) -> Any:
+    """打本机面板 API；连不上/非 JSON 都返回 None（调用方据此回落）。"""
+    import urllib.error
+    import urllib.request
+
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    request = urllib.request.Request(base + path, data=data, method=method)
+    if data is not None:
+        request.add_header("Content-Type", "application/json")
+    if token:
+        request.add_header("X-Panel-Token", token)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:  # 面板在跑但拒绝了（密码不对等）
+        try:
+            return json.loads(exc.read().decode("utf-8", "replace"))
+        except ValueError:
+            return {"error": {"message": "HTTP %s" % exc.code}}
+    except Exception:
+        return None
+
+
+def _login_report(args: Any, realm: str, state: str, url: str) -> None:
+    if args.json:
+        print(json.dumps({"state": state, "url": url, "realm": realm}, ensure_ascii=False))
+        return
+    print(f"域  ：{realm}")
+    print(f"链接：{url}")
+    print(f"state：{state}（10 分钟内有效）")
+
+
+def _login_wait(poll: Any, args: Any, timeout_note: str) -> int:
+    """共用轮询循环；`poll()` 返回 {status, message, account}。"""
+    deadline = time.time() + float(args.timeout)
+    last = ""
+    try:
+        while time.time() < deadline:
+            payload = dict(poll() or {})
+            status = str(payload.get("status") or "pending")
+            message = str(payload.get("message") or "")
+            if message and message != last and not args.json:
+                print(f"… {message}")
+                last = message
+            if status == "ok":
+                account = payload.get("account") or {}
+                nick = account.get("nickname") or account.get("uid") or ""
+                credit = account.get("credit")
+                print("登录成功：%s%s" % (nick, "（余额 %s）" % credit if credit is not None else ""))
+                return 0
+            if status == "error":
+                print(f"登录失败：{message or '未知原因'}")
+                return 1
+            time.sleep(2.0)
+    except KeyboardInterrupt:
+        print("已取消（浏览器里再授权也不会落库）")
+        return 130
+    print(f"等待超时（{timeout_note}）：链接过期后需要重新执行")
+    return 1
+
+
+def _login(cfg: Config, args: Any) -> int:
+    """命令行里加账号：打印授权链接，然后等浏览器完成登录。
+
+    优先走正在运行的面板（同一份 `accounts.json` 只能有一个写者：CLI 直接落盘、
+    面板进程随后一保存就会把刚加的号覆盖掉）。面板没在跑时才自己起 auth 流程。
+    """
+    from . import util
+
+    realm = args.realm or "cn"
+    base = _panel_base(cfg)
+    status = _panel_call(base, "GET", "/panel/status", timeout=3.0)
+    if status and status.get("enabled"):
+        token = ""
+        if status.get("password_required"):
+            login = _panel_call(base, "POST", "/panel/login",
+                                {"password": str(cfg.get("panel.password") or "")})
+            token = str((login or {}).get("token") or "")
+            if not token:
+                message = ((login or {}).get("error") or {}).get("message") if login else "面板无响应"
+                print(f"面板登录失败：{message}")
+                print("（改 config.json 里的 panel.password，或用 `wb2a login` 前先停掉网关）")
+                return 1
+        started = _panel_call(base, "POST", "/api/accounts/login/start", {"realm": realm}, token=token)
+        if not started or not started.get("url"):
+            message = ((started or {}).get("error") or {}).get("message") or "面板没有返回授权链接"
+            print(f"发起登录失败：{message}")
+            return 1
+        _login_report(args, realm, str(started.get("state") or ""), str(started.get("url") or ""))
+        if args.no_wait:
+            return 0
+        state = str(started.get("state") or "")
+        return _login_wait(
+            lambda: _panel_call(base, "GET",
+                                "/api/accounts/login/poll?state=" + util.quote(state), token=token),
+            args, util.format_duration(float(args.timeout)),
+        )
+
+    service = _service(cfg)
+    try:
+        session = service.auth.start_login(realm, proxy=args.proxy or "")
+    except Exception as exc:  # 上游不可达 / 代理坏
+        print(f"发起登录失败：{exc}")
+        return 1
+    url = getattr(session, "url", "") or getattr(session, "auth_url", "")
+    state = getattr(session, "state", "")
+    _login_report(args, realm, state, url)
+    if args.no_wait:
+        return 0
+    try:
+        return _login_wait(lambda: service.auth.poll_login(state), args,
+                           util.format_duration(float(args.timeout)))
+    finally:
+        service.close()
 
 
 def _doctor(cfg: Config) -> int:
