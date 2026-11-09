@@ -419,3 +419,50 @@ class AffinityPageTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SerializeTests(PoolTestBase):
+    """同号串行：同一账号同时只跑一条，第二条要么等、要么换号。
+
+    "一个号同时跑两条请求"在上游看来就是这台机器在并发刷——比换号更像脚本，
+    所以这条约束宁可让客户端多等一会儿。
+    """
+
+    def test_second_select_waits_then_fails_when_wait_expires(self) -> None:
+        self.add("a")
+        self.cfg.set("pool.serialize_wait", "0.2s")
+        first = self.pool.select("cn", "deepseek-v3")
+        self.assertIsNotNone(first)
+        started = util.now()
+        second = self.pool.select("cn", "deepseek-v3")
+        waited = util.now() - started
+        self.assertIsNone(second)
+        self.assertGreaterEqual(waited, 0.15)  # 真的等过，不是立刻回绝
+        self.pool.release(first)
+        self.assertIsNotNone(self.pool.select("cn", "deepseek-v3"))
+
+    def test_busy_account_is_skipped_for_another_one(self) -> None:
+        self.add("a")
+        self.add("b")
+        self.cfg.set("pool.serialize_wait", "0.3s")
+        first = self.pool.select("cn", "deepseek-v3")
+        second = self.pool.select("cn", "deepseek-v3")
+        self.assertIsNotNone(second)
+        self.assertNotEqual(first.key, second.key)
+
+    def test_disabled_serialize_allows_concurrency(self) -> None:
+        self.add("a")
+        self.cfg.set("pool.serialize_account", False)
+        first = self.pool.select("cn", "deepseek-v3")
+        second = self.pool.select("cn", "deepseek-v3")
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertEqual(self.pool.busy_accounts(), 0)
+
+    def test_release_returns_the_lock(self) -> None:
+        self.add("a")
+        self.cfg.set("pool.serialize_wait", "0.2s")
+        account = self.pool.select("cn", "deepseek-v3")
+        self.assertEqual(self.pool.busy_accounts(), 1)
+        self.pool.release(account)
+        self.assertEqual(self.pool.busy_accounts(), 0)

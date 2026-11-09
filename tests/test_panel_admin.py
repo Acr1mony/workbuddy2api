@@ -488,3 +488,89 @@ class TestMetricsAndKeyRate(ServerCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class TestObservability(ServerCase):
+    """/api/requests、/api/dumps、/api/proxies：面板要能看见"刚才那条请求怎么了"。"""
+
+    def _get(self, path, token):
+        return self.request("GET", path, headers={"X-Panel-Token": token})
+
+    def _post(self, path, body, token):
+        return self.request("POST", path, body, headers={"X-Panel-Token": token})
+
+    def test_request_log_endpoint_shapes(self):
+        self.service.reqlog.record({
+            "at": 1700000000, "model": "deepseek-v3", "account": "u1", "status": 200,
+            "outcome": "completed", "path": "/v1/chat/completions", "request_id": "req_1",
+            "prompt_tokens": 3, "completion_tokens": 4, "credit": 0.01,
+        })
+        token = self.panel_token()
+        status, _headers, data = self._get("/api/requests", token)
+        self.assertEqual(status, 200)
+        payload = self.json_of(data)
+        self.assertEqual(payload["items"][0]["request_id"], "req_1")
+        self.assertIn("buffered", payload["stats"])
+
+    def test_request_log_filters(self):
+        for request_id, code in (("req_a", 200), ("req_b", 503)):
+            self.service.reqlog.record({
+                "at": 1700000000, "model": "glm-5.3", "account": "u1", "status": code,
+                "outcome": "completed" if code == 200 else "failed", "request_id": request_id,
+            })
+        token = self.panel_token()
+        status, _headers, data = self._get("/api/requests?status=5xx", token)
+        self.assertEqual(status, 200)
+        self.assertEqual([row["request_id"] for row in self.json_of(data)["items"]], ["req_b"])
+
+    def test_dump_endpoint_and_unknown_id(self):
+        self.service.diag.dump(request_id="req_x", model="deepseek-v3", status=400, code="11101",
+                               body='{"code":11101}', request_headers={"Authorization": "Bearer t"})
+        token = self.panel_token()
+        status, _headers, data = self._get("/api/dumps", token)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.json_of(data)["items"][0]["code"], "11101")
+
+        status, _headers, data = self._get("/api/dumps/req_x", token)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.json_of(data)["request_headers"]["authorization"], "**redacted**")
+
+        status, _headers, data = self._get("/api/dumps/nope", token)
+        self.assertEqual(status, 404)
+        self.assertEqual(self.json_of(data)["error"]["code"], "unknown_dump")
+
+    def test_proxies_crud_roundtrip(self):
+        token = self.panel_token()
+        status, _headers, data = self._post(
+            "/api/proxies", {"action": "add", "url": "http://10.0.0.9:3128", "realm": "cn", "weight": 2}, token)
+        self.assertEqual(status, 200)
+        payload = self.json_of(data)
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["entries"][0]["realm"], "cn")
+
+        status, _headers, data = self._get("/api/proxies", token)
+        self.assertEqual(self.json_of(data)["total"], 1)
+
+        status, _headers, data = self._post(
+            "/api/proxies", {"action": "update", "url": "http://10.0.0.9:3128", "enabled": False}, token)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.json_of(data)["ready"], 0)
+
+        status, _headers, data = self._post(
+            "/api/proxies", {"action": "remove", "url": "http://10.0.0.9:3128"}, token)
+        self.assertEqual(self.json_of(data)["total"], 0)
+
+    def test_proxies_reject_duplicate_and_unknown(self):
+        token = self.panel_token()
+        self._post("/api/proxies", {"action": "add", "url": "http://a:1"}, token)
+        status, _headers, data = self._post("/api/proxies", {"action": "add", "url": "http://a:1"}, token)
+        self.assertEqual(status, 400)
+        self.assertEqual(self.json_of(data)["error"]["code"], "duplicate_proxy")
+        status, _headers, data = self._post("/api/proxies", {"action": "remove", "url": "http://nope:1"}, token)
+        self.assertEqual(status, 404)
+
+    def test_observability_requires_login(self):
+        for path in ("/api/requests", "/api/dumps", "/api/proxies"):
+            status, _headers, _data = self.request("GET", path)
+            self.assertEqual(status, 401, path)

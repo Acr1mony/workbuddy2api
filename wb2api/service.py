@@ -22,11 +22,14 @@ from . import identity, sse, util
 from .adapters import chat as chat_adapter
 from .billing import Billing
 from .credits import CreditBook, summarize as summarize_credits
+from .diagnostics import Diagnostics
 from .egress import Egress
 from .log import get_logger
 from .markup import MARKUP_HINT
 from .models import ModelCatalog
 from .pool import Pool
+from .proxies import ProxyPool
+from .reqlog import RequestLog
 from .store import ApiKey
 from .sticky import SessionAffinity, session_key as make_session_key
 from .upstream import UpstreamClient, UpstreamError, is_restricted
@@ -138,6 +141,25 @@ class GatewayService:
             retention_days=int(cfg.get("credits.retention_days", 30)) if cfg else 30,
         )
         self.max_payload_bytes = int(float(cfg.get("server.max_payload_mb", 16)) * 1024 * 1024) if cfg else 16 * 1024 * 1024
+        data_dir = store.data_dir if hasattr(store, "data_dir") else "./data"
+        # 出口池：账号自己配了 proxy 的永远优先，其它请求从池里挑。
+        self.proxies = ProxyPool(cfg)
+        # 失败报文留存（脱敏、限大小、按天封顶）：排障时"上游原话"比 code 有用得多。
+        self.diag = Diagnostics(
+            data_dir,
+            enabled=bool(cfg.get("diagnostics.enabled", True)) if cfg else True,
+            max_body_bytes=int(cfg.get("diagnostics.max_body_bytes", 8192)) if cfg else 8192,
+            retention_days=int(cfg.get("diagnostics.retention_days", 3)) if cfg else 3,
+            daily_max=int(cfg.get("diagnostics.daily_max", 200)) if cfg else 200,
+        )
+        # 逐请求明细：一条请求一行，面板能按状态/模型/账号/关键字翻。
+        self.reqlog = RequestLog(
+            data_dir,
+            enabled=bool(cfg.get("requests.enabled", True)) if cfg else True,
+            retention_days=int(cfg.get("requests.retention_days", 3)) if cfg else 3,
+            capacity=int(cfg.get("requests.capacity", 500)) if cfg else 500,
+        )
+        self.reqlog.load()
         self.scheduler = None  # 由 app 装配时注入
         self._lock = threading.RLock()
         # 每 key 的在飞计数：一个被 API key 卖出去的额度，不该被一个客户端占满。
@@ -282,6 +304,11 @@ class GatewayService:
         request_id = "req_" + util.rand_hex(8)
         request.state["request_id"] = request_id
         alias = str(request.state.get("model_alias") or "")
+        req_extra = {
+            "path": "/v1/chat/completions",
+            "client_ip": str(getattr(request, "client_ip", "") or ""),
+            "ua": str(request.header("User-Agent", ""))[:120],
+        }
 
         key_slot = self._acquire_key(key)
         try:
@@ -311,6 +338,7 @@ class GatewayService:
                     attempts=attempts,
                     alias=alias,
                     key_slot=key_slot,
+                    extra=req_extra,
                 ),
                 headers=extra_headers,
             )
@@ -326,6 +354,7 @@ class GatewayService:
                     started=started, model=model, realm=realm, account=account, key=key,
                     stream=False, outcome="completed", usage=usage, status=200, ttft=0,
                     request_id=request_id, attempts=attempts, alias=alias,
+                    extra=req_extra,
                 )
             except Exception:  # 记账失败不该让一个已经成功的请求变成 500
                 log.exception("记账失败（%s）", model)
@@ -383,6 +412,11 @@ class GatewayService:
         request.state["request_id"] = request_id
         alias = str(request.state.get("model_alias") or "")
         input_tokens = msg_adapter.count_tokens(body)
+        req_extra = {
+            "path": "/v1/messages",
+            "client_ip": str(getattr(request, "client_ip", "") or ""),
+            "ua": str(request.header("User-Agent", ""))[:120],
+        }
 
         key_slot = self._acquire_key(key)
         try:
@@ -405,7 +439,7 @@ class GatewayService:
                 self._relay_messages(
                     account=account, response=response, stream=stream, model=model, realm=realm,
                     key=key, started=started, stick=stick, request_id=request_id,
-                    attempts=attempts, alias=alias, key_slot=key_slot,
+                    attempts=attempts, alias=alias, key_slot=key_slot, extra=req_extra,
                 ),
                 headers=extra_headers,
             )
@@ -419,6 +453,7 @@ class GatewayService:
                     started=started, model=model, realm=realm, account=account, key=key,
                     stream=False, outcome="completed", usage=usage, status=200, ttft=0,
                     request_id=request_id, attempts=attempts, alias=alias, kind="messages",
+                    extra=req_extra,
                 )
             except Exception:
                 log.exception("记账失败（%s）", model)
@@ -444,6 +479,7 @@ class GatewayService:
         attempts: int = 1,
         alias: str = "",
         key_slot: str = "",
+        extra: Optional[Dict[str, Any]] = None,
     ) -> Iterator[bytes]:
         """把上游的 OpenAI 流重排成 Anthropic 事件流。"""
         from .adapters import messages as msg_adapter
@@ -514,7 +550,7 @@ class GatewayService:
                     stream=True, outcome=outcome, usage=usage,
                     status=200 if outcome == "completed" else 499, ttft=ttft,
                     error=error_text, request_id=request_id, attempts=attempts,
-                    alias=alias, kind="messages",
+                    alias=alias, kind="messages", extra=extra,
                 )
             except Exception:
                 log.exception("记账失败（%s）", model)
@@ -586,6 +622,10 @@ class GatewayService:
                     account, self.cfg, meta=meta, client_ip=request.client_ip
                 )
                 proxy = str(getattr(account, "proxy", "") or "")
+                if not proxy and self.proxies.enabled():
+                    # 账号没单独配出口时从池里挑一个：出口 IP 跟着请求一起变，
+                    # 比"所有账号都从家里那条宽带出去"难关联得多。
+                    proxy = self.proxies.pick(realm)
                 # 同一出口还在退避就先等一等：一口气重试只会让上游更确信这是脚本。
                 # 但这时账号槽位已经占了，睡太久会把整域的并发额度（默认 3）锁死，
                 # 所以持槽期间最多等 2 秒，剩下的交给下一轮退避。
@@ -595,9 +635,12 @@ class GatewayService:
                 response = self.client.post(url, headers, raw_body=payload, proxy=proxy)
             except UpstreamError as err:
                 last_error = err
+                self._dump_failure(err, account=account, realm=realm, model=model, url=url, meta=meta, request=request)
                 if err.kind in ("timeout", "transient") or err.status >= 500:
                     # 链路问题记在出口上：记到账号头上会让一次网络抖动把整池打断
                     self.egress.note_failure(Egress.key_for(url, proxy), err.message or "")
+                    if proxy:
+                        self.proxies.note_failure(proxy, err.message or "")
                 if err.kind == "waf" and not neutralized and self.cfg.get("prompt.content_retry", True):
                     # 内容审核打回时换号没用（同一份内容在哪个号上都会被拦），
                     # 但把用户自带的系统提示词换成中性最小版常常能过。只试一次，
@@ -631,12 +674,63 @@ class GatewayService:
                 log.exception("请求 %s 失败", model)
                 raise ServiceError(f"网关内部错误: {exc}", 500, "internal_error", "api_error") from exc
             self.egress.note_success(Egress.key_for(url, proxy))
+            if proxy:
+                self.proxies.note_success(proxy)
             return account, response, attempts
 
         error = last_error
         raise self._client_error(error, realm, model) if error is not None else ServiceError(
             "上游持续失败", 503, "upstream_unavailable", "api_error"
         )
+
+    def _dump_failure(
+        self,
+        err: UpstreamError,
+        *,
+        account: Any,
+        realm: str,
+        model: str,
+        url: str,
+        meta: Any = None,
+        request: Any = None,
+    ) -> None:
+        """把上游这次的拒绝原文留下来。
+
+        只留"有 body 的拒绝"：超时的 body 是空的，留一条空记录没有意义。脱敏、限
+        大小、按天封顶都在 :mod:`wb2api.diagnostics` 里做——这里只负责把上下文凑齐。
+        """
+        body = getattr(err, "body", "") or ""
+        if not getattr(self.diag, "enabled", False) or not body:
+            return
+        request_id = ""
+        client_ip = ""
+        alias = ""
+        if request is not None:
+            state = getattr(request, "state", {}) or {}
+            request_id = str(state.get("request_id") or "")
+            alias = str(state.get("model_alias") or "")
+            client_ip = str(getattr(request, "client_ip", "") or "")
+        headers: Dict[str, Any] = {}
+        try:
+            headers = identity.chat_headers(account, self.cfg, meta=meta, client_ip=client_ip)
+        except Exception:
+            headers = {}
+        try:
+            self.diag.dump(
+                request_id=request_id,
+                realm=realm,
+                model=model,
+                alias=alias,
+                account=str(getattr(account, "label", "") or getattr(account, "uid", "")),
+                url=url,
+                status=int(getattr(err, "status", 0) or 0),
+                code=str(getattr(err, "code", "") or ""),
+                message=str(getattr(err, "message", "") or ""),
+                request_headers=headers,
+                body=body,
+            )
+        except Exception:
+            log.debug("失败报文留存失败", exc_info=True)
 
     def _pace(self, account: Any) -> None:
         """同账号两次出站请求之间留最小间隔。
@@ -836,6 +930,7 @@ class GatewayService:
         attempts: int = 1,
         alias: str = "",
         key_slot: str = "",
+        extra: Optional[Dict[str, Any]] = None,
     ) -> Iterator[bytes]:
         """把上游流翻译成客户端帧。
 
@@ -904,6 +999,7 @@ class GatewayService:
                     stream=True, outcome=outcome, usage=usage, status=200,
                     ttft=ttft, error=error_text,
                     request_id=request_id, attempts=attempts, alias=alias,
+                    extra=extra,
                 )
             except Exception:
                 log.exception("记账失败（%s）", model)
@@ -934,6 +1030,7 @@ class GatewayService:
         attempts: int = 1,
         alias: str = "",
         kind: str = "chat.completions",
+        extra: Optional[Dict[str, Any]] = None,
     ) -> None:
         elapsed = int((time.time() - started) * 1000)
         prompt = _num(usage.get("prompt_tokens"))
@@ -974,7 +1071,17 @@ class GatewayService:
             event["error"] = error[:200]
         if outcome == "failed":
             event["status"] = status or 502
+        if extra:
+            # 明细字段（客户端 IP / UA / 入口路径）只进逐请求日志，不进聚合台账：
+            # 聚合表要小，明细表要全。
+            for name, value in extra.items():
+                if value not in (None, ""):
+                    event[name] = value
         self.ledger.record(event)
+        try:
+            self.reqlog.record(event)
+        except Exception:
+            log.debug("逐请求日志写入失败", exc_info=True)
         # 指标只留最近 N 条（内存里），和台账的 7 天回放是两件事。
         try:
             self.metrics.observe(event)

@@ -52,6 +52,7 @@
       <a href="#accounts" data-page="accounts">账号</a>
       <a href="#usage" data-page="usage">用量</a>
       <a href="#logs" data-page="logs">日志</a>
+      <a href="#requests" data-page="requests">请求</a>
       <a href="#settings" data-page="settings">设置</a>
     </nav>
     <div class="topbar-right">
@@ -336,6 +337,67 @@
       </div>
     </section>
 
+    <!-- ============ 请求明细 ============ -->
+    <section id="page-requests" hidden>
+      <div class="card">
+        <div class="card-head">
+          <h2>请求明细</h2>
+          <span class="muted tiny" id="req-note"></span>
+          <div class="row-actions">
+            <button class="ghost tiny-btn" id="req-refresh-btn">刷新</button>
+          </div>
+        </div>
+        <div class="toolbar">
+          <select id="req-status">
+            <option value="">全部状态</option>
+            <option value="error">失败（4xx/5xx/中断）</option>
+            <option value="2xx">2xx 成功</option>
+            <option value="4xx">4xx 请求问题</option>
+            <option value="5xx">5xx 上游问题</option>
+            <option value="429">429 限流</option>
+            <option value="499">499 客户端中断</option>
+          </select>
+          <input type="search" id="req-model" placeholder="模型，例如 glm">
+          <input type="search" id="req-account" placeholder="账号 uid 片段">
+          <input type="search" id="req-q" placeholder="任意关键字，例如 timeout">
+          <label class="muted tiny"><input type="checkbox" id="req-follow"> 自动刷新（5s）</label>
+        </div>
+        <div class="table-wrap">
+          <table class="data" id="req-table">
+            <thead>
+              <tr><th>时间</th><th>状态</th><th>模型</th><th>账号</th><th>耗时</th><th>首字</th><th>tokens</th><th>积分</th><th>request id</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <p class="muted tiny" style="margin:6px 0 0">
+          明细只留最近几天（默认 3 天）。要按 request id 追一次请求，把 id 贴到下面的失败报文里找。
+        </p>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>失败报文</h2>
+          <span class="muted tiny" id="dump-note"></span>
+          <div class="row-actions">
+            <button class="ghost tiny-btn" id="dump-refresh-btn">刷新</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="data" id="dump-table">
+            <thead>
+              <tr><th>时间</th><th>状态</th><th>code</th><th>模型</th><th>上游说</th><th></th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <pre class="log" id="dump-body" hidden></pre>
+        <p class="muted tiny" style="margin:6px 0 0">
+          只留被拒的请求，且 Authorization / Cookie / 令牌串都已脱敏；默认单条 8KB、每天最多 200 条。
+        </p>
+      </div>
+    </section>
+
     <!-- ============ 设置 ============ -->
     <section id="page-settings" hidden>
       <div class="grid-2">
@@ -414,6 +476,38 @@
         <p class="muted tiny" style="margin:0">
           接在客户端自己的 system 提示词末尾（不覆盖、也不参与 sanitize）。适合放"习惯"类要求：
           语言、长度、不要寒暄。空着就等于网关一句话都不加。
+        </p>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>出口代理</h2>
+          <span class="muted tiny" id="proxy-note"></span>
+        </div>
+        <div class="table-wrap">
+          <table class="data" id="proxy-table">
+            <thead>
+              <tr><th>出口</th><th>域</th><th>权重</th><th>备注</th><th>冷却</th><th>用过</th><th>状态</th><th></th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="inline">
+          <input type="text" id="proxy-url" placeholder="socks5h://user:pass@host:port">
+          <select id="proxy-realm">
+            <option value="">两个域</option>
+            <option value="cn">cn</option>
+            <option value="global">global</option>
+          </select>
+          <input type="number" id="proxy-weight" placeholder="权重" min="0.1" step="0.1" value="1" style="flex:0 0 88px">
+          <input type="text" id="proxy-note-input" placeholder="备注（例如 家宽 / 美西）">
+          <button id="proxy-add">添加出口</button>
+          <button class="ghost" id="proxy-reset">清空冷却</button>
+        </div>
+        <p class="muted tiny" style="margin:6px 0 0">
+          留空表示直连。上游是按"机器 id + 出口 IP"看请求形状的：出口全是一个家宽地址时，
+          号再多也只是同一台机器在轮着用。某个出口被拦会自己冷却（5 分钟起、翻倍封顶 1 小时），
+          全在冷却时仍会挑最早解禁的那个——不会退回直连。
         </p>
       </div>
 

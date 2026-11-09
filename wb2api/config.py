@@ -64,6 +64,20 @@ DEFAULTS: Dict[str, Any] = {
     "credits": {
         "retention_days": 30,
     },
+    # 逐请求日志（明细，可按状态/模型/账号/关键字检索；与用量台账互补）
+    "requests": {
+        "enabled": True,
+        "retention_days": 3,
+        "capacity": 500,
+    },
+    # 失败报文留存：上游拒了以后 body 里常写清楚"为什么不收"（11101/11129/11148…），
+    # 不存下来就只能看一个 code 猜。默认只留被拒的、且脱敏、且限大小。
+    "diagnostics": {
+        "enabled": True,
+        "max_body_bytes": 8192,
+        "retention_days": 3,
+        "daily_max": 200,
+    },
     # --- upstream ----------------------------------------------------------
     "upstream": {
         "timeout_seconds": 120,
@@ -137,6 +151,18 @@ DEFAULTS: Dict[str, Any] = {
         "idle_weight_max": 5.0,
         "rate_limit_retries": 2,
         "cross_domain_fallback": False,
+        # --- 出口代理池 ---------------------------------------------------
+        # 形状：["socks5h://user:pass@host:port", {"url": "...", "realm": "global", "weight": 2}]
+        # 空表示直连。上游是按"机器 id + 出口 IP"看请求形状的，出口全是同一个家宽
+        # 地址时，账号再多也只是同一台机器在轮着用。
+        "proxies": [],
+        "proxy_cooldown": "5m",
+        "proxy_cooldown_max": "1h",
+        # --- 同号串行 -----------------------------------------------------
+        # 同一个账号同时跑两个请求，在上游看来就是"这台机器在并发刷"。
+        # 打开后：账号忙时排队等（最多 serialize_wait 秒），而不是再开一条。
+        "serialize_account": True,
+        "serialize_wait": "10s",
     },
     "session_sticky": {"enabled": True, "ttl": "30m", "gc_interval": "5m", "page_size": 3},
     "schedule": {        # 键名必须和 scheduler.py 读的一致，否则配置改了等于没改

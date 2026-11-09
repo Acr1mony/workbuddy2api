@@ -8,7 +8,7 @@
   // ---------------- 基础状态 ----------------
 
   var TOKEN_KEY = "wb2a_panel_token";
-  var PAGES = ["overview", "accounts", "usage", "logs", "settings"];
+  var PAGES = ["overview", "accounts", "usage", "logs", "requests", "settings"];
 
   var state = {
     token: localStorage.getItem(TOKEN_KEY) || "",
@@ -246,8 +246,13 @@
     } else if (state.page === "logs") {
       loadLogs();
       if (state.logFollow) every("logs", 3000, loadLogs);
+    } else if (state.page === "requests") {
+      loadRequests();
+      loadDumps();
+      if (reqFilter.follow) every("requests", 5000, loadRequests);
     } else if (state.page === "settings") {
       loadSettings();
+      loadProxies();
     }
   }
 
@@ -1460,8 +1465,228 @@
 
   // ---------------- 入口 ----------------
 
+
+  // ---------------- 请求明细 / 失败报文 / 出口代理 ----------------
+
+  var reqFilter = { status: "", model: "", account: "", q: "", follow: false };
+
+  function reqQuery() {
+    var parts = [];
+    if (reqFilter.status) parts.push("status=" + encodeURIComponent(reqFilter.status));
+    if (reqFilter.model) parts.push("model=" + encodeURIComponent(reqFilter.model));
+    if (reqFilter.account) parts.push("account=" + encodeURIComponent(reqFilter.account));
+    if (reqFilter.q) parts.push("q=" + encodeURIComponent(reqFilter.q));
+    return parts.length ? "?" + parts.join("&") : "";
+  }
+
+  function statusTone(status, outcome) {
+    var code = Number(status) || 0;
+    if (outcome && outcome !== "completed") return "bad";
+    if (code >= 500) return "bad";
+    if (code >= 400) return "warn";
+    return "ok";
+  }
+
+  function loadRequests() {
+    api("/api/requests?limit=200" + (reqQuery() ? "&" + reqQuery().slice(1) : ""))
+      .then(function (data) {
+        renderRequests(data.items || [], data.stats || {});
+      })
+      .catch(function (err) { toast("读请求明细失败：" + err.message, "bad"); });
+  }
+
+  function renderRequests(items, stats) {
+    var body = $("#req-table tbody");
+    if (!body) return;
+    if (!items.length) {
+      body.innerHTML = '<tr><td colspan="9" class="muted">还没有请求记录（或者刚重启、明细已过期）。</td></tr>';
+    } else {
+      body.innerHTML = items.map(function (row) {
+        var tone = statusTone(row.status, row.outcome);
+        var tokens = (row.prompt_tokens || 0) + "/" + (row.completion_tokens || 0);
+        return "<tr>" +
+          "<td>" + esc(fmtTime(row.at)) + "</td>" +
+          '<td><span class="badge ' + tone + '">' + esc(row.status || "-") + "</span>" +
+          (row.outcome && row.outcome !== "completed" ? ' <span class="muted tiny">' + esc(row.outcome) + "</span>" : "") + "</td>" +
+          "<td>" + esc(row.model || "") + "</td>" +
+          "<td>" + esc(row.account || "") + "</td>" +
+          "<td>" + (row.elapsed_ms ? row.elapsed_ms + "ms" : "-") + "</td>" +
+          "<td>" + (row.ttft_ms ? row.ttft_ms + "ms" : "-") + "</td>" +
+          '<td class="muted">' + esc(tokens) + "</td>" +
+          "<td>" + esc(fmtCredit(row.credit)) + "</td>" +
+          '<td class="muted tiny">' + esc(row.request_id || "") + "</td>" +
+          "</tr>";
+      }).join("");
+    }
+    var note = $("#req-note");
+    if (note) {
+      note.textContent = "缓冲 " + (stats.buffered || 0) + " 条 · 落盘 " + (stats.files || 0) +
+        " 个文件 · 保留 " + (stats.retention_days || 0) + " 天" + (stats.enabled ? "" : "（未启用）");
+    }
+  }
+
+  function loadDumps() {
+    api("/api/dumps?limit=50")
+      .then(function (data) { renderDumps(data.items || [], data.stats || {}); })
+      .catch(function (err) { toast("读失败报文失败：" + err.message, "bad"); });
+  }
+
+  function renderDumps(items, stats) {
+    var body = $("#dump-table tbody");
+    if (!body) return;
+    if (!items.length) {
+      body.innerHTML = '<tr><td colspan="6" class="muted">没有留存（只留被上游拒绝的请求）。</td></tr>';
+    } else {
+      body.innerHTML = items.map(function (row) {
+        return "<tr>" +
+          "<td>" + esc(fmtTime(row.at)) + "</td>" +
+          '<td><span class="badge ' + statusTone(row.status) + '">' + esc(row.status || "-") + "</span></td>" +
+          '<td><code class="tiny">' + esc(row.code || "-") + "</code></td>" +
+          "<td>" + esc(row.model || "") + "</td>" +
+          '<td class="muted">' + esc((row.message || "").slice(0, 90)) + "</td>" +
+          '<td><button class="ghost tiny-btn dump-open" data-id="' + esc(row.request_id) + '">看原文</button></td>' +
+          "</tr>";
+      }).join("");
+    }
+    var note = $("#dump-note");
+    if (note) {
+      note.textContent = "今天已留 " + (stats.today || 0) + "/" + (stats.daily_max || 0) +
+        " 条 · 保留 " + (stats.retention_days || 0) + " 天" + (stats.enabled ? "" : "（未启用）");
+    }
+  }
+
+  function openDump(requestId) {
+    api("/api/dumps/" + encodeURIComponent(requestId))
+      .then(function (row) {
+        var box = $("#dump-body");
+        if (!box) return;
+        var headers = row.request_headers || {};
+        var lines = [];
+        lines.push("request_id : " + (row.request_id || ""));
+        lines.push("时间       : " + (row.iso || fmtTime(row.at)));
+        lines.push("模型       : " + (row.model || "") + (row.alias ? "（别名 " + row.alias + "）" : ""));
+        lines.push("账号       : " + (row.account || ""));
+        lines.push("状态       : " + (row.status || "") + "  code=" + (row.code || ""));
+        lines.push("上游说     : " + (row.message || ""));
+        lines.push("URL        : " + (row.url || ""));
+        lines.push("");
+        lines.push("--- 我们发出去的头（已脱敏）---");
+        Object.keys(headers).sort().forEach(function (name) {
+          lines.push(name + ": " + headers[name]);
+        });
+        lines.push("");
+        lines.push("--- 上游回的 body（" + (row.truncated ? "已截断" : "完整") + "）---");
+        lines.push(row.body || "");
+        box.hidden = false;
+        box.textContent = lines.join("\n");
+      })
+      .catch(function (err) { toast("读原文失败：" + err.message, "bad"); });
+  }
+
+  function loadProxies() {
+    api("/api/proxies")
+      .then(function (data) { renderProxies(data); })
+      .catch(function (err) { toast("读出口池失败：" + err.message, "bad"); });
+  }
+
+  function renderProxies(data) {
+    var body = $("#proxy-table tbody");
+    if (!body) return;
+    var rows = data.entries || [];
+    if (!rows.length) {
+      body.innerHTML = '<tr><td colspan="8" class="muted">没有配置出口——所有请求直连。</td></tr>';
+    } else {
+      body.innerHTML = rows.map(function (row) {
+        var cooling = Number(row.cooling_for) > 0;
+        return "<tr>" +
+          '<td class="tiny">' + esc(row.url) + "</td>" +
+          "<td>" + esc(row.realm) + "</td>" +
+          "<td>" + esc(row.weight) + "</td>" +
+          '<td class="muted">' + esc(row.note || "") + "</td>" +
+          "<td>" + (cooling ? '<span class="badge warn">' + fmtCountdown(row.cooling_for) + "</span>" : '<span class="badge ok">可用</span>') + "</td>" +
+          '<td class="muted">' + esc(row.used || 0) + "</td>" +
+          "<td>" + (row.enabled ? "启用" : '<span class="badge warn">停用</span>') + "</td>" +
+          '<td><button class="ghost tiny-btn proxy-toggle" data-url="' + esc(row.url) + '" data-enabled="' + (row.enabled ? "1" : "0") + '">' +
+          (row.enabled ? "停用" : "启用") + "</button></td>" +
+          "</tr>";
+      }).join("");
+    }
+    var note = $("#proxy-note");
+    if (note) {
+      note.textContent = "共 " + (data.total || 0) + " 个 · 可用 " + (data.ready || 0) + " · 冷却 " + (data.cooling || 0);
+    }
+  }
+
+  function proxyMutate(payload, okText) {
+    return api("/api/proxies", { method: "POST", body: payload })
+      .then(function (data) {
+        renderProxies(data);
+        toast(okText, "ok");
+      })
+      .catch(function (err) { toast("操作失败：" + err.message, "bad"); });
+  }
+
+  function addProxy() {
+    var url = ($("#proxy-url").value || "").trim();
+    if (!url) { toast("先填出口地址，例如 socks5h://user:pass@host:1080", "warn"); return; }
+    proxyMutate({
+      action: "add",
+      url: url,
+      realm: $("#proxy-realm").value,
+      weight: Number($("#proxy-weight").value) || 1,
+      note: ($("#proxy-note-input").value || "").trim()
+    }, "已添加出口").then(function () {
+      $("#proxy-url").value = "";
+      $("#proxy-note-input").value = "";
+    });
+  }
+
+  function bindObservability() {
+    var status = $("#req-status");
+    if (status) status.addEventListener("change", function () { reqFilter.status = status.value; loadRequests(); });
+    ["req-model", "req-account", "req-q"].forEach(function (id) {
+      var el = $("#" + id);
+      if (!el) return;
+      var key = id.split("-")[1];
+      el.addEventListener("input", function () {
+        reqFilter[key] = el.value.trim();
+        clearTimeout(el._timer);
+        el._timer = setTimeout(loadRequests, 250);
+      });
+    });
+    var follow = $("#req-follow");
+    if (follow) follow.addEventListener("change", function () {
+      reqFilter.follow = follow.checked;
+      stopTimer("requests");
+      if (reqFilter.follow) every("requests", 5000, loadRequests);
+    });
+    var refresh = $("#req-refresh-btn");
+    if (refresh) refresh.addEventListener("click", function () { loadRequests(); loadDumps(); });
+    var dumpRefresh = $("#dump-refresh-btn");
+    if (dumpRefresh) dumpRefresh.addEventListener("click", loadDumps);
+    var dumpTable = $("#dump-table");
+    if (dumpTable) dumpTable.addEventListener("click", function (ev) {
+      var btn = ev.target.closest(".dump-open");
+      if (btn) openDump(btn.getAttribute("data-id"));
+    });
+    var addBtn = $("#proxy-add");
+    if (addBtn) addBtn.addEventListener("click", addProxy);
+    var resetBtn = $("#proxy-reset");
+    if (resetBtn) resetBtn.addEventListener("click", function () {
+      proxyMutate({ action: "reset" }, "冷却已清空");
+    });
+    var proxyTable = $("#proxy-table");
+    if (proxyTable) proxyTable.addEventListener("click", function (ev) {
+      var btn = ev.target.closest(".proxy-toggle");
+      if (!btn) return;
+      proxyMutate({ action: "update", url: btn.getAttribute("data-url"), enabled: btn.getAttribute("data-enabled") !== "1" },
+        "已更新出口");
+    });
+  }
+
   function main() {
     bind();
+    bindObservability();
     setAddMode("link");
     // 走到这里说明绑定都成功了；index.html 用它区分"脚本没跑"和"脚本跑了但没登录"。
     window.__WB2A_READY = true;

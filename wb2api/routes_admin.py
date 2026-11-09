@@ -134,6 +134,12 @@ def register(router: Router, panel: Panel) -> None:
     router.add("GET", r"/api/credits/history", lambda req: _credit_history(panel, req))
     router.add("GET", r"/api/scheduler", lambda req: _scheduler(panel, req))
     router.add("POST", r"/api/scheduler/trigger", lambda req: _scheduler_trigger(panel, req))
+    # -- 观测：逐请求明细 / 失败报文 / 出口池 --------------------------------
+    router.add("GET", r"/api/requests", lambda req: _requests(panel, req))
+    router.add("GET", r"/api/dumps", lambda req: _dumps(panel, req))
+    router.add("GET", r"/api/dumps/(?P<request_id>[^/]+)", lambda req, request_id: _dump(panel, req, request_id))
+    router.add("GET", r"/api/proxies", lambda req: _proxies(panel, req))
+    router.add("POST", r"/api/proxies", lambda req: _proxies_post(panel, req))
 
 
 # --------------------------------------------------------------------------
@@ -900,3 +906,87 @@ def read_tail(directory: str, limit: int) -> List[str]:
     except OSError:
         return []
     return data.splitlines()[-limit:]
+
+
+# --------------------------------------------------------------------------
+# 观测：逐请求明细 / 失败报文 / 出口池
+# --------------------------------------------------------------------------
+
+
+def _require_writable(panel: Panel, req: Any) -> None:
+    """只读面板：能看不能改（给"只想给同事看状态"的部署用）。"""
+    if bool(panel.cfg.get("panel.readonly", False)) if panel.cfg else False:
+        raise BadRequest("面板处于只读模式", 403, "readonly")
+
+
+def _requests(panel: Panel, req: Any) -> Response:
+    panel.require(req)
+    limit = int(req.arg("limit", "200") or 200)
+    rows = panel.service.reqlog.recent(
+        limit,
+        status=req.arg("status", ""),
+        model=req.arg("model", ""),
+        account=req.arg("account", ""),
+        query=req.arg("q", ""),
+    )
+    return json_response({"items": rows, "stats": panel.service.reqlog.stats()})
+
+
+def _dumps(panel: Panel, req: Any) -> Response:
+    panel.require(req)
+    limit = int(req.arg("limit", "50") or 50)
+    return json_response({"items": panel.service.diag.recent(limit), "stats": panel.service.diag.stats()})
+
+
+def _dump(panel: Panel, req: Any, request_id: str) -> Response:
+    panel.require(req)
+    record = panel.service.diag.get(request_id)
+    if record is None:
+        raise BadRequest("没有这条失败报文（可能已过期或从未落盘）", 404, "unknown_dump")
+    return json_response(record)
+
+
+def _proxies(panel: Panel, req: Any) -> Response:
+    panel.require(req)
+    stats = panel.service.proxies.stats(req.arg("realm", ""))
+    stats["enabled"] = panel.service.proxies.enabled()
+    stats["realm"] = req.arg("realm", "")
+    return json_response(stats)
+
+
+def _proxies_post(panel: Panel, req: Any) -> Response:
+    panel.require(req)
+    _require_writable(panel, req)
+    body = req.json_body()
+    if not isinstance(body, dict):
+        raise BadRequest("请求体必须是 JSON 对象", 400, "bad_request")
+    action = str(body.get("action") or "add").strip().lower()
+    pool = panel.service.proxies
+    if action == "add":
+        url = str(body.get("url") or "").strip()
+        if not url:
+            raise BadRequest("缺少 url", 400, "missing_url")
+        added = pool.add(url, realm=str(body.get("realm") or ""), weight=body.get("weight", 1.0), note=str(body.get("note") or ""))
+        if not added:
+            raise BadRequest("这个出口已经在池里了（或者地址不合法）", 400, "duplicate_proxy")
+    elif action in ("remove", "delete"):
+        url = str(body.get("url") or "").strip()
+        if not pool.remove(url):
+            raise BadRequest("池里没有这个出口", 404, "unknown_proxy")
+    elif action in ("update", "set"):
+        url = str(body.get("url") or "").strip()
+        if not pool.update(url, **{k: v for k, v in body.items() if k not in ("action", "url")}):
+            raise BadRequest("池里没有这个出口", 404, "unknown_proxy")
+    elif action == "reset":
+        pool.reset_health()
+    else:
+        raise BadRequest("未知操作：%s" % action, 400, "bad_action")
+    # 池子的真源是配置：改完就写回去，否则重启就回到旧列表。
+    try:
+        panel.cfg.set("pool.proxies", pool.to_config())
+        panel.cfg.save()
+    except Exception:
+        log.debug("保存出口池配置失败", exc_info=True)
+    stats = pool.stats("")
+    stats["enabled"] = pool.enabled()
+    return json_response(stats)

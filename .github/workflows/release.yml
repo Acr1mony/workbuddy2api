@@ -1,0 +1,65 @@
+name: release
+
+# 打 tag 就发版：v1.8.0 / v1.8.0-rc1 都行。产物是 wheel，外加自动生成的说明。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的 tag（例如 v1.8.0）"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Tests before publishing
+        run: |
+          python -m compileall -q wb2api
+          python -m unittest discover -s tests -t . 
+
+      - name: Build wheel
+        run: |
+          python -m pip install --quiet build
+          python -m build --wheel
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: ${{ github.event.inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          body: |
+            ## 怎么用
+
+            不需要这个包也能跑（源码目录里 `python -m wb2api serve` 即可）。
+            想装成命令：
+
+            ```bash
+            pip install wb2api-*.whl
+            wb2a serve --port 8788
+            ```
+
+            一条命令装到 Linux 服务器（含 systemd）：
+
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/Acr1mony/workbuddy2api/main/scripts/install.sh | bash
+            ```
+
+            > 仅供自用，不承诺可用性：上游接口一变就可能失效。
+          files: dist/*.whl
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') }}

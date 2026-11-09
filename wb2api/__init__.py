@@ -8,6 +8,9 @@
     authflow.py     OAuth 登录（无 PKCE，state 轮询）与一次性 refresh token
     upstream.py     上游 HTTP 客户端、连接复用、错误码归一化
     egress.py       出口（host+proxy）级退避：链路抖动不记在账号头上
+    proxies.py      出口代理池：按域/权重挑出口，坏了自动冷却
+    diagnostics.py  失败报文留存（脱敏、限大小、按天封顶）
+    reqlog.py       逐请求明细（可按状态/模型/账号/关键字检索）
     billing.py      额度查询 / 签到 / 用量上报（宽容解析）
     probe.py        账号体检（真打一次最小 chat，只读不记账）
     sse.py          SSE 解析与 OpenAI 分块编码
@@ -22,11 +25,11 @@
     usage.py        用量台账与面板聚合
     httpserver.py   极简 HTTP 框架（路由 / 请求 / 响应 / 面板会话）
     routes_openai.py  客户端面：/v1/chat/completions、/v1/models、/healthz、/status
-    routes_admin.py   面板 API：账号（含备份）、设置、用量、日志、调度
+    routes_admin.py   面板 API：账号（含备份）、设置、用量、日志、调度、请求明细、出口池
     web/            面板静态页（零构建）
     app.py          装配：把上面这些拼成一个应用
     cli.py          命令行入口（serve / doctor / version / accounts）
 """
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 __version__ = VERSION

@@ -17,7 +17,7 @@ from tests.test_app import ServerCase
 from tests.test_service import FakeClient, FakeResponse, ok_stream, sse_lines, chat_chunk
 from wb2api import models, util
 from wb2api.config import Config
-from wb2api.service import GatewayService
+from wb2api.service import GatewayService, ServiceError
 from wb2api.store import Account, Store
 
 
@@ -434,3 +434,105 @@ class ModelLockViewTest(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class ObservabilityTest(unittest.TestCase):
+    """出口池、失败报文留存、逐请求日志：三者都是"出问题时能查"的基础设施。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="wb2a-obs-")
+        self.cfg = Config(None, {"data_dir": self.tmp, "panel": {"enabled": False}})
+
+    def service(self, script, cfg=None):
+        store = Store(self.tmp)
+        for uid in ("u1",):
+            store.upsert_account(Account(
+                uid=uid, id=uid, realm="cn", access_token="tok-" + uid,
+                refresh_token="rt-" + uid, expires_at=time.time() + 86400,
+            ))
+        client = FakeClient(script)
+        return GatewayService(cfg or self.cfg, Store(self.tmp), client=client), client
+
+    def request(self, payload=None):
+        from wb2api.httpserver import Request
+
+        body = {"model": "deepseek-v3", "messages": [{"role": "user", "content": "hi"}]}
+        body.update(payload or {})
+        return Request("POST", "/v1/chat/completions", {}, {}, json.dumps(body).encode(), ("1.2.3.4", 1))
+
+    # -- 出口池 -------------------------------------------------------------
+    def test_proxy_from_pool_is_used_and_counted(self):
+        from wb2api.config import Config as C
+
+        cfg = C(None, {"data_dir": self.tmp, "panel": {"enabled": False},
+                       "pool": {"proxies": ["http://10.0.0.9:3128"]}})
+        svc, client = self.service([ok_stream("hi")], cfg=cfg)
+        svc.chat_completions(self.request())
+        self.assertEqual(client.calls[0]["proxy"], "http://10.0.0.9:3128")
+        self.assertEqual(svc.proxies.stats()["entries"][0]["used"], 1)
+
+    def test_account_proxy_wins_over_pool(self):
+        from wb2api.config import Config as C
+
+        cfg = C(None, {"data_dir": self.tmp, "panel": {"enabled": False},
+                       "pool": {"proxies": ["http://10.0.0.9:3128"]}})
+        store = Store(self.tmp)
+        store.upsert_account(Account(
+            uid="u1", id="u1", realm="cn", access_token="tok", refresh_token="rt",
+            expires_at=time.time() + 86400, proxy="socks5h://127.0.0.1:1080",
+        ))
+        client = FakeClient([ok_stream("hi")])
+        svc = GatewayService(cfg, Store(self.tmp), client=client)
+        svc.chat_completions(self.request())
+        self.assertEqual(client.calls[0]["proxy"], "socks5h://127.0.0.1:1080")
+
+    def test_empty_pool_means_direct(self):
+        svc, client = self.service([ok_stream("hi")])
+        svc.chat_completions(self.request())
+        self.assertEqual(client.calls[0]["proxy"], "")
+
+    # -- 失败报文 -----------------------------------------------------------
+    def test_rejected_body_is_kept_and_redacted(self):
+        from wb2api.upstream import UpstreamError
+
+        err = UpstreamError("tool_choice invalid", kind="bad_request", status=400, code=11101,
+                            body='{"code":11101,"message":"tool_choice invalid","key":"sk-abcdefghijklmnop"}')
+        svc, _client = self.service([err])
+        with self.assertRaises(ServiceError):
+            svc.chat_completions(self.request())
+        rows = svc.diag.recent()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["code"], "11101")
+        record = svc.diag.get(rows[0]["request_id"])
+        self.assertIn("tool_choice invalid", record["body"])
+        self.assertNotIn("abcdefghijklmnop", record["body"])
+        self.assertEqual(record["request_headers"]["authorization"], "**redacted**")
+
+    def test_timeout_without_body_is_not_dumped(self):
+        from wb2api.upstream import UpstreamError
+
+        svc, _client = self.service([UpstreamError("timeout", kind="timeout", status=0)])
+        with self.assertRaises(ServiceError):
+            svc.chat_completions(self.request())
+        self.assertEqual(svc.diag.recent(), [])
+
+    def test_diagnostics_can_be_disabled(self):
+        from wb2api.upstream import UpstreamError
+
+        cfg = Config(None, {"data_dir": self.tmp, "panel": {"enabled": False},
+                            "diagnostics": {"enabled": False}})
+        svc, _client = self.service([UpstreamError("bad", kind="bad_request", status=400,
+                                                   code=11101, body="{bad}")], cfg=cfg)
+        with self.assertRaises(ServiceError):
+            svc.chat_completions(self.request())
+        self.assertEqual(svc.diag.recent(), [])
+
+    # -- 逐请求日志 ---------------------------------------------------------
+    def test_request_log_keeps_client_context(self):
+        svc, _client = self.service([ok_stream("hi")])
+        svc.chat_completions(self.request())
+        row = svc.reqlog.recent()[0]
+        self.assertEqual(row["path"], "/v1/chat/completions")
+        self.assertEqual(row["client_ip"], "1.2.3.4")
+        self.assertTrue(row["request_id"].startswith("req_"))
+        self.assertEqual(row["outcome"], "completed")

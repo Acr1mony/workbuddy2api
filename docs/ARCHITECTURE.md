@@ -36,7 +36,7 @@
 7. **回写**：流式把上游 SSE 逐帧重写成 OpenAI chunk；非流式在本地聚合成一个 `chat.completion`。
 8. **记账**：一行 JSONL，`finally` 里写（客户端中断也写，上游已经计费了）。
 
-## 十五个关键决定
+## 十八个关键决定
 
 ### 1. 冷却窗口持久化，失败叙述不持久化
 
@@ -155,6 +155,10 @@ data/
     usage-YYYY-MM-DD.jsonl   每请求一行，保留 N 天（默认 7）；单文件满 64MB 滚成 .p001.jsonl
   credits/
     credit-YYYY-MM-DD.jsonl  每次刷新余额记一行（总额/到期桶/包数/来源），保留 30 天
+  requests/
+    req-YYYY-MM-DD.jsonl     逐请求明细，保留 3 天（内存环形另留最近 500 条）
+  dumps/
+    dump-YYYY-MM-DD.jsonl    失败报文（脱敏、8KB 截断、每天最多 200 条），保留 3 天
 logs/
   wb2api.log        滚动 8MB × 5
 ```
@@ -179,6 +183,20 @@ logs/
 
 余额读不到时返回 `None` 而不是 `0`：`0` 会让 `credit_floor` 把一个好账号踢出池子，也会在面板上显示"已欠费"。
 
+### 16. 出口是独立的一层，和账号互不牵连
+
+上游看的形状是"机器 id + 出口 IP"。一个出口被 WAF 盯上时，换账号没有用——出口没换。所以 `proxies.py` 按 `(host:port, proxy)` 分桶，坏掉的出口冷却 5 分钟起、翻倍封顶 1 小时，**全部出口都在冷却时宁可排队等第一个解禁，也不退回直连**：直连等于把真实 IP 交出去，那比慢几十秒贵得多。
+
+同理，账号自带 `proxy` 时优先用它（一条账号绑一个出口，画像更稳），池里的出口只服务没绑的账号。
+
+### 17. 失败报文要留，但只留"要命的那些"，而且必须脱敏
+
+上游拒绝时的原文（`11101` 工具形状、`11129` schema、`11148` 工具配对……）在归一化成 `code` 之后就没了，排障只能靠猜。`diagnostics.py` 把 **body 非空**的失败原文留下来，同时上三道锁：请求头脱敏（`authorization`、`cookie`、`x-refresh-token` 一律 `**redacted**`，body 里的 `sk-` 串也打码）、body 截到 8KB、每天最多 200 条。第三条是关键——错误循环刷的时候，留存不能跟着雪崩，否则磁盘先死。
+
+### 18. 同一个账号同时只跑一条请求
+
+`max_in_flight` 限制的是"整个池"，一个人开三个客户端就能让同一个账号并发三条——在上游眼里这就是脚本。`pool.select()` 因此先拿**账号级锁**再占并发槽：拿不到就分段等到 `serialize_wait`（默认 10 秒），超时返回 503 `no_account`，而不是换个号悄悄继续（换号会把"并发刷"变成"多号并发刷"，更糟）。这个锁是进程内的，多进程部署时它保护不了你——这是已知取舍。
+
 ## 模块边界
 
 | 模块 | 可以依赖 | 不该做的事 |
@@ -188,6 +206,9 @@ logs/
 | `upstream.py` | `util`, `config` | 不重试、不选号（重试属于 service） |
 | `adapters/chat.py` | `util`, `markup`, `sanitize` | 不做 IO |
 | `pool.py` | `store`, `sticky`, `util` | 不发请求（只记账） |
+| `proxies.py` | `util`, `config` | 不选账号、不发请求 |
+| `diagnostics.py` | `util` | 不解读报文（只脱敏、截断、留存） |
+| `reqlog.py` | `util` | 不做聚合统计（那是 `usage.py` 的事） |
 | `service.py` | 以上全部 | 不碰 `Request` 以外的 HTTP 细节 |
 | `routes_*.py`, `web/` | `httpserver`, `service` | 不直接打上游 |
 | `scheduler.py` | `service` | 不起第二个 HTTP 服务器 |

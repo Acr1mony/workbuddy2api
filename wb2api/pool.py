@@ -155,6 +155,10 @@ class Pool:
         self._holds: Dict[str, float] = {}
         self._dirty = False
         self._last_flush = util.now()
+        # 同号串行：每个账号一把锁，``select()`` 拿到锁才发请求，``release()`` 放回。
+        # 一个账号同时跑两条请求，在上游眼里就是"这台机器在并发刷"——比换号更像脚本。
+        self._account_locks: Dict[str, "threading.Lock"] = {}
+        self._held_locks: Dict[str, "threading.Lock"] = {}
 
     # -- 配置 ---------------------------------------------------------------
     def set_config(self, cfg: Any) -> None:
@@ -339,21 +343,71 @@ class Pool:
         with self._lock:
             if account.in_flight > 0:
                 account.in_flight -= 1
+            lock = self._held_locks.pop(getattr(account, "key", "") or "", None)
+        # 锁在锁外释放：万一有人正等着，让它立刻能进门，而不是等我们出临界区。
+        if lock is not None:
+            try:
+                lock.release()
+            except RuntimeError:
+                pass
+
+    # -- 同号串行 -----------------------------------------------------------
+    def serialize(self) -> bool:
+        """是否要求同一账号同时只跑一条请求。"""
+        return bool(self._pool_cfg("pool", "serialize_account", default=True))
+
+    def serialize_wait(self) -> float:
+        """账号忙时最多等多久（秒）；等不到就让调用方去挑别的号。"""
+        return max(0.0, self._duration(("pool", "serialize_wait"), 10.0))
+
+    def account_lock(self, account: Account) -> "threading.Lock":
+        key = getattr(account, "key", "") or ""
+        with self._lock:
+            lock = self._account_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._account_locks[key] = lock
+            return lock
+
+    def busy_accounts(self) -> int:
+        with self._lock:
+            return len(self._held_locks)
 
     def select(self, realm: str, model: str, **kwargs: Any) -> Optional[Account]:
-        """选号并占槽；返回的账号必须由调用方 ``release()``。"""
-        for _ in range(4):
-            account = self.pick(realm, model, **kwargs)
+        """选号并占槽；返回的账号必须由调用方 ``release()``。
+
+        ``pool.serialize_account`` 打开时还会顺便占住"这个号"的锁：同一账号的第二
+        条请求要么排队等（最多 ``serialize_wait`` 秒），要么被挑到另一个号上。默认
+        打开——它换来的"上游看不到并发"比那点延迟值钱。
+        """
+        wait = self.serialize_wait() if self.serialize() else 0.0
+        deadline = util.now() + wait
+        exclude = set(kwargs.get("exclude") or ())
+        while True:
+            account = self.pick(realm, model, **{**kwargs, "exclude": exclude})
             if account is None:
                 return None
+            lock: Optional["threading.Lock"] = None
+            if wait > 0:
+                lock = self.account_lock(account)
+                remaining = deadline - util.now()
+                if remaining <= 0:
+                    return None  # 等满一轮还没轮到：让上层回"都在忙"
+                # 分段等：一次等满会错过那些"刚好空出来"的别的号。
+                if not lock.acquire(timeout=max(0.02, min(remaining, 0.5))):
+                    exclude.add(account.key)
+                    continue
             if self.acquire(account):
                 self._mark_used(account)
+                if lock is not None:
+                    with self._lock:
+                        self._held_locks[account.key] = lock
                 return account
-            # 槽满了：把它排除再挑一次，别原地打转
-            exclude = set(kwargs.get("exclude") or ())
+            if lock is not None:
+                lock.release()
             exclude.add(account.key)
-            kwargs["exclude"] = exclude
-        return None
+            if util.now() >= deadline:
+                return None
 
     def model_blocked(self, realm: str, model: str) -> Dict[str, Any]:
         """整个域的所有可用账号都把这个模型标记为不可用时，返回解禁信息。

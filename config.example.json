@@ -32,6 +32,17 @@
   "credits": {
     "retention_days": 30
   },
+  "requests": {
+    "enabled": true,
+    "retention_days": 3,
+    "capacity": 500
+  },
+  "diagnostics": {
+    "enabled": true,
+    "max_body_bytes": 8192,
+    "retention_days": 3,
+    "daily_max": 200
+  },
   "upstream": {
     "timeout_seconds": 120,
     "header_timeout_seconds": 120,
@@ -91,7 +102,12 @@
     "idle_weight_per_hour": 0.5,
     "idle_weight_max": 5.0,
     "rate_limit_retries": 2,
-    "cross_domain_fallback": false
+    "cross_domain_fallback": false,
+    "proxies": [],
+    "proxy_cooldown": "5m",
+    "proxy_cooldown_max": "1h",
+    "serialize_account": true,
+    "serialize_wait": "10s"
   },
   "session_sticky": {
     "enabled": true,

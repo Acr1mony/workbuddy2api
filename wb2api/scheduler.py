@@ -348,10 +348,19 @@ class Scheduler:
         credit_rows = 0
         if hasattr(self.service, "credit_book"):
             credit_rows = self.service.credit_book.prune()
+        req_rows = 0
+        if hasattr(self.service, "reqlog"):
+            req_rows = self.service.reqlog.prune()
+        dump_rows = 0
+        if hasattr(self.service, "diag"):
+            dump_rows = self.service.diag.prune()
+        if hasattr(self.service, "proxies"):
+            self.service.proxies.clamp()
         aff = self.service.affinity.stats()
         return (
             f"affinity={aff.get('sessions', 0)} rotated={aff.get('rotations', 0)} "
-            f"pruned={removed} credits_pruned={credit_rows}"
+            f"pruned={removed} credits_pruned={credit_rows} "
+            f"req_pruned={req_rows} dumps_pruned={dump_rows}"
         )
 
     def flush(self) -> str:
