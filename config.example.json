@@ -128,7 +128,8 @@
   "prompt": {
     "mode": "sanitize",
     "file": "",
-    "content_retry": true
+    "content_retry": true,
+    "append": ""
   },
   "features": {}
 }

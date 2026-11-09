@@ -59,12 +59,16 @@ def prepare_request(
     body: Dict[str, Any],
     model_meta: Optional[Dict[str, Any]] = None,
     sanitize_prompt: bool = False,
+    append_prompt: str = "",
 ) -> Dict[str, Any]:
     """把客户端请求体改写成上游能接受的形状。入参不会被修改。
 
     顺序不是随意的：``stream`` 必须最先钉死（上游拒绝非流式），工具配对必须在
     thinking 注入之前（否则补出来的字段会被当成孤儿的判据），回填 reasoning 必须
     在配对之后（配对可能删除消息）。前面的改动都可能让后面的判断失效。
+
+    ``append_prompt`` 是网关自己的追加提示词：接在最后一条 system 后面（没有就造一条）。
+    它是"网关替客户端说的话"，所以不参与 sanitize——洗用户内容，不该洗自己的配置。
     """
     obj = json.loads(json.dumps(body)) if body else {}
     obj["stream"] = True
@@ -92,9 +96,36 @@ def prepare_request(
     _clamp_reasoning_effort(obj, model_meta)
     if reasoning_model:
         _backfill_reasoning(obj)
+    if append_prompt:
+        _append_system_prompt(obj, append_prompt)
     # 上游不认的字段留给他们自己忽略，但空 choices/messages 一定要有。
     obj.setdefault("messages", [])
     return obj
+
+
+def _append_system_prompt(obj: Dict[str, Any], text: str) -> None:
+    """把网关的追加提示词接到 system 消息末尾（缺失就新建一条）。
+
+    追加而不是覆盖：客户端自己的系统提示词是它调好的，网关只补"习惯"这一层。
+    """
+    messages = obj.get("messages")
+    if not isinstance(messages, list):
+        messages = []
+        obj["messages"] = messages
+    extra = str(text).strip()
+    if not extra:
+        return
+    for message in messages:
+        if isinstance(message, dict) and str(message.get("role") or "") == "system":
+            content = message.get("content")
+            if isinstance(content, str):
+                message["content"] = (content + "\n\n" + extra).strip()
+            elif isinstance(content, list):
+                content.append({"type": "text", "text": extra})
+            else:
+                message["content"] = extra
+            return
+    messages.insert(0, {"role": "system", "content": extra})
 
 
 def is_reasoning_model(model: str, model_meta: Optional[Dict[str, Any]] = None) -> bool:

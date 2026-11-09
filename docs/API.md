@@ -304,7 +304,7 @@ X-Panel-Token: 1762500000.9f3c...
 | 方法与路径 | 说明 |
 | --- | --- |
 | `GET /api/settings` | 当前设置（**密码与 device token 不回明文**）；`tunables` 数组给出可在线修改的调优项（`path`/`label`/`kind`/`restart`/`value`） |
-| `POST /api/settings` | `panel_password`（≥6 位）、`prompt_mode`（`passthrough`\|`sanitize`）、`api_key`、`listen`、`keys_add:[{key,name,realm,models,max_concurrency}]`、`keys_delete:[name]`、`tunables:{配置路径: 值}` |
+| `POST /api/settings` | `panel_password`（≥6 位）、`prompt_mode`（`passthrough`\|`sanitize`）、`prompt_append`（≤4000 字，接在 system 末尾）、`api_key`、`listen`、`keys_add:[{key,name,realm,models,max_concurrency,rate_limit}]`、`keys_delete:[name]`、`tunables:{配置路径: 值}` |
 
 `tunables` 的写入是**逐项校验**的：`duration` 接受 `"30m"`/`"200ms"` 或纯数字（按秒），`int`/`float` 拒绝负数，`schedule.checkin_hour` 不超过 23，`pool.strategy.*` 只接受 `weighted_random`/`round_robin`/`sequential_exhaust`。任何一项非法整单返回 `400 bad_value`、一个都不写；不认识的路径静默忽略（前向兼容）。`server.max_payload_mb` 标了 `restart: true`，改完要重启进程。
 

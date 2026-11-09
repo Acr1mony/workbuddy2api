@@ -258,6 +258,7 @@ class GatewayService:
             body,
             self.catalog.meta_map(realm),
             sanitize_prompt=str(self.cfg.get("prompt.mode") or "") == "sanitize",
+            append_prompt=str(self.cfg.get("prompt.append") or ""),
         )
         meta_body["model"] = model
         payload = json.dumps(meta_body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -362,6 +363,7 @@ class GatewayService:
             chat_body,
             self.catalog.meta_map(realm),
             sanitize_prompt=str(self.cfg.get("prompt.mode") or "") == "sanitize",
+            append_prompt=str(self.cfg.get("prompt.append") or ""),
         )
         prepared["model"] = model
         payload = json.dumps(prepared, ensure_ascii=False, separators=(",", ":")).encode("utf-8")

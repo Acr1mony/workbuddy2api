@@ -615,6 +615,7 @@ def _settings_get(panel: Panel, req: Any) -> Response:
             },
             "pool": cfg.get("pool.strategy"),
             "prompt_mode": cfg.get("prompt.mode"),
+            "prompt_append": cfg.get("prompt.append") or "",
             "listen": cfg.get("listen"),
             # Editable pool/schedule knobs. Values are strings-or-numbers exactly
             # as the config holds them (durations stay human: "30m", "200ms").
@@ -777,6 +778,12 @@ def _settings_post(panel: Panel, req: Any) -> Response:
         if mode not in ("passthrough", "sanitize"):
             return error_response(400, "prompt_mode 只能是 passthrough 或 sanitize", "bad_value")
         cfg.set("prompt.mode", mode)
+    if "prompt_append" in body:
+        # 网关自己的追加提示词：接在 system 末尾，不覆盖客户端写的那段。
+        text = str(body["prompt_append"] or "")
+        if len(text) > 4000:
+            return error_response(400, "追加提示词最多 4000 字", "bad_value")
+        cfg.set("prompt.append", text)
     if "api_key" in body:
         cfg.set("api_key", str(body["api_key"] or ""))
     if "listen" in body:

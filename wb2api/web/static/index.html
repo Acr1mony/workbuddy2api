@@ -408,6 +408,21 @@
           上游的风控是按字面量匹配的：请求里出现某些固定句子或键名会被整单拒绝（400 <code>11-128</code>）。
           sanitize 只做最小改写，但确实会动到你自己写的 prompt。
         </p>
+        <label class="field" style="margin-top:10px">网关追加提示词
+          <textarea id="set-prompt-append" rows="4" placeholder="例如：回答用中文，尽量简短。留空表示不追加。"></textarea>
+        </label>
+        <p class="muted tiny" style="margin:0">
+          接在客户端自己的 system 提示词末尾（不覆盖、也不参与 sanitize）。适合放"习惯"类要求：
+          语言、长度、不要寒暄。空着就等于网关一句话都不加。
+        </p>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>接入指南</h2><button class="ghost tiny-btn" id="copy-guide">复制全部</button></div>
+        <p class="muted tiny" style="margin:0 0 8px">
+          按下面的填法，客户端就能直接用。密钥就是下面那些 <code>sk-...</code>，不要发给别人。
+        </p>
+        <pre class="log" id="guide-body" style="max-height:340px"></pre>
       </div>
     </section>
 

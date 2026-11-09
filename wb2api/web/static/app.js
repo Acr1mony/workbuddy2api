@@ -1072,9 +1072,11 @@
       $("#set-api-key").value = "";
       $("#set-api-key").placeholder = data.default_api_key_set ? "已设置（留空 = 不修改）" : "留空 = 不设默认 key";
       $("#set-prompt-mode").value = data.prompt_mode || "passthrough";
+      if ($("#set-prompt-append")) $("#set-prompt-append").value = data.prompt_append || "";
       if (panel.session_hours) $("#keys-note").textContent = "会话 " + panel.session_hours + " 小时";
       renderKeys(data.api_keys || []);
       renderTunables(data.tunables || []);
+      renderGuide(data.api_keys || []);
       markUpdated();
     }).catch(function (err) {
       toast("bad", "读取设置失败", err.message);
@@ -1091,6 +1093,36 @@
         '<td class="tiny">' + esc(k.rate_limit ? String(k.rate_limit) + "/分" : "不限") + "</td>" +
         '<td><button class="ghost tiny-btn danger" data-key-del="' + esc(k.name || k.key) + '">删除</button></td></tr>';
     }), 7, "还没有 key（客户端不带 key 时走开放模式）");
+  }
+
+  // 接入指南：把"填哪里"写清楚。密钥在列表里永远是打码的，所以这里给占位说明
+  // 而不是假装能读回明文——能读回明文才是真问题。
+  function renderGuide(keys) {
+    var host = $("#guide-body");
+    if (!host) return;
+    var base = location.origin;
+    var first = (keys && keys[0] && keys[0].name) ? keys[0].name : "default";
+    host.textContent = [
+      "# OpenAI SDK（Python）",
+      "from openai import OpenAI",
+      'client = OpenAI(base_url="' + base + '/v1", api_key="sk-…")  # 密钥：客户端密钥里新建时显示一次（' + first + '）',
+      'print(client.chat.completions.create(model="deepseek-v4-flash",',
+      '      messages=[{"role":"user","content":"你好"}]).choices[0].message.content)',
+      "",
+      "# 任何 OpenAI 兼容客户端",
+      "Base URL: " + base + "/v1",
+      "API Key : sk-…",
+      "",
+      "# Claude Code / Codex（Anthropic 协议，走 /v1/messages）",
+      "ANTHROPIC_BASE_URL=" + base,
+      "ANTHROPIC_API_KEY=sk-…",
+      "",
+      "# 自测",
+      'curl -s ' + base + '/v1/models -H "Authorization: Bearer sk-…"',
+      'curl -s ' + base + '/v1/messages -H "x-api-key: sk-…" -H "content-type: application/json" \\',
+      '  -d \'{"model":"deepseek-v4-flash","max_tokens":64,',
+      '       "messages":[{"role":"user","content":"你好"}]}\''
+    ].join("\n");
   }
 
   function renderTunables(items) {
@@ -1114,6 +1146,7 @@
     var password = $("#set-panel-password").value;
     if (password) body.panel_password = password;
     body.prompt_mode = $("#set-prompt-mode").value;
+    if ($("#set-prompt-append")) body.prompt_append = $("#set-prompt-append").value;
     api("/api/settings", { body: body }).then(function () {
       $("#set-panel-password").value = "";
       $("#set-api-key").value = "";
@@ -1410,6 +1443,14 @@
     // 设置
     $("#set-save").addEventListener("click", saveSettings);
     $("#tunables-save").addEventListener("click", saveTunables);
+    if ($("#copy-guide")) {
+      $("#copy-guide").addEventListener("click", function () {
+        var text = ($("#guide-body") || {}).textContent || "";
+        if (!text) { toast("warn", "没有可复制的内容", ""); return; }
+        try { navigator.clipboard.writeText(text); toast("ok", "接入指南已复制", ""); }
+        catch (e) { toast("warn", "复制失败", "浏览器拒绝了剪贴板"); }
+      });
+    }
     $("#key-add").addEventListener("click", addKey);
     $("#keys-table").addEventListener("click", function (ev) {
       var button = ev.target.closest("button[data-key-del]");
