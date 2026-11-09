@@ -148,6 +148,37 @@ data: [DONE]
 
 发生这种情况时**不会**再补 `[DONE]`——收到 error 帧即终止，这是刻意与 OpenAI 保持一致的行为约定。
 
+### `POST /v1/messages`（Anthropic 形状）
+
+给 Claude Code / Codex 这类只会说 Anthropic 协议的客户端用。请求与响应都按 Anthropic
+Messages 的形状收发，网关内部翻成上游的 OpenAI 形状：
+
+| Anthropic 字段 | 网关怎么处理 |
+|---|---|
+| `system`（字符串或 text 块数组） | 拼成 `messages[0]` 的 `system` |
+| `content` 是块数组 | `text` 直接拼；`image`（base64 / url）转 `image_url`；`tool_use` 转 `tool_calls`；`tool_result` 转 `role:"tool"` |
+| `thinking` 块（历史里） | 回填到 `reasoning_content`，不并进正文 |
+| `tools` / `tool_choice` | `input_schema` 转 `parameters`；`tool_choice` 一律折成字符串（上游只吃字符串） |
+| `max_tokens`（必填） | 原样作为上游 `max_tokens` |
+| `stop_sequences` | 转上游 `stop` 数组 |
+
+响应（非流式）：`{"type":"message","content":[{"type":"text"...}`，`stop_reason` 映射为
+`end_turn` / `max_tokens` / `tool_use` / `refusal`，`usage` 为 `{"input_tokens","output_tokens"}`。
+
+流式事件的顺序固定为 `message_start` → `content_block_start/delta/stop`（每个块一个 index）
+→ `message_delta` → `message_stop`；思考内容走 `thinking_delta`，工具参数走 `input_json_delta`。
+中途失败发 `event: error`，**不会**再补 `message_stop`。
+
+```bash
+curl -s http://127.0.0.1:8788/v1/messages \
+  -H "x-api-key: sk-..." -H "anthropic-version: 2023-06-01" -H "content-type: application/json" \
+  -d '{"model":"deepseek-v4-flash","max_tokens":256,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+### `POST /v1/messages/count_tokens`
+
+本地估算（不打上游）：按"字符数 / 2.2"取整，偏保守。返回 `{"input_tokens": 123}`。
+
 ### `GET /v1/models`
 
 ```json

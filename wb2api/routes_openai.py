@@ -52,8 +52,65 @@ def guard(handler: Callable[..., Any]) -> Callable[..., Any]:
     return wrapper
 
 
+def anthropic_guard(handler: Callable[..., Any]) -> Callable[..., Any]:
+    """Anthropic 的错误信封是 ``{"type":"error","error":{...}}``，与 OpenAI 不同。
+
+    Claude Code 会按这个形状取 ``error.message``；给错形状它只显示 "unknown error"，
+    用户拿不到任何可用信息。
+    """
+
+    def wrapper(req: Any, **params: Any) -> Response:
+        try:
+            return handler(req, **params)
+        except ServiceError as exc:
+            return _anthropic_error(exc.status, exc.message, _anthropic_kind(exc), exc.retry_after)
+        except BadRequest as exc:
+            return _anthropic_error(exc.status, exc.message, "invalid_request_error")
+        except UpstreamError as exc:
+            return _anthropic_error(503, str(exc), "api_error")
+        except (BrokenPipeError, ConnectionResetError):
+            raise
+        except Exception as exc:
+            from .log import get_logger
+
+            get_logger("routes").exception("handler %s failed", getattr(handler, "__name__", handler))
+            return _anthropic_error(500, f"internal error: {exc}", "api_error")
+
+    return wrapper
+
+
+def _anthropic_kind(exc: ServiceError) -> str:
+    mapping = {
+        "invalid_request_error": "invalid_request_error",
+        "rate_limit_error": "rate_limit_error",
+        "authentication_error": "authentication_error",
+    }
+    return mapping.get(exc.kind, "api_error")
+
+
+def _anthropic_error(status: int, message: str, kind: str, retry_after: float = 0.0) -> Response:
+    headers = {}
+    if retry_after:
+        headers["Retry-After"] = str(int(retry_after))
+    return json_response(
+        {"type": "error", "error": {"type": kind, "message": message}},
+        status=status,
+        headers=headers or None,
+    )
+
+
+def _count_tokens(req: Any) -> Response:
+    from .adapters.messages import count_tokens
+
+    body = req.json_body()
+    return json_response({"input_tokens": count_tokens(body if isinstance(body, dict) else {})})
+
+
 def register(router: Router, service: Any) -> None:
     router.add("POST", r"/v1/chat/completions", guard(lambda req: service.chat_completions(req)))
+    # Anthropic 形状：Claude Code / Codex 只认这个入口。count_tokens 不需要打上游。
+    router.add("POST", r"/v1/messages", anthropic_guard(lambda req: service.messages(req)))
+    router.add("POST", r"/v1/messages/count_tokens", anthropic_guard(lambda req: _count_tokens(req)))
     router.add("GET", r"/v1/models", guard(lambda req: service.models(req)))
     router.add("GET", r"/healthz", lambda req: json_response({"ok": True}))
     router.add("GET", r"/status", guard(lambda req: json_response(service.status(req))))

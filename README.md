@@ -133,6 +133,26 @@ wb2a login --no-wait --json # 只要链接（脚本/远程会话用）
 | 观测  | 每请求一行 JSONL 台账（tokens、TTFT、命中缓存、账套、账号、`request_id`、`attempts`，独立线程写、单文件 64MB 滚片）、进程内指标（首字/总耗时分位、错误率、结果分布、重试直方图、按模型延迟）、余额到期分桶与变动台账、面板实时 KPI |
 | 稳   | 并发槽在 `finally` 里释放（异常、客户端半路断开都不会漏）、状态文件坏了就拒绝启动而不是静默清空、连接读写有超时（慢客户端拖不死网关）、面板页面带 CSP/X-Frame-DENY 且不带 CORS |
 
+### 两个协议入口
+
+同一个网关同时讲两种话，用哪套取决于客户端：
+
+| 入口 | 给谁用 |
+| --- | --- |
+| `POST /v1/chat/completions` | OpenAI SDK、各种兼容 OpenAI 的客户端 |
+| `POST /v1/messages`（+ `/v1/messages/count_tokens`） | Claude Code、Codex 这类只会说 Anthropic 协议的客户端 |
+
+两边走同一套选号、重试、冷却、台账，只是请求和响应的形状不同——翻译在
+[`wb2api/adapters/messages.py`](wb2api/adapters/messages.py)，不含网络代码，所以能被单测钉死。
+
+```bash
+curl -s http://127.0.0.1:8788/v1/messages \
+  -H "x-api-key: sk-..." -H "anthropic-version: 2023-06-01" -H "content-type: application/json" \
+  -d '{"model":"deepseek-v4-flash","max_tokens":256,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+Claude Code 里把它当自定义端点填：`ANTHROPIC_BASE_URL=http://127.0.0.1:8788`、`ANTHROPIC_API_KEY=sk-...`。
+
 ---
 
 ## API Key 能看见什么

@@ -14,7 +14,7 @@
     markup.py       DSML 内联工具调用的增量提取
     sanitize.py     出站请求体反指纹净化（可选）
     models.py       模型目录（/v3/config 优先，TTL + 负缓存 + 磁盘缓存 + 刷新节流）
-    adapters/       协议转换（chat.completions）
+    adapters/       协议转换（chat.completions ↔ Anthropic messages）
     pool.py         选号、五类冷却窗口、会话粘滞、并发槽
     sticky.py       会话 → 账号亲和表（按页换号，防单号被对话绑死）
     service.py      请求编排：鉴权、换号、流式边界、记账
@@ -28,5 +28,5 @@
     cli.py          命令行入口（serve / doctor / version / accounts）
 """
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 __version__ = VERSION

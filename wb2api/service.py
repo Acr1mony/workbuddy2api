@@ -335,6 +335,193 @@ class GatewayService:
             self.pool.release(account)
             self._release_key(key_slot)
 
+    # -- Anthropic Messages 入口 -------------------------------------------
+    def messages(self, request: Any) -> Any:
+        """处理一次 ``POST /v1/messages``（Anthropic 形状）。
+
+        上游只讲 OpenAI，所以这里翻译两次：请求翻成 chat，响应/流再翻回 Anthropic。
+        翻译本身在 ``adapters/messages.py``，这里是编排（选号、重试、记账与 chat 一致）。
+        """
+        from .adapters import messages as msg_adapter
+        from .httpserver import json_response, stream_response
+
+        started = time.time()
+        token = request.bearer() or request.arg("api_key")
+        key = self.authenticate(token)
+
+        body = request.json_body()
+        if not isinstance(body, dict):
+            raise ServiceError("请求体必须是 JSON 对象", 400, "invalid_request")
+        chat_body = msg_adapter.to_chat(body)
+        if not chat_body.get("messages"):
+            raise ServiceError("messages 不能为空", 400, "invalid_request")
+
+        model, realm = self._resolve_model(chat_body, request, key)
+        want_stream = bool(body.get("stream"))
+        prepared = chat_adapter.prepare_request(
+            chat_body,
+            self.catalog.meta_map(realm),
+            sanitize_prompt=str(self.cfg.get("prompt.mode") or "") == "sanitize",
+        )
+        prepared["model"] = model
+        payload = json.dumps(prepared, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+        stick = make_session_key(request.headers, chat_body)
+        if chat_adapter.has_media(chat_body):
+            stick = ""
+        hint = stick if bool(self.cfg.get("upstream.derive_conversation_id", True)) else ""
+        meta = identity.ChatMeta.for_request(
+            chat_body,
+            request.header("X-Trace-Id") or request.header("X-B3-TraceId"),
+            session_hint=hint,
+        )
+        tool_names = _tool_names(prepared)
+        completion_id = "chatcmpl-" + identity.new_message_id()[:24]
+        request_id = "req_" + util.rand_hex(8)
+        request.state["request_id"] = request_id
+        alias = str(request.state.get("model_alias") or "")
+        input_tokens = msg_adapter.count_tokens(body)
+
+        key_slot = self._acquire_key(key)
+        try:
+            account, response, attempts = self._open_upstream(
+                realm=realm, model=model, key=key, stick=stick, payload=payload, meta=meta, request=request
+            )
+        except BaseException:
+            self._release_key(key_slot)
+            raise
+
+        extra_headers = {"X-Request-Id": request_id}
+        if alias:
+            extra_headers["X-Model-Alias"] = alias
+
+        if want_stream:
+            stream = msg_adapter.MessageStream(
+                model, message_id="msg_" + identity.new_message_id()[:24], input_tokens=input_tokens
+            )
+            return stream_response(
+                self._relay_messages(
+                    account=account, response=response, stream=stream, model=model, realm=realm,
+                    key=key, started=started, stick=stick, request_id=request_id,
+                    attempts=attempts, alias=alias, key_slot=key_slot,
+                ),
+                headers=extra_headers,
+            )
+
+        try:
+            lines = list(response.iter_text(float(self.cfg.get("upstream.idle_timeout_seconds", 300))))
+            aggregated = chat_adapter.aggregate(lines, completion_id, model, tool_names)
+            usage = aggregated.get("usage") or {}
+            try:
+                self._record(
+                    started=started, model=model, realm=realm, account=account, key=key,
+                    stream=False, outcome="completed", usage=usage, status=200, ttft=0,
+                    request_id=request_id, attempts=attempts, alias=alias, kind="messages",
+                )
+            except Exception:
+                log.exception("记账失败（%s）", model)
+            self.pool.note_success(account, model=model, session_key=stick)
+            return json_response(msg_adapter.from_chat(aggregated, model), headers=extra_headers)
+        finally:
+            response.close()
+            self.pool.release(account)
+            self._release_key(key_slot)
+
+    def _relay_messages(
+        self,
+        *,
+        account: Any,
+        response: Any,
+        stream: Any,
+        model: str,
+        realm: str,
+        key: Optional[ApiKey],
+        started: float,
+        stick: str = "",
+        request_id: str = "",
+        attempts: int = 1,
+        alias: str = "",
+        key_slot: str = "",
+    ) -> Iterator[bytes]:
+        """把上游的 OpenAI 流重排成 Anthropic 事件流。"""
+        from .adapters import messages as msg_adapter
+
+        idle = float(self.cfg.get("upstream.idle_timeout_seconds", 300))
+        usage: Dict[str, Any] = {}
+        outcome = "completed"
+        error_text = ""
+        ttft = 0.0
+        first = True
+        try:
+            for item in stream.start():
+                yield msg_adapter.stream_frames([item]).__next__()
+            for parsed in sse.iter_sse(response.iter_text(idle)):
+                if parsed.event == "done" or (parsed.data or "").strip() == "[DONE]":
+                    break
+                raw = (parsed.data or "").strip()
+                if not raw:
+                    continue
+                try:
+                    chunk = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(chunk, dict):
+                    continue
+                if chunk.get("usage"):
+                    usage = chunk["usage"] or usage
+                    if first:
+                        # 第一帧就有 usage 的情况很少，真有时至少别把 input_tokens 记成 0
+                        first = False
+                if first:
+                    ttft = (time.time() - started) * 1000.0
+                    first = False
+                for item in stream.feed(chunk):
+                    yield msg_adapter.stream_frames([item]).__next__()
+            for item in stream.finish():
+                yield msg_adapter.stream_frames([item]).__next__()
+        except GeneratorExit:
+            outcome = "client_aborted"
+            raise
+        except UpstreamError as err:
+            outcome = "upstream_aborted"
+            error_text = err.message or str(err)
+            for item in stream.error("上游流中断：" + error_text[:200], "upstream_stream_error"):
+                yield msg_adapter.stream_frames([item]).__next__()
+        except Exception as exc:
+            outcome = "failed"
+            error_text = str(exc)
+            log.exception("Messages 流处理失败 %s/%s", realm, model)
+            for item in stream.error("网关转发失败：" + error_text[:200], "gateway_error"):
+                yield msg_adapter.stream_frames([item]).__next__()
+        finally:
+            self.pool.release(account)
+            self._release_key(key_slot)
+            try:
+                response.close()
+            except Exception:
+                pass
+            if not usage.get("completion_tokens"):
+                usage = dict(usage)
+                usage["completion_tokens"] = stream.output_tokens
+            if not usage.get("prompt_tokens"):
+                usage = dict(usage)
+                usage["prompt_tokens"] = stream.input_tokens
+            try:
+                self._record(
+                    started=started, model=model, realm=realm, account=account, key=key,
+                    stream=True, outcome=outcome, usage=usage,
+                    status=200 if outcome == "completed" else 499, ttft=ttft,
+                    error=error_text, request_id=request_id, attempts=attempts,
+                    alias=alias, kind="messages",
+                )
+            except Exception:
+                log.exception("记账失败（%s）", model)
+            if outcome == "completed":
+                try:
+                    self.pool.note_success(account, model=model, session_key=stick)
+                except Exception:
+                    log.exception("标记成功失败（%s）", model)
+
     # -- 选号 + 出站 --------------------------------------------------------
     def _open_upstream(
         self,
@@ -744,6 +931,7 @@ class GatewayService:
         request_id: str = "",
         attempts: int = 1,
         alias: str = "",
+        kind: str = "chat.completions",
     ) -> None:
         elapsed = int((time.time() - started) * 1000)
         prompt = _num(usage.get("prompt_tokens"))
@@ -762,7 +950,7 @@ class GatewayService:
             "model": model,
             "stream": stream,
             "outcome": outcome,
-            "kind": "chat.completions",
+            "kind": kind,
             "elapsed_ms": elapsed,
             "ttft_ms": int(ttft),
             "prompt_tokens": int(prompt),
