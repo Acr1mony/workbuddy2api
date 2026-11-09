@@ -96,3 +96,40 @@ class DumpTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class RequestBodyTest(unittest.TestCase):
+    """失败报文里必须有我们发出去的请求体，否则 11-128 只能靠猜。"""
+
+    def _diag(self):
+        import shutil
+        from wb2api.diagnostics import Diagnostics
+        tmp = tempfile.mkdtemp(prefix="wb2a-dump-req-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        return Diagnostics(tmp, enabled=True, max_body_bytes=256, daily_max=10)
+
+    def test_request_body_is_stored_and_redacted(self):
+        diag = self._diag()
+        diag.dump(
+            request_id="req_1", model="m", status=400, code="11-128",
+            request_headers={"authorization": "Bearer secret"},
+            body='{"code":"11-128"}',
+            request_body='{"messages":[{"role":"system","content":"sk-abcdefghijklmnop"}]}',
+        )
+        row = diag.get("req_1")
+        self.assertIn("messages", row["request_body"])
+        self.assertNotIn("sk-abcdefghijklmnop", row["request_body"], "请求体里的密钥也要脱敏")
+        self.assertIn("**redacted**", row["request_headers"]["authorization"])
+
+    def test_request_body_is_truncated(self):
+        diag = self._diag()
+        diag.dump(request_id="req_2", body="x", request_body="y" * 1000)
+        row = diag.get("req_2")
+        self.assertTrue(row["request_truncated"])
+        self.assertEqual(len(row["request_body"]), 256, "构造器把下限夹到 256 字节")
+
+    def test_recent_reports_request_size(self):
+        diag = self._diag()
+        diag.dump(request_id="req_3", body="abcd", request_body="0123456789")
+        rows = diag.recent()
+        self.assertEqual(rows[0]["request_size"], 10)
+        self.assertEqual(rows[0]["size"], 4)

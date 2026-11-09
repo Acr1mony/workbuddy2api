@@ -635,7 +635,8 @@ class GatewayService:
                 response = self.client.post(url, headers, raw_body=payload, proxy=proxy)
             except UpstreamError as err:
                 last_error = err
-                self._dump_failure(err, account=account, realm=realm, model=model, url=url, meta=meta, request=request)
+                self._dump_failure(err, account=account, realm=realm, model=model, url=url, meta=meta,
+                                   request=request, payload=payload)
                 if err.kind in ("timeout", "transient") or err.status >= 500:
                     # 链路问题记在出口上：记到账号头上会让一次网络抖动把整池打断
                     self.egress.note_failure(Egress.key_for(url, proxy), err.message or "")
@@ -693,6 +694,7 @@ class GatewayService:
         url: str,
         meta: Any = None,
         request: Any = None,
+        payload: Any = b"",
     ) -> None:
         """把上游这次的拒绝原文留下来。
 
@@ -728,6 +730,7 @@ class GatewayService:
                 message=str(getattr(err, "message", "") or ""),
                 request_headers=headers,
                 body=body,
+                request_body=payload,
             )
         except Exception:
             log.debug("失败报文留存失败", exc_info=True)

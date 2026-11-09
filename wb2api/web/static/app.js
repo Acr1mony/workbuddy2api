@@ -1760,18 +1760,21 @@
           lines.push(name + ": " + headers[name]);
         });
         lines.push("");
+        lines.push("--- 我们发出去的请求体（" + (row.request_truncated ? "已截断" : "完整") + "）---");
+        lines.push(row.request_body || "（没留：这次错误发生在发出之前）");
+        lines.push("");
         lines.push("--- 上游回的 body（" + (row.truncated ? "已截断" : "完整") + "）---");
         lines.push(row.body || "");
         box.hidden = false;
         box.textContent = lines.join("\n");
       })
-      .catch(function (err) { toast("读原文失败：" + err.message, "bad"); });
+      .catch(function (err) { toast("bad", "读原文失败", err.message); });
   }
 
   function loadProxies() {
     api("/api/proxies")
       .then(function (data) { renderProxies(data); })
-      .catch(function (err) { toast("读出口池失败：" + err.message, "bad"); });
+      .catch(function (err) { toast("bad", "读出口池失败", err.message); });
   }
 
   function renderProxies(data) {

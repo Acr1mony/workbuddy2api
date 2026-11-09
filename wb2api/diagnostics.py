@@ -107,8 +107,14 @@ class Diagnostics:
         response_headers: Optional[Dict[str, Any]] = None,
         request_headers: Optional[Dict[str, Any]] = None,
         body: Any = "",
+        request_body: Any = "",
     ) -> str:
-        """留一次被拒请求；返回落盘路径（未启用时返回空串）。"""
+        """留一次被拒请求；返回落盘路径（未启用时返回空串）。
+
+        `body` 是上游回给我们的原文，`request_body` 是我们发出去的那份请求体。
+        两个都要留：11-128 这类"渠道校验"错误只看响应什么都看不出来，必须对照
+        我们到底发了什么（是谁的提示词、哪一句被认成了别家客户端）。
+        """
         if not self.enabled:
             return ""
         day = self._today()
@@ -119,6 +125,10 @@ class Diagnostics:
         if isinstance(text, (bytes, bytearray)):
             text = bytes(text[: self.max_body_bytes]).decode("utf-8", "replace")
         truncated = len(text) > self.max_body_bytes
+        req_text = request_body if isinstance(request_body, str) else (request_body or "")
+        if isinstance(req_text, (bytes, bytearray)):
+            req_text = bytes(req_text[: self.max_body_bytes]).decode("utf-8", "replace")
+        req_truncated = len(req_text) > self.max_body_bytes
         record = {
             "at": time.time(),
             "iso": util.iso(),
@@ -134,6 +144,8 @@ class Diagnostics:
             "message": redact_text(str(message or ""))[:600],
             "truncated": truncated,
             "body": redact_text(text[: self.max_body_bytes]),
+            "request_body": redact_text(req_text[: self.max_body_bytes]),
+            "request_truncated": req_truncated,
             "response_headers": redact_headers(response_headers),
             "request_headers": redact_headers(request_headers),
         }
@@ -170,6 +182,7 @@ class Diagnostics:
                         "code": item.get("code", ""),
                         "message": item.get("message", ""),
                         "size": len(item.get("body", "") or ""),
+                        "request_size": len(item.get("request_body", "") or ""),
                     }
                 )
         rows.sort(key=lambda row: row.get("at") or 0, reverse=True)

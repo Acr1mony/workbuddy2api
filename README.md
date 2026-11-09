@@ -292,6 +292,7 @@ Docker / 服务化部署见 [docs/DEPLOY.md](docs/DEPLOY.md)。
 
 - `data/requests/req-YYYY-MM-DD.jsonl`：一行一个请求（状态、耗时、首字、tokens、积分、`request_id`、客户端 IP/UA），面板「请求」页可按状态/模型/账号/关键字筛。
 - `data/dumps/dump-YYYY-MM-DD.jsonl`：只留**上游拒绝且有 body** 的那些（`11101`/`11129`/`11148`…），请求头脱敏、body 截 8KB、每天最多 200 条。
+- 每条记录里同时有**我们发出去的请求体**（同样脱敏、默认截 8KB）。只留上游那句话是不够的：`11-128` 只说"渠道不对"，到底是哪句话踩线得看我们自己发了什么。
 - `"requests": {"enabled": false}` / `"diagnostics": {"enabled": false}` 可整体关掉。
 
 ### 持续集成
@@ -331,7 +332,7 @@ Docker / 服务化部署见 [docs/DEPLOY.md](docs/DEPLOY.md)。
 | 现象                                    | 大概率原因                                              | 处置                                        |
 | ------------------------------------- | -------------------------------------------------- | ----------------------------------------- |
 | `503 no_account`                      | 没有可用账号（全在冷却/被禁/余额为空）                               | 面板「概览」看池状态；「账号」页看冷却原因                     |
-| `400 fingerprint_rejected` (`11-128`) | 请求体里带了被逐字匹配的特征（Claude Code / Codex CLI 的系统提示等）     | 把 `prompt.mode` 设为 `sanitize`，或换掉客户端自带提示词 |
+| `400 fingerprint_rejected` (`11-128`) | 请求体里带了被逐字匹配的特征（`DeepSeek Harness` 的 GUI 描述句/文件引用段、Claude Code / Codex CLI 的系统提示、`Sisyphus-Junior - … from OhMyOpenCode` 整串等，**是一族不是一条**）     | 默认已开 `prompt.mode=sanitize` 会自动改写；若被关掉就打开它。改完还不行，去面板「请求 → 失败报文」看我们发出去的请求体 |
 | `403 restricted` (`11140`)            | 触发风控                                               | **换号没用，会连坐封号**。停一到两小时，检查客户端/UA 是否被识别      |
 | `403 content_blocked`                 | 内容审核 / 边缘 WAF 拦的（不是 `11140`）                       | 跟账号无关，换号一样被拦：改写触发内容或稍后再来                 |
 | `503 upstream_timeout`                | 上游 120 秒没响应                                        | 稍后重试；网关**不会**替你换号重发（重发可能重复计费）             |

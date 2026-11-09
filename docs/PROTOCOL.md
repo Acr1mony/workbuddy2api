@@ -394,3 +394,42 @@ Classification helpers to copy: `Classify(status, body)` with `hardMarkers` (ins
 - **X-Machine-ID/X-Session-ID 在 chat 上是可选项**：panel 的抓包带（由 uid 稳定派生），hub 5.8.4 的抓包里 chat 不带，
   两边都能跑通 → 说明服务端不依赖它。我们的默认跟 panel（带，更像插件），配置项 upstream.send_stable_ids=false
   可以关掉——如果哪天上游开始按机器 id 做频率风控，这是最后一道退路。计费/刷新端点不受这个开关影响。
+
+### `11-128`：渠道校验是按字面匹配的，而且是一族
+
+错误形态（CN 域实测）：
+
+```json
+{"code":11-128,"msg":"Illegal API invocation from an unapproved channel",
+ "retry_policy":{"retry":false},
+ "displayMsg":{"zh":"请求被拦截，请重新发送"},
+ "displayTips":{"zh":"这次调用没通过渠道校验，可能不是官方客户端发出的。请用官方版本重新发送。"}}
+```
+
+**换号没有用**：校验的是"请求里的这句话像不像官方客户端"，不是账号状态。
+特征如下（都是逐条二分出来的，每条都能单独触发 400）：
+
+| 指纹 | 判据 | 最小改写 |
+| --- | --- | --- |
+| `<X> 的 Web GUI` 描述句 + 紧随其后的 `whose URL the runtime context names.` | **两句连续出现**才算（改前句、改后句、中间插东西三种都能过） | 只调整句尾语序：`whose URL is named in the runtime context.`，品牌全名保留 |
+| `Tokens prefixed with @ are paths the user explicitly referenced.` 起头的文件引用段 | 整段 5 句连排稳定 400，只发前两句 200 | 补一个 `that`（`paths **that** the user`）打断连续 |
+| 品牌 + `this page` / `this GUI` / `this app` 连排 | 单独出现品牌词放行 | 散文里的品牌缩成短名；路径/标识符（`deepseek-harness`）不动 |
+| `You are an AI agent powered by <品牌>.` 一族 | 动词表：powered by / built on / built by / created by / developed by / made by / trained by | 整句换 `You are a helpful AI assistant.` |
+| `<X> - Focused executor from <项目名>` 整串 | 单独出现任一半都放行 | 只截掉 `from <项目名>` 那半句 |
+| `You are Claude Code, Anthropic's official CLI for Claude.` / `You are a coding agent running in the Codex CLI, ...` | 整句 | 自述首段整句换中性句 |
+| 任何消息里出现 `x-anthropic-billing-hdr: ...;` | 键名即触发，与值无关 | 整段剥掉（它没有语义） |
+
+**作用域**：只对 `system` / `developer` / `assistant` 做"自述句"层的中性化；
+`user` / `tool` 里的文本是用户数据，只做"一个词"的最小改写（如 `official CLI for Claude`
+→ `official CLI tool for Claude`）。assistant 历史必须一起处理——多轮对话的第二轮会把
+第一轮那句话原样带回来。
+
+真机对照（`prompt_mode` 切换同一份请求体，2026-11-09 CN 域）：
+
+```text
+passthrough -> 400 code=11-128 "Illegal API invocation from an unapproved channel"
+sanitize    -> 200 "你好"
+```
+
+所以 `prompt.mode` 默认是 `sanitize`。要排查这类问题，面板「请求 → 失败报文」里有
+**我们发出去的请求体**（脱敏、默认截 8KB）——只看上游回的那句 `11-128` 是找不到是哪句话踩线的。
