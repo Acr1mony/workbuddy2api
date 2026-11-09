@@ -27,8 +27,13 @@ class UsageBase(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.dir = self.tmp.name
 
-    def ledger(self, retention_days=7):
-        return UsageLedger(self.dir, retention_days=retention_days)
+    def ledger(self, retention_days=7, **kw):
+        # 默认走同步写：这些用例断言的是"记录有没有落在正确的文件里"，
+        # 异步写线程会让断言与落盘之间产生竞态。异步行为单独有 AsyncWriteTest。
+        kw.setdefault("async_write", False)
+        ledger = UsageLedger(self.dir, retention_days=retention_days, **kw)
+        self.addCleanup(ledger.close)
+        return ledger
 
     def event(self, **kw):
         base = {
@@ -384,6 +389,51 @@ class RecentAfterRestartTest(UsageBase):
         ledger.record(self.event(ts=time.time() - 86400, day=day_of(time.time() - 86400)))
         ledger.record(self.event())
         self.assertEqual([item["model"] for item in ledger.recent(5)], ["deepseek-v3", "deepseek-v3"])
+
+
+class AsyncWriteTest(UsageBase):
+    """写盘不该在请求线程里：入队就返回，落盘由后台线程批量做。"""
+
+    def ledger(self, retention_days=7, **kw):  # 这个类要测的正是异步路径
+        ledger = UsageLedger(self.dir, retention_days=retention_days, **kw)
+        self.addCleanup(ledger.close)
+        return ledger
+
+    def test_records_reach_disk_after_flush(self):
+        ledger = self.ledger()
+        for _ in range(50):
+            ledger.record(self.event())
+        ledger.flush()
+        lines = self.read_lines(ledger.file_for(day_of(time.time())))
+        self.assertEqual(len(lines), 50, "50 条都该落盘，一条不能少")
+
+    def test_summary_shows_queue_backlog_and_fallbacks(self):
+        ledger = self.ledger()
+        ledger.record(self.event())
+        summary = ledger.summary()
+        self.assertIn("queue_backlog", summary)
+        self.assertEqual(summary["inline_fallbacks"], 0)
+        self.assertGreater(summary["max_bytes"], 0)
+
+    def test_rotation_splits_into_parts(self):
+        # 分片阈值调到最小（1MB 下限），灌到超过它就该出现 p001 分片文件。
+        ledger = self.ledger(max_bytes=1024 * 1024)
+        blob = "x" * 4096
+        for _ in range(400):  # ≈1.7MB
+            ledger.record(self.event(pad=blob))
+        ledger.flush()
+        parts = [name for name in os.listdir(ledger.dir) if ".p" in name]
+        self.assertTrue(parts, "超过阈值必须滚动出分片，否则单文件无限长大")
+
+    def test_close_drains_the_queue(self):
+        ledger = self.ledger()
+        for _ in range(20):
+            ledger.record(self.event(model="m-close"))
+        ledger.close()
+        revived = UsageLedger(self.dir, async_write=False)
+        self.addCleanup(revived.close)
+        revived.load()
+        self.assertEqual(revived.summary()["total"]["requests"], 20, "关闭时要排空队列，不能丢尾巴")
 
 
 if __name__ == "__main__":

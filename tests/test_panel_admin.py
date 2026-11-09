@@ -455,5 +455,36 @@ class TestPauseAndPoolViews(ServerCase):
         self.assertEqual(keys["limited"]["max_concurrency"], 2)
 
 
+class TestMetricsAndKeyRate(ServerCase):
+    """指标页与 key 速率上限：面板要能读到刚发生的请求的延迟分布。"""
+
+    def test_metrics_endpoint_shape(self):
+        token = self.panel_token()
+        status, _headers, data = self.request("GET", "/api/metrics", headers={"X-Panel-Token": token})
+        self.assertEqual(status, 200)
+        payload = self.json_of(data)
+        for key in ("window", "requests", "ttfb_ms", "elapsed_ms", "outcomes", "attempts", "models"):
+            self.assertIn(key, payload)
+        self.assertIn("p99", payload["ttfb_ms"])
+        self.assertIn("error_rate", payload["requests"])
+
+    def test_metrics_requires_auth(self):
+        status, _headers, _data = self.request("GET", "/api/metrics")
+        self.assertEqual(status, 401)
+
+    def test_key_rate_limit_round_trip(self):
+        token = self.panel_token()
+        status, _headers, data = self.request(
+            "POST", "/api/settings",
+            {"keys_add": [{"name": "rate-limited", "rate_limit": 30}]},
+            headers={"X-Panel-Token": token},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(self.json_of(data)["added"][0]["rate_limit"], 30)
+        _status, _headers, data = self.request("GET", "/api/settings", headers={"X-Panel-Token": token})
+        keys = {item["name"]: item for item in self.json_of(data)["api_keys"]}
+        self.assertEqual(keys["rate-limited"]["rate_limit"], 30)
+
+
 if __name__ == "__main__":
     unittest.main()

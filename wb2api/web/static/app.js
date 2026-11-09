@@ -298,14 +298,64 @@
       api("/api/usage").catch(function () { return null; }),
       api("/api/usage/recent?limit=20").catch(function () { return null; }),
       api("/api/pool").catch(function () { return null; }),
-      api("/api/scheduler").catch(function () { return null; })
+      api("/api/scheduler").catch(function () { return null; }),
+      api("/api/metrics").catch(function () { return null; })
     ]).then(function (res) {
       renderKpis(res[0]);
       renderRecent(res[1]);
       renderPool(res[2]);
       renderScheduler(res[3]);
+      renderMetrics(res[4]);
       markUpdated();
     });
+  }
+
+  function renderMetrics(metrics) {
+    var host = $("#metrics-body");
+    if (!host) return;
+    if (!metrics || !metrics.window) {
+      host.innerHTML = '<p class="muted">读不到指标</p>';
+      return;
+    }
+    var ttfb = metrics.ttfb_ms || {};
+    var elapsed = metrics.elapsed_ms || {};
+    var requests = metrics.requests || {};
+    var outcomes = metrics.outcomes || {};
+    var attempts = metrics.attempts || {};
+    var models = metrics.models || [];
+    var sampled = (metrics.window && metrics.window.samples) || 0;
+    $("#metrics-note").textContent = sampled
+      ? "最近 " + sampled + " 条样本 · 进程已运行 " + fmtCountdown(metrics.window.uptime_seconds)
+      : "还没有样本";
+
+    var outcomeText = ["completed", "client_aborted", "upstream_aborted", "failed"].map(function (name) {
+      var label = { completed: "完成", client_aborted: "客户端断", upstream_aborted: "上游断", failed: "失败" }[name];
+      return label + " " + fmtNum(outcomes[name] || 0);
+    }).join(" · ");
+    var attemptText = Object.keys(attempts).sort().map(function (key) {
+      return key + "次:" + fmtNum(attempts[key]);
+    }).join(" · ");
+
+    var rows = models.slice(0, 8).map(function (row) {
+      return "<tr><td>" + esc(row.model) + "</td>" +
+        '<td class="num">' + esc(fmtNum(row.requests)) + "</td>" +
+        '<td class="num">' + esc(Math.round(row.avg_ttfb_ms) + "ms") + "</td>" +
+        '<td class="num">' + esc(Math.round(row.avg_elapsed_ms) + "ms") + "</td>" +
+        '<td class="num">' + esc(row.errors ? fmtNum(row.errors) : "—") + "</td></tr>";
+    }).join("");
+
+    host.innerHTML =
+      '<div class="metrics-grid">' +
+        kpi("首字 p50", ttfb.p50 ? Math.round(ttfb.p50) + " ms" : "—", "p90 " + Math.round(ttfb.p90 || 0) + " / p99 " + Math.round(ttfb.p99 || 0)) +
+        kpi("总耗时 p50", elapsed.p50 ? Math.round(elapsed.p50) + " ms" : "—", "p99 " + Math.round(elapsed.p99 || 0) + " ms") +
+        kpi("错误率", requests.sampled ? fmtPct(requests.error_rate) : "—", "样本内 " + fmtNum(requests.errors || 0) + " 次失败", requests.error_rate > 0.2 ? "bad" : (requests.error_rate > 0.05 ? "warn" : "")) +
+        kpi("缓存命中", requests.sampled ? fmtPct(requests.cache_hit_rate) : "—", "按带 prompt 的请求算") +
+      "</div>" +
+      '<p class="tiny muted">结果分布：' + esc(outcomeText) + "</p>" +
+      (attemptText ? '<p class="tiny muted">尝试次数：' + esc(attemptText) + "</p>" : "") +
+      (rows
+        ? '<div class="table-wrap"><table class="data"><thead><tr><th>模型</th><th class="num">请求</th><th class="num">平均首字</th><th class="num">平均总耗时</th><th class="num">失败</th></tr></thead><tbody>' + rows + "</tbody></table></div>"
+        : "");
   }
 
   function kpi(label, value, sub, tone) {
@@ -671,13 +721,41 @@
     html += detailRow("昵称", esc(a.nickname || "—"));
     html += detailRow("域", '<span class="badge">' + esc(a.realm || "cn") + "</span>");
     html += detailRow("UID", '<span class="mono tiny">' + esc(a.uid || "") + "</span>");
-    html += detailRow("状态", a.disabled ? '<span class="badge bad">已停用</span>' : '<span class="badge ok">启用中</span>');
+    html += detailRow("状态", a.disabled ? '<span class="badge bad">已停用</span>' : (a.paused ? '<span class="badge warn">已暂停</span>' : '<span class="badge ok">启用中</span>'));
     html += detailRow("余额", a.credit === null || a.credit === undefined ? '<span class="muted">未知</span>' : esc(fmtCredit(a.credit)));
     html += detailRow("令牌", (a.has_refresh_token ? "可续期" : (a.has_access_token ? "仅 access" : "无令牌")) +
       (a.token_expired ? " · <span class=\"badge bad\">已过期</span>" : ""));
     html += detailRow("到期", esc(a.token_expires_at ? fmtTime(a.token_expires_at) : "—"));
     html += detailRow("在途", esc(String(a.in_flight || 0)));
     html += "</div>";
+
+    // 余额的"钱"视角：这些钱分别什么时候过期。只看总数会在最大那个包到期的
+    // 早上突然变成 0，那时候再排查就晚了。
+    var creditInfo = data.credits || {};
+    var bucketMap = creditInfo.buckets || {};
+    var bucketLabels = { d3: "3 天内到期", d7: "7 天内到期", d30: "30 天内到期", later: "30 天以上", expired: "已过期（不算额度）" };
+    var bucketKeys = Object.keys(bucketLabels).filter(function (key) { return bucketMap[key]; });
+    if (bucketKeys.length || creditInfo.expiring_soon) {
+      html += '<div class="detail-section"><div class="muted tiny">余额什么时候过期</div>';
+      if (creditInfo.expiring_soon) {
+        html += '<div class="badge warn">7 天内要过期 ' + esc(fmtCredit(creditInfo.expiring_soon)) + "</div>";
+      }
+      bucketKeys.forEach(function (key) {
+        html += detailRow(bucketLabels[key], esc(fmtCredit(bucketMap[key])));
+      });
+      if (creditInfo.soonest_expire_at) {
+        html += detailRow("最近一次到期", esc(fmtTime(creditInfo.soonest_expire_at)) + "（" + esc(fmtAgo(creditInfo.soonest_expire_at)) + "）");
+      }
+      html += detailRow("资源包", esc(String(creditInfo.package_count || 0)) + " 个");
+      html += "</div>";
+    }
+    var delta = creditInfo.delta || {};
+    if (delta.samples) {
+      html += '<div class="detail-section"><div class="muted tiny">最近 7 天的余额变化</div>';
+      html += detailRow("净变化", esc((delta.delta > 0 ? "+" : "") + fmtCredit(delta.delta)));
+      html += detailRow("其中消耗", esc(fmtCredit(delta.spent)));
+      html += "</div>";
+    }
 
     if (a.last_error) {
       html += '<div class="detail-section"><div class="muted tiny">最近错误</div>' +
@@ -1010,8 +1088,9 @@
         "<td>" + esc(k.realm || "跟随") + "</td>" +
         '<td class="tiny">' + esc((k.models || []).join(",") || "全部") + "</td>" +
         '<td class="tiny">' + esc(k.max_concurrency ? String(k.max_concurrency) : "不限") + "</td>" +
+        '<td class="tiny">' + esc(k.rate_limit ? String(k.rate_limit) + "/分" : "不限") + "</td>" +
         '<td><button class="ghost tiny-btn danger" data-key-del="' + esc(k.name || k.key) + '">删除</button></td></tr>';
-    }), 6, "还没有 key（客户端不带 key 时走开放模式）");
+    }), 7, "还没有 key（客户端不带 key 时走开放模式）");
   }
 
   function renderTunables(items) {
@@ -1064,7 +1143,9 @@
     var models = $("#key-models").value.split(",").map(function (s) { return s.trim(); }).filter(Boolean);
     var maxConc = parseInt(($("#key-maxconc") && $("#key-maxconc").value) || "0", 10);
     if (!isFinite(maxConc) || maxConc < 0) maxConc = 0;
-    api("/api/settings", { body: { keys_add: [{ name: name, realm: realm, models: models, max_concurrency: maxConc }] } })
+    var rateLimit = parseInt(($("#key-rate") && $("#key-rate").value) || "0", 10);
+    if (!isFinite(rateLimit) || rateLimit < 0) rateLimit = 0;
+    api("/api/settings", { body: { keys_add: [{ name: name, realm: realm, models: models, max_concurrency: maxConc, rate_limit: rateLimit }] } })
       .then(function (data) {
         var created = (data && data.added && data.added[0]) || null;
         var box = $("#key-created");

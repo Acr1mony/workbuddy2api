@@ -29,6 +29,7 @@
 | 403 | `content_blocked` | 内容审核 / 边缘 WAF 拦的（HTML 错误页或审核文案，**不是** `11140`） | 改写触发内容或稍后再来；换号无效 |
 | 429 | `rate_limited` | 真限流 | 看响应头 `Retry-After` 退避重试 |
 | 429 | `key_concurrency_exceeded` | 这把 key 自己的并发上限满了（`max_concurrency`） | 等自己的请求结束，或加并发上限 |
+| 429 | `key_rate_limited` | 这把 key 自己的每分钟速率满了（`rate_limit`，滑动窗口） | 等 `Retry-After` 秒再发 |
 | 503 | `no_account` | 池里没有可用账号（冷却/禁用/暂停/槽满） | 等冷却结束或去面板加号 |
 | 503 | `upstream_unavailable` | 上游 5xx | 稍后重试（有 `Retry-After` 时按它来） |
 | 503 | `upstream_timeout` | 上游超时 | 稍后重试；网关**不会**替你换号重发 |
@@ -238,7 +239,7 @@ X-Panel-Token: 1762500000.9f3c...
 | `POST /api/accounts/{uid}/test` | 真打一次最小 chat（`max_tokens: 16`）确认能用，返回 `{"ok":true,"model":"...","sample":"..."}` |
 | `POST /api/accounts/{uid}/refresh` | 强制刷新令牌 |
 | `POST /api/accounts/{uid}/checkin` | 每日签到（CN 域） |
-| `POST /api/accounts/{uid}/balance` | 查余额并写回账号 |
+| `POST /api/accounts/{uid}/balance` | 查余额并写回账号。返回的不只是一个数字：`{"ok":true,"credits":8954.73,"expiring_soon":4306.73,"soonest_expire_at":1794569253.0,"package_count":84,"buckets":{"d3":0,"d7":4306.73,"d30":4648.0,"later":0,"expired":0}}` —— `buckets` 按到期日把钱分开，`total` 只算未过期的包。读不到余额时 `ok:false` 且 `credits:null`（**不是 0**） |
 | `POST /api/accounts/{uid}/report` | 活跃上报（点亮连登天数 / 解锁 first_buddy）。企业号直接回 `{"ok":false,"message":"企业号没有活跃体系，上报是零收益"}`，**一次请求都不发** |
 | `POST /api/accounts/bulk` | `{"action":"test","uids":["..."]}` 或 `{"action":"disable","all":true,"realm":"cn"}`。`action` ∈ `enable`/`disable`/`pause`/`resume`/`test`/`refresh`/`balance`/`checkin`/`report`；单次最多 200 个；慢操作（测试/续期/查额度/签到/上报）之间会串行错峰，一个号失败不影响其余，返回 `{"ok":true,"total":N,"ok_count":M,"results":[{"uid","ok","detail"}]}`。企业号的 `report` 直接回失败且不打上游（零收益） |
 | `GET /api/accounts/export` | 下载账号备份（`Content-Disposition: attachment`，`Cache-Control: no-store`）。**含明文 refresh token**——不做脱敏，脱敏的备份 restore 不回来等于假备份 |
@@ -283,6 +284,8 @@ X-Panel-Token: 1762500000.9f3c...
 | `GET /api/usage` | 台账汇总：总量、按天/按密钥/按账号/按模型、最近 50 条 |
 | `GET /api/usage/recent?limit=50` | 最近请求明细 |
 | `GET /api/logs?lines=200` | 日志尾部，返回 `{"lines":["...", "..."]}`（只读最后 256KB，不会把大文件读进内存；`lines` 上限 2000） |
+| `GET /api/metrics` | 进程内请求指标（环形缓冲，默认 2000 条样本）：`requests{sampled,errors,error_rate,cache_hit_rate}`、`ttfb_ms{p50,p90,p99,max}`、`elapsed_ms{p50,p90,p99}`、`outcomes{completed,client_aborted,upstream_aborted,failed}`、`attempts{"1"…"4+"}`、`status{2xx,4xx,5xx,none}`、`models[]{model,requests,errors,avg_ttfb_ms,avg_elapsed_ms}`。**重启即清零**，它是"现在健不健康"，不是账 |
+| `GET /api/credits/history?uid=&limit=120&days=30` | 余额变动台账（每次刷新余额记一行：总额、7 天内到期、各桶金额、资源包数、来源）。返回 `{"items":[...],"uid","days"}`，按 `days` 过滤 |
 | `GET /api/pool` | 池状态：可用/冷却/停用/暂停/在途、余额合计、各域策略、风控连坐剩余时间；`affinity` 子对象给出会话粘滞的 `sessions`/`hits`/`misses`/`hit_rate`/`page_size`/`rotations`（命中率低说明粘滞没起作用，首字延迟会变差；`rotations` 高说明有长会话在按页换号）；`model_locks` 是"这个模型被几个号同时挡住、最晚什么时候解"（单号详情只能看到自己那份，这里是全局视图）；`waf` 给出两个域的 WAF 波次状态——`active: true` 意味着近一分钟内有 ≥2 个不同账号被边缘拦截，网关会直接拒掉新请求一分钟，而不是继续换号 |
 | `GET /api/scheduler` | 后台任务清单与上次/下次运行时间 |
 | `POST /api/scheduler/trigger` | `{"job":"keepalive"}` 立刻跑一次；不传 `job` 则跑全部到期任务 |

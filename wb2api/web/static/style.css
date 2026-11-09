@@ -454,3 +454,5 @@ pre.log {
 @media (max-width: 900px) {
   .drawer { width: 100vw; }
 }
+
+.metrics-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:10px}

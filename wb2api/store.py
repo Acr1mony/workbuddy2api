@@ -91,6 +91,10 @@ class Account:
     # --- mutable runtime state (persisted so restarts keep cooldowns) ------
     credit: Optional[float] = None
     credit_at: float = 0.0
+    # 余额的"什么时候过期"视角：{total, expiring_soon, buckets{d3,d7,d30,later,expired},
+    # soonest_expire_at, package_count}。上游把额度拆成几十个包，只看总额会在最大那个
+    # 包到期的早上突然归零，面板必须能说清"这些钱分别什么时候没"。
+    credit_buckets: Dict[str, Any] = field(default_factory=dict)
     cooldown_until: float = 0.0
     cooldown_reason: str = ""
     cooldown_level: str = ""  # "" | "soft" | "hard" | "auth" | "breaker"
@@ -168,6 +172,7 @@ class Account:
             "last_error": self.last_error,
             "credit": self.credit,
             "credit_at": self.credit_at,
+            "credit_buckets": self.credit_buckets,
             "cooldown_until": self.cooldown_until,
             "cooldown_reason": self.cooldown_reason,
             "cooldown_level": self.cooldown_level,
@@ -231,6 +236,7 @@ class Account:
             "last_error": self.last_error,
             "credit": self.credit,
             "credit_at": self.credit_at,
+            "credit_buckets": self.credit_buckets,
             "cooldown_until": self.cooldown_until,
             "cooldown_reason": self.cooldown_reason,
             "cooldown_level": self.cooldown_level,
@@ -284,6 +290,7 @@ class ApiKey:
     groups: List[str] = field(default_factory=list)
     disabled: bool = False
     max_concurrency: int = 0  # 每 key 同时在飞的请求上限；0 = 不限
+    rate_limit: int = 0  # 每分钟请求数上限（RPM）；0 = 不限
     created_at: float = 0.0
     last_used_at: float = 0.0
     requests: int = 0
@@ -302,6 +309,7 @@ class ApiKey:
             "groups": list(self.groups),
             "disabled": self.disabled,
             "max_concurrency": self.max_concurrency,
+            "rate_limit": self.rate_limit,
             "created_at": self.created_at,
             "last_used_at": self.last_used_at,
             "requests": self.requests,

@@ -22,7 +22,15 @@
     "dir": "./logs"
   },
   "usage": {
-    "retention_days": 7
+    "retention_days": 7,
+    "async_write": true,
+    "max_mb": 64
+  },
+  "metrics": {
+    "capacity": 2000
+  },
+  "credits": {
+    "retention_days": 30
   },
   "upstream": {
     "timeout_seconds": 120,

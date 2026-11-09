@@ -217,9 +217,6 @@ class Scheduler:
         return f"renewed={renewed} failed={failed}"
 
     def refresh_balances(self) -> str:
-        from .billing import Billing
-
-        billing = Billing(self.service.client, self.cfg)
         updated = 0
         seen = 0
         for account in self.service.store.list_accounts():
@@ -228,11 +225,11 @@ class Scheduler:
             if seen:
                 _spread()
             seen += 1
-            value = billing.credits(account, account.realm)
-            if value is None:
+            # refresh_credit 顺手把"哪个包快过期"记下来并写一条变动台账——
+            # 只看总额的版本会在最大那个包到期的早上突然变成 0，而面板上什么都查不到。
+            info = self.service.refresh_credit(account, account.realm, note="schedule")
+            if not info.get("ok"):
                 continue
-            account.credit = value
-            account.credit_at = util.now()
             self.service.pool.revive(account, balance_changed=True)
             updated += 1
         if updated:
@@ -348,8 +345,14 @@ class Scheduler:
     def housekeeping(self) -> str:
         self.service.affinity.gc()
         removed = self.service.ledger.prune() if hasattr(self.service.ledger, "prune") else 0
+        credit_rows = 0
+        if hasattr(self.service, "credit_book"):
+            credit_rows = self.service.credit_book.prune()
         aff = self.service.affinity.stats()
-        return f"affinity={aff.get('sessions', 0)} rotated={aff.get('rotations', 0)} pruned={removed}"
+        return (
+            f"affinity={aff.get('sessions', 0)} rotated={aff.get('rotations', 0)} "
+            f"pruned={removed} credits_pruned={credit_rows}"
+        )
 
     def flush(self) -> str:
         self.service.pool.flush()

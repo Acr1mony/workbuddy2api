@@ -130,6 +130,8 @@ def register(router: Router, panel: Panel) -> None:
     router.add("GET", r"/api/usage/recent", lambda req: _usage_recent(panel, req))
     router.add("GET", r"/api/logs", lambda req: _logs(panel, req))
     router.add("GET", r"/api/pool", lambda req: _pool(panel, req))
+    router.add("GET", r"/api/metrics", lambda req: _metrics(panel, req))
+    router.add("GET", r"/api/credits/history", lambda req: _credit_history(panel, req))
     router.add("GET", r"/api/scheduler", lambda req: _scheduler(panel, req))
     router.add("POST", r"/api/scheduler/trigger", lambda req: _scheduler_trigger(panel, req))
 
@@ -356,8 +358,40 @@ def _account_detail(panel: Panel, req: Any, uid: str) -> Response:
                 model: {"until": until, "for": int(max(0.0, float(until or 0) - now))}
                 for model, until in (row.get("model_cooldowns") or {}).items()
             },
+            # "钱"的视角：包清单按到期日排好、最近 30 天的变动，以及净变化。
+            "credits": _credit_view(panel, account),
         }
     )
+
+
+def _credit_view(panel: Panel, account: Any) -> Dict[str, Any]:
+    """余额的三个面：现在有多少、什么时候过期、最近怎么变的。"""
+    buckets = dict(getattr(account, "credit_buckets", {}) or {})
+    history = panel.service.credit_book.history(account.uid, 40) if hasattr(panel.service, "credit_book") else []
+    delta = panel.service.credit_book.delta(account.uid, 7) if hasattr(panel.service, "credit_book") else {}
+    return {
+        "total": getattr(account, "credit", None),
+        "read_at": getattr(account, "credit_at", 0.0) or 0.0,
+        "expiring_soon": buckets.get("expiring_soon") or 0.0,
+        "soonest_expire_at": buckets.get("soonest_expire_at") or 0.0,
+        "buckets": buckets.get("buckets") or {},
+        "package_count": buckets.get("package_count") or 0,
+        "history": history,
+        "delta": delta,
+    }
+
+
+def _credit_history(panel: Panel, req: Any) -> Response:
+    """跨账号的余额变动：``?uid=&limit=&days=``。"""
+    panel.require(req)
+    uid = str(req.arg("uid") or "").strip()
+    limit = int(max(1, min(1000, int(req.arg("limit", 120) or 120))))
+    days = int(max(1, min(365, int(req.arg("days", 30) or 30))))
+    rows = panel.service.credit_book.history(uid, limit) if hasattr(panel.service, "credit_book") else []
+    # `days` 不是装饰：面板按"最近 N 天"取数，台账里可能有更老的样本。
+    cutoff = time.time() - days * 86400
+    rows = [row for row in rows if float(row.get("at") or 0) >= cutoff]
+    return json_response({"items": rows, "uid": uid, "days": days})
 
 
 def _account_action(panel: Panel, req: Any, uid: str, action: str) -> Response:
@@ -405,12 +439,16 @@ def _account_action(panel: Panel, req: Any, uid: str, action: str) -> Response:
         ok, message = panel.billing.checkin(account, account.realm)
         return json_response({"ok": ok, "message": message})
     if action == "balance":
-        value = panel.billing.credits(account, account.realm)
-        if value is not None:
-            account.credit = value
-            account.credit_at = util.now()
-            panel.store.upsert_account(account)
-        return json_response({"ok": value is not None, "credits": value})
+        info = panel.service.refresh_credit(account, account.realm, note="panel")
+        return json_response({
+            "ok": bool(info.get("ok")),
+            "credits": info.get("credits"),
+            "expiring_soon": info.get("expiring_soon"),
+            "buckets": info.get("buckets"),
+            "soonest_expire_at": info.get("soonest_expire_at"),
+            "package_count": info.get("package_count"),
+            "packages": info.get("packages"),
+        })
     if action == "report":
         if getattr(account, "enterprise_id", ""):
             return json_response({"ok": False, "message": "企业号没有活跃体系，上报是零收益"})
@@ -497,13 +535,15 @@ def _bulk_one(panel: Panel, account: Account, action: str) -> Dict[str, Any]:
         panel.store.upsert_account(account)
         return {"ok": True, "detail": "令牌已续期", "expires_at": account.expires_at}
     if action == "balance":
-        value = panel.billing.credits(account, account.realm)
-        if value is not None:
-            account.credit = value
-            account.credit_at = util.now()
-            panel.store.upsert_account(account)
+        info = panel.service.refresh_credit(account, account.realm, note="bulk")
+        value = info.get("credits")
         # unknown is not zero: the account is fine, we just could not read it
-        return {"ok": value is not None, "detail": "读不到余额" if value is None else f"{value:.2f}", "credits": value}
+        return {
+            "ok": bool(info.get("ok")),
+            "detail": "读不到余额" if value is None else f"{value:.2f}",
+            "credits": value,
+            "expiring_soon": info.get("expiring_soon"),
+        }
     if action == "checkin":
         ok, message = panel.billing.checkin(account, account.realm)
         return {"ok": ok, "detail": message}
@@ -759,6 +799,7 @@ def _settings_post(panel: Panel, req: Any) -> Response:
             realm=str(item.get("realm") or ""),
             models=[str(m) for m in models],
             max_concurrency=max(0, int(item.get("max_concurrency") or 0)),
+            rate_limit=max(0, int(item.get("rate_limit") or 0)),
         )
         panel.store.add_key(created)
         # The plaintext key is returned exactly once — the panel cannot show it
@@ -768,6 +809,7 @@ def _settings_post(panel: Panel, req: Any) -> Response:
             "key": created.key,
             "realm": created.realm,
             "max_concurrency": created.max_concurrency,
+            "rate_limit": created.rate_limit,
         })
     deleted = _delete_keys(panel, body.get("keys_delete"))
     return json_response({"ok": True, "added": added, "deleted": deleted})
@@ -804,6 +846,11 @@ def _pool(panel: Panel, req: Any) -> Response:
     # WAF 波次：多个号在一分钟内都被边缘拦过，说明问题在出口而不在账号。
     stats["waf"] = {realm: panel.service.waf_wave(realm) for realm in ("cn", "global")}
     return json_response(stats)
+
+
+def _metrics(panel: Panel, req: Any) -> Response:
+    panel.require(req)
+    return json_response(panel.service.metrics.snapshot())
 
 
 def _scheduler(panel: Panel, req: Any) -> Response:

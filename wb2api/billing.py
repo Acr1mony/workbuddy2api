@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from . import identity
+from .credits import parse_packages
 from .log import get_logger
 from .upstream import UpstreamClient, UpstreamError
 
@@ -81,6 +82,20 @@ class Billing:
         if value is None:
             log.debug("额度响应里没有可识别的字段: %s", _preview(payload))
         return value
+
+    def packages(self, account: Any, realm: str) -> List[Dict[str, Any]]:
+        """把资源包拆成结构化清单（余额、额度、到期时间、是否过期）。
+
+        为什么要拆：上游把余额拆成几十个包，到期日各不相同。只看总数，
+        就会出现"余额还有八千，下周一早上突然归零"——到期的是其中最大那个包。
+        面板要能回答"这些钱分别什么时候过期"。
+        """
+        try:
+            payload = self._call(account, realm, "POST", RESOURCE_PATH, {})
+        except (UpstreamError, ValueError) as exc:
+            log.debug("读取资源包失败 %s: %s", getattr(account, "label", "?"), exc)
+            return []
+        return parse_packages(payload)
 
     def checkin(self, account: Any, realm: str) -> Tuple[bool, str]:
         """每日签到。CN 域才有；企业号会被拒（10001），那是正常的。"""

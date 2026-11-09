@@ -49,9 +49,20 @@ DEFAULTS: Dict[str, Any] = {
         "level": "INFO",
         "dir": "./logs",
     },
-    # 用量台账（append-only JSONL，按天一个文件）
+    # 用量台账（append-only JSONL，按天一个文件、超过 max_mb 自动分片）
     "usage": {
         "retention_days": 7,
+        # 独立写线程落盘：请求线程只入队，慢盘不再拖慢首字延迟
+        "async_write": True,
+        "max_mb": 64,
+    },
+    # 请求级指标（TTFB 分位/outcome 分布），只保留最近 N 条样本，重启即清空
+    "metrics": {
+        "capacity": 2000,
+    },
+    # 余额变动台账（每次刷新一行；回答"钱去哪了"，以及"哪个包下周一过期"）
+    "credits": {
+        "retention_days": 30,
     },
     # --- upstream ----------------------------------------------------------
     "upstream": {

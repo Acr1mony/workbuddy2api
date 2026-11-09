@@ -91,6 +91,34 @@ class BillingBase(unittest.TestCase):
         return Billing(client, FakeCfg()), client
 
 
+class PackagesTest(BillingBase):
+    """`Billing.packages()` 是面板"钱什么时候过期"的唯一来源。
+
+    这条路径以前只有 service 层在用，billing 里少了个 import 也没人发现——
+    真机上表现为余额按钮 500。所以这里直接钉住返回值。
+    """
+
+    def test_packages_returns_structured_rows(self):
+        payload = {
+            "code": 0,
+            "data": {"Response": {"Data": {"Accounts": [
+                {"Name": "A", "CapacityRemainPrecise": "5.5", "CycleEndTime": "2026-11-13 23:59:59", "Status": 0},
+                {"Name": "B", "CapacityRemain": 10, "Status": 0},
+            ]}}},
+        }
+        billing, client = self.flow([payload])
+        rows = billing.packages(self.account(), "cn")
+        self.assertEqual(len(rows), 2)
+        self.assertAlmostEqual(rows[0]["remain"], 5.5)
+        self.assertGreater(rows[0]["expire_at"], 0)
+        self.assertEqual(client.calls[0]["method"], "POST")
+
+    def test_upstream_error_degrades_to_empty_list(self):
+        billing, _client = self.flow([UpstreamError("boom", kind="transient")])
+        self.assertEqual(billing.packages(self.account(), "cn"), [],
+                         "读不到就返回空清单，不能让面板 500")
+
+
 class CreditsTest(BillingBase):
     def credit(self, payload):
         billing, client = self.flow([payload])

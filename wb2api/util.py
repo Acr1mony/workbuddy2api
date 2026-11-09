@@ -414,6 +414,26 @@ def jwt_claims(token: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def to_float(value: Any) -> Optional[float]:
+    """把上游的"数字"转成 float；认不出返回 None。
+
+    上游常把金额写成字符串（`"5.01000004"`），也见过把 0 写成 `""`。
+    这里返回 None 而不是 0.0：**0 是"额度为零"，None 是"读不到"**，
+    两者在 credit_floor 面前的含义完全相反（0 会把账号踢出池）。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
 def normalize_epoch(value: Any) -> float:
     """把上游的时间戳统一成秒级 epoch；认不出就返回 0。
 

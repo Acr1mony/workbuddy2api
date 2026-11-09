@@ -20,6 +20,8 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from . import identity, sse, util
 from .adapters import chat as chat_adapter
+from .billing import Billing
+from .credits import CreditBook, summarize as summarize_credits
 from .egress import Egress
 from .log import get_logger
 from .markup import MARKUP_HINT
@@ -28,7 +30,8 @@ from .pool import Pool
 from .store import ApiKey
 from .sticky import SessionAffinity, session_key as make_session_key
 from .upstream import UpstreamClient, UpstreamError, is_restricted
-from .usage import UsageLedger
+from .metrics import Metrics
+from .usage import DEFAULT_MAX_BYTES, UsageLedger
 
 log = get_logger("service")
 
@@ -36,6 +39,7 @@ MAX_ROTATE = 3  # 再换 3 个号；加上第一次共 4 次尝试
 BACKOFF_BASE = 0.5
 BACKOFF_MAX = 8.0
 CHAT_PATH = "/v2/chat/completions"
+KEY_RATE_WINDOW = 60.0  # 每 key 速率窗口：滑动一分钟，不是固定分钟桶
 
 # 上游业务码。判断"换不换号"全靠它，所以每个都单独命名，别写成裸数字。
 CODE_PROMPT_TOO_LONG = 11115
@@ -123,13 +127,23 @@ class GatewayService:
         self.ledger = UsageLedger(
             store.data_dir if hasattr(store, "data_dir") else "./data",
             retention_days=int(cfg.get("usage.retention_days", 7)) if cfg else 7,
+            async_write=bool(cfg.get("usage.async_write", True)) if cfg else True,
+            max_bytes=int(float(cfg.get("usage.max_mb", 64)) * 1024 * 1024) if cfg else DEFAULT_MAX_BYTES,
         )
         self.ledger.load()
+        # 余额的"钱"视角：资源包清单 + 到期分桶 + 变动台账（回答"钱去哪了"）。
+        self.billing = Billing(self.client, cfg)
+        self.credit_book = CreditBook(
+            store.data_dir if hasattr(store, "data_dir") else "./data",
+            retention_days=int(cfg.get("credits.retention_days", 30)) if cfg else 30,
+        )
         self.max_payload_bytes = int(float(cfg.get("server.max_payload_mb", 16)) * 1024 * 1024) if cfg else 16 * 1024 * 1024
         self.scheduler = None  # 由 app 装配时注入
         self._lock = threading.RLock()
         # 每 key 的在飞计数：一个被 API key 卖出去的额度，不该被一个客户端占满。
         self._key_inflight: Dict[str, int] = {}
+        self._key_hits: Dict[str, List[float]] = {}
+        self.metrics = Metrics(capacity=int(cfg.get("metrics.capacity", 2000)) if cfg else 2000)
         self._key_lock = threading.Lock()
         # WAF 波次：内容被拦是"这份内容"的问题，不是号的问题——但连续踩中说明
         # 出口/阶段已经被盯上，这时候继续换号只是把整池的账号都送上去记一笔。
@@ -140,7 +154,8 @@ class GatewayService:
         try:
             self.pool.flush(force=True)
         finally:
-            self.ledger.flush() if hasattr(self.ledger, "flush") else None
+            # 台账有独立写线程：先排空队列再退出，否则最后几条记录会丢。
+            self.ledger.close()
             self.client.close()
 
     # -- 鉴权 ---------------------------------------------------------------
@@ -171,18 +186,35 @@ class GatewayService:
 
     # -- 每 key 并发 ---------------------------------------------------------
     def _acquire_key(self, key: Optional[ApiKey]) -> str:
-        """占一个 key 名额；超限直接 429。
+        """占一个 key 名额；并发或每分钟速率超限就直接 429。
 
         账号池的并发槽是"保护上游"的，这里是"保护别的使用者"的：一个人挂 20 个
         并发把 3 个槽全占住，其他人就只能在 503 里等——限流该发生在入口，而不是
         让别人排队失败。
+
+        速率用滑动窗口（默认 60 秒）而不是固定分钟桶：固定桶会在整分钟边界上放
+        两倍的量过去，对上游来说就是"前一分钟 0 次、这一分钟 20 次"。
         """
         if key is None or not key.key:
             return ""
         limit = int(getattr(key, "max_concurrency", 0) or 0)
-        if limit <= 0:
-            return ""
+        rpm = int(getattr(key, "rate_limit", 0) or 0)
+        now = time.time()
         with self._key_lock:
+            if rpm > 0:
+                window = [stamp for stamp in self._key_hits.get(key.key, []) if now - stamp < KEY_RATE_WINDOW]
+                if len(window) >= rpm:
+                    oldest = window[0]
+                    self._key_hits[key.key] = window
+                    raise ServiceError(
+                        "这把 API key 的速率上限是 %d 次/分钟，请稍后再试" % rpm,
+                        429, "key_rate_limited", "rate_limit_error",
+                        retry_after=max(0.5, round(KEY_RATE_WINDOW - (now - oldest), 1)),
+                    )
+                window.append(now)
+                self._key_hits[key.key] = window
+            if limit <= 0:
+                return ""
             used = self._key_inflight.get(key.key, 0)
             if used >= limit:
                 raise ServiceError(
@@ -753,6 +785,11 @@ class GatewayService:
         if outcome == "failed":
             event["status"] = status or 502
         self.ledger.record(event)
+        # 指标只留最近 N 条（内存里），和台账的 7 天回放是两件事。
+        try:
+            self.metrics.observe(event)
+        except Exception:
+            log.debug("metrics observe failed", exc_info=True)
         if key is not None and hasattr(self.store, "touch_key"):
             self.store.touch_key(key.key, int(prompt), int(completion))
 
@@ -787,6 +824,62 @@ class GatewayService:
         self._ensure_catalog(realm)
         allowed = key.allows_model if key is not None else None
         return json_response(self.catalog.openai_list(realm, allowed))
+
+    def refresh_credit(self, account: Any, realm: str = "", note: str = "") -> Dict[str, Any]:
+        """刷新一个账号的余额，并把"钱什么时候过期"一起留下。
+
+        返回 ``{ok, credits, expiring_soon, buckets, soonest_expire_at, package_count, read_at}``。
+        读不到时 `credits` 为 None（**不是 0**）：0 会让 `credit_floor` 把号踢出池，
+        None 只是"这次没读到"。
+        """
+        target_realm = realm or getattr(account, "realm", "") or "cn"
+        packages = self.billing.packages(account, target_realm)
+        summary: Dict[str, Any]
+        if packages:
+            summary = summarize_credits(packages)
+        else:
+            # 包清单读不到时退回"只读总数"，至少让面板上的数字是新的。
+            value = self.billing.credits(account, target_realm)
+            summary = {
+                "total": value,
+                "packages": [],
+                "package_count": 0,
+                "expiring_soon": 0.0,
+                "buckets": {},
+                "soonest_expire_at": 0.0,
+            }
+            if value is None:
+                return {"ok": False, "credits": None, "detail": "读不到余额",
+                        "buckets": {}, "expiring_soon": 0.0, "package_count": 0}
+
+        value = summary.get("total")
+        self.store.update_credit(account, value, save=False)
+        account.credit_buckets = {
+            "buckets": summary.get("buckets") or {},
+            "expiring_soon": summary.get("expiring_soon") or 0.0,
+            "soonest_expire_at": summary.get("soonest_expire_at") or 0.0,
+            "package_count": summary.get("package_count") or 0,
+            "total": value,
+            "read_at": util.now(),
+        }
+        if hasattr(self.store, "save_accounts"):
+            try:
+                self.store.save_accounts()
+            except OSError:
+                log.debug("保存余额失败", exc_info=True)
+        self.credit_book.record(
+            getattr(account, "uid", "") or "", target_realm, summary, note=note
+        )
+        return {
+            "ok": value is not None,
+            "credits": value,
+            "expiring_soon": summary.get("expiring_soon") or 0.0,
+            "buckets": summary.get("buckets") or {},
+            "labels": summary.get("labels") or {},
+            "soonest_expire_at": summary.get("soonest_expire_at") or 0.0,
+            "package_count": summary.get("package_count") or 0,
+            "packages": summary.get("packages") or [],
+        }
 
     def _ensure_catalog(self, realm: str) -> None:
         if self.catalog.names(realm):

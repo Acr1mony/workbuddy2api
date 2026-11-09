@@ -321,6 +321,56 @@ class KeyConcurrencyTest(unittest.TestCase):
         self.assertEqual(svc.chat_completions(request).status, 200)
 
 
+class KeyRateTest(unittest.TestCase):
+    """速率是滑动窗口：放过去的量必须真的按分钟算，不能变成"整分钟放两倍"。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="wb2a-keyrate-")
+        self.cfg = Config(None, {"data_dir": self.tmp, "panel": {"enabled": False}})
+        self.store = Store(self.tmp)
+        self.store.upsert_account(Account(uid="r1", id="r1", realm="cn", access_token="tok",
+                                          refresh_token="rt", expires_at=time.time() + 86400))
+
+    def _service(self, rate_limit):
+        from wb2api.store import ApiKey
+
+        key = ApiKey(key="sk-rate", name="rate", realm="cn", rate_limit=rate_limit)
+        self.store.add_key(key)
+        return GatewayService(self.cfg, self.store, client=FakeClient([ok_stream("a") for _ in range(10)]))
+
+    def _request(self):
+        from wb2api.httpserver import Request
+
+        body = json.dumps({
+            "model": "deepseek-v3", "messages": [{"role": "user", "content": "hi"}],
+        }).encode()
+        return Request("POST", "/v1/chat/completions", {}, {"Authorization": "Bearer sk-rate"}, body, ("1.2.3.4", 1))
+
+    def test_over_rpm_is_429_with_retry_after(self):
+        svc = self._service(rate_limit=2)
+        self.assertEqual(svc.chat_completions(self._request()).status, 200)
+        self.assertEqual(svc.chat_completions(self._request()).status, 200)
+        with self.assertRaises(Exception) as ctx:
+            svc.chat_completions(self._request())
+        error = ctx.exception
+        self.assertEqual(getattr(error, "code", ""), "key_rate_limited")
+        self.assertGreater(float(getattr(error, "retry_after", 0) or 0), 0.0)
+
+    def test_window_slides_not_fixed_bucket(self):
+        svc = self._service(rate_limit=1)
+        self.assertEqual(svc.chat_completions(self._request()).status, 200)
+        # 把窗口里那次请求的时间戳往前推：滑动窗口该立刻放行，
+        # 固定分钟桶会继续挡到下一个整分钟。
+        svc._key_hits["sk-rate"] = [time.time() - 61]
+        self.assertEqual(svc.chat_completions(self._request()).status, 200)
+
+    def test_zero_means_unlimited(self):
+        svc = self._service(rate_limit=0)
+        for _ in range(5):
+            self.assertEqual(svc.chat_completions(self._request()).status, 200)
+        self.assertNotIn("sk-rate", svc._key_hits)
+
+
 class WafWaveTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="wb2a-waf-")
