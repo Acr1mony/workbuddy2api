@@ -536,3 +536,11 @@ class ObservabilityTest(unittest.TestCase):
         self.assertEqual(row["client_ip"], "1.2.3.4")
         self.assertTrue(row["request_id"].startswith("req_"))
         self.assertEqual(row["outcome"], "completed")
+
+    def test_non_stream_has_no_ttft(self):
+        # 非流式根本没有"首字"，记 0 会让面板的分位数和逐请求表格说谎。
+        svc, _client = self.service([ok_stream("hi")])
+        svc.chat_completions(self.request({"stream": False}))
+        row = svc.reqlog.recent()[0]
+        self.assertIsNone(row["ttft_ms"])
+        self.assertGreaterEqual(row["elapsed_ms"], 0)

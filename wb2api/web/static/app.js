@@ -344,7 +344,7 @@
     var rows = models.slice(0, 8).map(function (row) {
       return "<tr><td>" + esc(row.model) + "</td>" +
         '<td class="num">' + esc(fmtNum(row.requests)) + "</td>" +
-        '<td class="num">' + esc(Math.round(row.avg_ttfb_ms) + "ms") + "</td>" +
+        '<td class="num">' + esc(row.avg_ttfb_ms == null ? "—" : Math.round(row.avg_ttfb_ms) + "ms") + "</td>" +
         '<td class="num">' + esc(Math.round(row.avg_elapsed_ms) + "ms") + "</td>" +
         '<td class="num">' + esc(row.errors ? fmtNum(row.errors) : "—") + "</td></tr>";
     }).join("");

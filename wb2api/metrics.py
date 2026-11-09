@@ -42,7 +42,11 @@ class Metrics:
 
     # -- ingest -------------------------------------------------------------
     def observe(self, record: Dict[str, Any]) -> None:
-        ttfb = float(record.get("ttfb_ms") or 0)
+        # service 写的键是 ttft_ms；老台账/测试里是 ttfb_ms。只认一个的后果是
+        # 首字延迟永远是 0——面板上"首字 p50 = 0ms"看着像好消息，其实是没读到。
+        ttfb_raw = record.get("ttft_ms", record.get("ttfb_ms"))
+        # 非流式请求没有首字（None）：当成 0 混进分位数，p50 会被拉成"快得不可能"。
+        ttfb = float(ttfb_raw) if ttfb_raw else None
         elapsed = float(record.get("elapsed_ms") or record.get("latency_ms") or 0)
         outcome = str(record.get("outcome") or "completed")
         if outcome not in self._outcomes:
@@ -69,12 +73,15 @@ class Metrics:
                     self._cache_hit += 1
             if model:
                 slot = self._models.setdefault(
-                    model, {"requests": 0, "errors": 0, "ttfb_total": 0.0, "elapsed_total": 0.0}
+                    model,
+                    {"requests": 0, "errors": 0, "ttfb_total": 0.0, "ttfb_samples": 0, "elapsed_total": 0.0},
                 )
                 slot["requests"] += 1
                 if bucket in ("4xx", "5xx", "none"):
                     slot["errors"] += 1
-                slot["ttfb_total"] += ttfb
+                if ttfb is not None:
+                    slot["ttfb_total"] += ttfb
+                    slot["ttfb_samples"] += 1
                 slot["elapsed_total"] += elapsed
             self._samples.append({"ttfb": ttfb, "elapsed": elapsed, "model": model, "ok": bucket == "2xx"})
             del self._samples[:-self.capacity]
@@ -90,7 +97,8 @@ class Metrics:
             cache_hit, cache_known = self._cache_hit, self._cache_known
             started = self._started_at
 
-        ttfb = sorted(sample["ttfb"] for sample in samples)
+        # 只统计"真的有首字"的样本（非流式请求没有），否则分位数会被 0 拉偏。
+        ttfb = sorted(sample["ttfb"] for sample in samples if sample["ttfb"] is not None)
         elapsed = sorted(sample["elapsed"] for sample in samples)
         total = len(samples)
         errors = sum(1 for sample in samples if not sample["ok"])
@@ -101,7 +109,9 @@ class Metrics:
                 "model": name,
                 "requests": requests,
                 "errors": int(slot["errors"]),
-                "avg_ttfb_ms": round(slot["ttfb_total"] / requests, 1) if requests else 0.0,
+                "avg_ttfb_ms": (
+                    round(slot["ttfb_total"] / slot["ttfb_samples"], 1) if slot["ttfb_samples"] else None
+                ),
                 "avg_elapsed_ms": round(slot["elapsed_total"] / requests, 1) if requests else 0.0,
             })
         model_rows.sort(key=lambda row: (-row["requests"], row["model"]))

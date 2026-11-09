@@ -123,6 +123,21 @@ class CacheAndModelTest(unittest.TestCase):
         self.assertEqual(snapshot["requests"]["sampled"], 0)
         self.assertEqual(snapshot["outcomes"]["completed"], 0)
 
+    def test_service_ttft_key_is_read(self):
+        # service 写的是 ttft_ms；只认 ttfb_ms 会让"首字 p50"永远 0。
+        metrics = Metrics()
+        metrics.observe(sample(ttft_ms=250))
+        self.assertAlmostEqual(metrics.snapshot()["ttfb_ms"]["p50"], 250.0, delta=1.0)
+
+    def test_non_stream_samples_do_not_pollute_ttft(self):
+        metrics = Metrics()
+        metrics.observe(sample(ttft_ms=None, elapsed_ms=900))
+        snapshot = metrics.snapshot()
+        self.assertEqual(snapshot["window"]["samples"], 1)
+        self.assertEqual(snapshot["ttfb_ms"]["p50"], 0.0)
+        self.assertIsNone(snapshot["models"][0]["avg_ttfb_ms"])
+
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

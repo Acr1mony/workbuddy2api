@@ -1051,7 +1051,9 @@ class GatewayService:
             "outcome": outcome,
             "kind": kind,
             "elapsed_ms": elapsed,
-            "ttft_ms": int(ttft),
+            # 非流式没有"首字"可言：写 0 会让分位数统计把一堆 0 算成"快得离谱"，
+            # 写 None 让面板显示"—"、让 metrics 直接跳过这个样本。
+            "ttft_ms": int(ttft) if ttft > 0 else None,
             "prompt_tokens": int(prompt),
             "completion_tokens": int(completion),
             "reasoning_tokens": int(reasoning),
