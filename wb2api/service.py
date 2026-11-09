@@ -128,6 +128,12 @@ class GatewayService:
         self.max_payload_bytes = int(float(cfg.get("server.max_payload_mb", 16)) * 1024 * 1024) if cfg else 16 * 1024 * 1024
         self.scheduler = None  # 由 app 装配时注入
         self._lock = threading.RLock()
+        # 每 key 的在飞计数：一个被 API key 卖出去的额度，不该被一个客户端占满。
+        self._key_inflight: Dict[str, int] = {}
+        self._key_lock = threading.Lock()
+        # WAF 波次：内容被拦是"这份内容"的问题，不是号的问题——但连续踩中说明
+        # 出口/阶段已经被盯上，这时候继续换号只是把整池的账号都送上去记一笔。
+        self._waf_hits: Dict[str, List[Tuple[str, float]]] = {}
 
     # -- 生命周期 -----------------------------------------------------------
     def close(self) -> None:
@@ -162,6 +168,44 @@ class GatewayService:
         if header_realm:
             return identity.normalize_realm(header_realm)
         return identity.normalize_realm(str(self.cfg.get("default_realm") or "cn")) if self.cfg else "cn"
+
+    # -- 每 key 并发 ---------------------------------------------------------
+    def _acquire_key(self, key: Optional[ApiKey]) -> str:
+        """占一个 key 名额；超限直接 429。
+
+        账号池的并发槽是"保护上游"的，这里是"保护别的使用者"的：一个人挂 20 个
+        并发把 3 个槽全占住，其他人就只能在 503 里等——限流该发生在入口，而不是
+        让别人排队失败。
+        """
+        if key is None or not key.key:
+            return ""
+        limit = int(getattr(key, "max_concurrency", 0) or 0)
+        if limit <= 0:
+            return ""
+        with self._key_lock:
+            used = self._key_inflight.get(key.key, 0)
+            if used >= limit:
+                raise ServiceError(
+                    "这把 API key 的并发上限是 %d，当前已满" % limit,
+                    429, "key_concurrency_exceeded", "rate_limit_error",
+                    retry_after=1.0,
+                )
+            self._key_inflight[key.key] = used + 1
+        return key.key
+
+    def _release_key(self, slot: str) -> None:
+        if not slot:
+            return
+        with self._key_lock:
+            used = self._key_inflight.get(slot, 0) - 1
+            if used > 0:
+                self._key_inflight[slot] = used
+            else:
+                self._key_inflight.pop(slot, None)
+
+    def key_inflight(self, key: str) -> int:
+        with self._key_lock:
+            return self._key_inflight.get(key, 0)
 
     # -- 主流程 -------------------------------------------------------------
     def chat_completions(self, request: Any) -> Any:
@@ -206,9 +250,14 @@ class GatewayService:
         request.state["request_id"] = request_id
         alias = str(request.state.get("model_alias") or "")
 
-        account, response, attempts = self._open_upstream(
-            realm=realm, model=model, key=key, stick=stick, payload=payload, meta=meta, request=request
-        )
+        key_slot = self._acquire_key(key)
+        try:
+            account, response, attempts = self._open_upstream(
+                realm=realm, model=model, key=key, stick=stick, payload=payload, meta=meta, request=request
+            )
+        except BaseException:
+            self._release_key(key_slot)
+            raise
         extra_headers = {"X-Request-Id": request_id}
         if alias:
             extra_headers["X-Model-Alias"] = alias
@@ -228,10 +277,10 @@ class GatewayService:
                     request_id=request_id,
                     attempts=attempts,
                     alias=alias,
+                    key_slot=key_slot,
                 ),
                 headers=extra_headers,
             )
-
         # 非流式：本地聚合。上游本来只给流，是我们替客户端攒完再回一条完整 JSON。
         # 槽位必须在 finally 里松开：聚合/记账任何一步抛异常都不能把账号永久占住
         # （in_flight 只增不减 = 几个请求之后整域就是 503 no_account）。
@@ -252,6 +301,7 @@ class GatewayService:
         finally:
             response.close()
             self.pool.release(account)
+            self._release_key(key_slot)
 
     # -- 选号 + 出站 --------------------------------------------------------
     def _open_upstream(
@@ -270,6 +320,16 @@ class GatewayService:
         last_error: Optional[UpstreamError] = None
         attempts = 0
         neutralized = False  # 内容审核降级只允许一次
+        wave = self.waf_wave(realm)
+        if wave.get("active"):
+            # 一分钟内两个不同的号都踩到 WAF：这不是内容问题，是出口被抓了。
+            # 直接回给客户端，别再把剩下的号一个个送上去记一笔。
+            raise ServiceError(
+                "上游风控拦截（%s 域近一分钟内多个账号被拦），请 %d 秒后再试"
+                % (realm, int(wave.get("for_seconds") or 60)),
+                403, "content_blocked", "api_error",
+                retry_after=float(wave.get("for_seconds") or 60),
+            )
         while attempts <= MAX_ROTATE:
             attempts += 1
             account = self.pool.select(
@@ -375,6 +435,40 @@ class GatewayService:
             self.pool.note_auth_dead(account, "令牌不可用")
             raise UpstreamError("账号令牌不可用", kind="auth", status=401)
 
+    # -- WAF 波次 ------------------------------------------------------------
+    WAF_WAVE_WINDOW = 60.0
+    WAF_WAVE_UIDS = 2
+    WAF_WAVE_HOLD = 60.0
+
+    def _note_waf_hit(self, realm: str, account: Any) -> None:
+        uid = str(getattr(account, "uid", "") or getattr(account, "id", ""))
+        now = time.time()
+        with self._key_lock:
+            hits = [item for item in self._waf_hits.get(realm, []) if now - item[1] <= self.WAF_WAVE_WINDOW]
+            hits.append((uid, now))
+            self._waf_hits[realm] = hits
+
+    def waf_wave(self, realm: str) -> Dict[str, Any]:
+        """短时间内多个不同账号都踩到 WAF：这是出口/IP 级的问题。
+
+        这时再换号只是把剩下的账号一个个送上去记一笔——而它们本来什么事都没有。
+        停手一分钟，比"全池各被记一次"划算得多。
+        """
+        now = time.time()
+        with self._key_lock:
+            hits = [item for item in self._waf_hits.get(realm, []) if now - item[1] <= self.WAF_WAVE_WINDOW]
+            self._waf_hits[realm] = hits
+        uids = {item[0] for item in hits}
+        active = len(uids) >= self.WAF_WAVE_UIDS
+        until = (max(item[1] for item in hits) + self.WAF_WAVE_HOLD) if hits else 0.0
+        return {
+            "active": active,
+            "uids": len(uids),
+            "realm": realm,
+            "until": until if active else 0.0,
+            "for_seconds": int(max(0.0, until - now)) if active else 0,
+        }
+
     def _absorb(self, account: Any, err: UpstreamError, model: str, realm: str) -> Tuple[bool, bool]:
         """把一次失败记到号上，并决定"换不换号 / 要不要先刷新令牌"。"""
         message = err.message or ""
@@ -391,6 +485,7 @@ class GatewayService:
             # 内容审核 / 边缘 WAF：跟账号健康无关，换号也一样被拦，
             # 而且"换号继续打"正是连坐的形态。给一分钟软冷却，然后把错交给客户端。
             self.pool.note_waf(account, message)
+            self._note_waf_hit(realm, account)
             return False, False
         if code == CODE_PROMPT_TOO_LONG:
             return False, False
@@ -519,6 +614,7 @@ class GatewayService:
         request_id: str = "",
         attempts: int = 1,
         alias: str = "",
+        key_slot: str = "",
     ) -> Iterator[bytes]:
         """把上游流翻译成客户端帧。
 
@@ -576,6 +672,7 @@ class GatewayService:
             # 顺序很重要：先松开槽位，再关连接、记账。记账要落盘，磁盘满/权限问题
             # 抛出来时槽位已经还回去了，不会把账号永久占死。
             self.pool.release(account)
+            self._release_key(key_slot)
             try:
                 response.close()
             except Exception:

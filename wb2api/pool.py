@@ -127,6 +127,8 @@ def unavailable_reason(account: Account, model: str = "", now: Optional[float] =
     remaining = max(0.0, until - now)
     if account.disabled:
         return {"reason": "已禁用", "kind": "disabled", "remaining": 0.0}
+    if getattr(account, "paused", False):
+        return {"reason": "已暂停（人工）", "kind": "paused", "remaining": 0.0}
     if remaining <= 0:
         return {"reason": "", "kind": "", "remaining": 0.0}
     entry = account.model_cooldowns.get(model) or {}
@@ -198,7 +200,9 @@ class Pool:
     def is_ready(self, account: Account, model: str = "", now: Optional[float] = None,
                  ignore_slots: bool = False) -> bool:
         now = util.now() if now is None else now
-        if account.disabled or not (account.access_token or account.static_key):
+        if account.disabled or getattr(account, "paused", False):
+            return False
+        if not (account.access_token or account.static_key):
             return False
         if throttle_until(account, model)[0] > now:
             return False
@@ -675,21 +679,47 @@ class Pool:
             log.error("池状态落盘失败：%s", exc)
 
     # -- 面板 ---------------------------------------------------------------
+    def model_locks(self, accounts: List[Account], now: Optional[float] = None) -> Dict[str, Dict[str, Any]]:
+        """哪些模型被"账号级"挡住了，挡了几个号、最晚什么时候解。
+
+        单个号的详情里能看到它自己的模型冷却，但"这个模型现在整体不可用"是另一个
+        问题——尤其在只有一个号的时候，用户看到的应该是"模型被锁了"，而不是"没有可用账号"。
+        """
+        now = util.now() if now is None else now
+        locks: Dict[str, Dict[str, Any]] = {}
+        for account in accounts:
+            for model, entry in (account.model_cooldowns or {}).items():
+                until = float((entry or {}).get("until", 0) or 0)
+                if until <= now:
+                    continue
+                item = locks.setdefault(model, {"accounts": 0, "until": 0.0, "reason": ""})
+                item["accounts"] += 1
+                if until > item["until"]:
+                    item["until"] = until
+                    item["reason"] = str((entry or {}).get("reason") or "")
+        for item in locks.values():
+            item["for_seconds"] = int(item["until"] - now)
+        return locks
+
     def stats(self, realm: str = "") -> Dict[str, Any]:
         now = util.now()
         accounts = self.store.list_accounts(realm)
-        ready = sum(1 for a in accounts if self.is_ready(a, now=now))
-        cooling = sum(1 for a in accounts if not a.disabled and not self.is_ready(a, now=now))
+        paused = sum(1 for a in accounts if getattr(a, "paused", False) and not a.disabled)
+        active = [a for a in accounts if not a.disabled and not getattr(a, "paused", False)]
+        ready = sum(1 for a in active if self.is_ready(a, now=now))
+        cooling = sum(1 for a in active if not self.is_ready(a, now=now))
         return {
             "realm": realm or "all",
             "total": len(accounts),
             "ready": ready,
             "cooling": cooling,
             "disabled": sum(1 for a in accounts if a.disabled),
+            "paused": paused,
             "in_flight": sum(a.in_flight for a in accounts),
             "credits": round(sum(a.credit or 0 for a in accounts), 2),
             "credit_unknown": sum(1 for a in accounts if a.credit is None),
             "hold_cn_remaining": int(self.realm_hold_remaining("cn", now)),
             "hold_global_remaining": int(self.realm_hold_remaining("global", now)),
             "strategy": {r: self.strategy_for(r) for r in ("cn", "global")},
+            "model_locks": self.model_locks(active, now),
         }

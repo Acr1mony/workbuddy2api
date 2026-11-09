@@ -387,5 +387,73 @@ class TestReportAction(ServerCase):
         self.assertEqual(status, 404)
 
 
+class TestPauseAndPoolViews(ServerCase):
+    """暂停是"人工按住"：既不是停用（令牌还在），也不是冷却（不是上游给的）。"""
+
+    def test_pause_and_resume_round_trip(self):
+        token = self.panel_token()
+        self.app.store.upsert_account(make_account("uid-pause"))
+        status, _headers, data = self.request(
+            "POST", "/api/accounts/uid-pause/pause", headers={"X-Panel-Token": token}
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(self.json_of(data)["paused"])
+        saved = self.app.store.get_account("uid-pause")
+        self.assertTrue(saved.paused)
+        self.assertEqual(saved.state, "paused")
+        self.assertFalse(saved.disabled, "暂停不是停用：令牌和窗口都留着")
+
+        status, _headers, data = self.request(
+            "POST", "/api/accounts/uid-pause/resume", headers={"X-Panel-Token": token}
+        )
+        self.assertEqual(status, 200)
+        self.assertFalse(self.app.store.get_account("uid-pause").paused)
+
+    def test_bulk_pause_and_resume(self):
+        token = self.panel_token()
+        for uid in ("uid-b1", "uid-b2"):
+            self.app.store.upsert_account(make_account(uid))
+        status, _headers, data = self.request(
+            "POST", "/api/accounts/bulk", {"action": "pause", "uids": ["uid-b1", "uid-b2"]},
+            headers={"X-Panel-Token": token},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(self.json_of(data)["ok_count"], 2)
+        self.assertTrue(all(self.app.store.get_account(u).paused for u in ("uid-b1", "uid-b2")))
+
+    def test_pool_exposes_paused_count_model_locks_and_waf(self):
+        token = self.panel_token()
+        account = make_account("uid-lock")
+        self.app.store.upsert_account(account)
+        self.app.panel.pool.block_model(self.app.store.get_account("uid-lock"), "glm-4.6", "no service")
+        paused = make_account("uid-held")
+        paused.paused = True
+        self.app.store.upsert_account(paused)
+
+        status, _headers, data = self.request("GET", "/api/pool", headers={"X-Panel-Token": token})
+        self.assertEqual(status, 200)
+        payload = self.json_of(data)
+        self.assertEqual(payload["paused"], 1)
+        self.assertIn("glm-4.6", payload["model_locks"])
+        self.assertEqual(payload["model_locks"]["glm-4.6"]["accounts"], 1)
+        self.assertIn("waf", payload, "面板要能显示出口被 WAF 盯上了")
+        self.assertFalse(payload["waf"]["cn"]["active"])
+
+    def test_key_concurrency_is_reported_and_validated(self):
+        token = self.panel_token()
+        status, _headers, data = self.request(
+            "POST", "/api/settings",
+            {"keys_add": [{"name": "limited", "max_concurrency": 2}]},
+            headers={"X-Panel-Token": token},
+        )
+        self.assertEqual(status, 200)
+        added = self.json_of(data)["added"][0]
+        self.assertEqual(added["max_concurrency"], 2)
+
+        _status, _headers, data = self.request("GET", "/api/settings", headers={"X-Panel-Token": token})
+        keys = {item["name"]: item for item in self.json_of(data)["api_keys"]}
+        self.assertEqual(keys["limited"]["max_concurrency"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()

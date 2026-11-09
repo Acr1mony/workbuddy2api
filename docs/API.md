@@ -28,7 +28,8 @@
 | 403 | `restricted` | 账号被上游风控（`11140`） | **停止重试**，换号会连坐 |
 | 403 | `content_blocked` | 内容审核 / 边缘 WAF 拦的（HTML 错误页或审核文案，**不是** `11140`） | 改写触发内容或稍后再来；换号无效 |
 | 429 | `rate_limited` | 真限流 | 看响应头 `Retry-After` 退避重试 |
-| 503 | `no_account` | 池里没有可用账号（冷却/禁用/槽满） | 等冷却结束或去面板加号 |
+| 429 | `key_concurrency_exceeded` | 这把 key 自己的并发上限满了（`max_concurrency`） | 等自己的请求结束，或加并发上限 |
+| 503 | `no_account` | 池里没有可用账号（冷却/禁用/暂停/槽满） | 等冷却结束或去面板加号 |
 | 503 | `upstream_unavailable` | 上游 5xx | 稍后重试（有 `Retry-After` 时按它来） |
 | 503 | `upstream_timeout` | 上游超时 | 稍后重试；网关**不会**替你换号重发 |
 | 503 | `account_auth_failed` | 账号令牌失效需要重新登录 | 面板里重新授权 |
@@ -233,12 +234,13 @@ X-Panel-Token: 1762500000.9f3c...
 | `GET /api/accounts/login/poll?state=...` | `{"state":"pending"\|"ok"\|"expired"\|"error","account":{...}}`；`ok` 时账号已入库 |
 | `POST /api/accounts/set` | `{"uid":"...","weight":2,"note":"...","group":"...","proxy":"...","enabled":true}` |
 | `POST /api/accounts/{uid}/enable` / `disable` / `delete` | 启停 / 删除 |
+| `POST /api/accounts/{uid}/pause` / `resume` | **暂停不接单 / 恢复**。暂停既不是停用也不是冷却：令牌、余额、冷却窗口全都留着，只是不参与选号（`paused: true`）。适合"这个号我先留着做备份"或"手工排查时先按住它" |
 | `POST /api/accounts/{uid}/test` | 真打一次最小 chat（`max_tokens: 16`）确认能用，返回 `{"ok":true,"model":"...","sample":"..."}` |
 | `POST /api/accounts/{uid}/refresh` | 强制刷新令牌 |
 | `POST /api/accounts/{uid}/checkin` | 每日签到（CN 域） |
 | `POST /api/accounts/{uid}/balance` | 查余额并写回账号 |
 | `POST /api/accounts/{uid}/report` | 活跃上报（点亮连登天数 / 解锁 first_buddy）。企业号直接回 `{"ok":false,"message":"企业号没有活跃体系，上报是零收益"}`，**一次请求都不发** |
-| `POST /api/accounts/bulk` | `{"action":"test","uids":["..."]}` 或 `{"action":"disable","all":true,"realm":"cn"}`。`action` ∈ `enable`/`disable`/`test`/`refresh`/`balance`/`checkin`/`report`；单次最多 200 个；慢操作（测试/续期/查额度/签到/上报）之间会串行错峰，一个号失败不影响其余，返回 `{"ok":true,"total":N,"ok_count":M,"results":[{"uid","ok","detail"}]}`。企业号的 `report` 直接回失败且不打上游（零收益） |
+| `POST /api/accounts/bulk` | `{"action":"test","uids":["..."]}` 或 `{"action":"disable","all":true,"realm":"cn"}`。`action` ∈ `enable`/`disable`/`pause`/`resume`/`test`/`refresh`/`balance`/`checkin`/`report`；单次最多 200 个；慢操作（测试/续期/查额度/签到/上报）之间会串行错峰，一个号失败不影响其余，返回 `{"ok":true,"total":N,"ok_count":M,"results":[{"uid","ok","detail"}]}`。企业号的 `report` 直接回失败且不打上游（零收益） |
 | `GET /api/accounts/export` | 下载账号备份（`Content-Disposition: attachment`，`Cache-Control: no-store`）。**含明文 refresh token**——不做脱敏，脱敏的备份 restore 不回来等于假备份 |
 | `POST /api/accounts/import` | `{"accounts":[...]}`（也接受裸数组）。merge 语义：同 uid 覆盖，其余保留，**从不删除**；每行独立判定，坏行只计入 `skipped`。返回 `{"ok":true,"added":N,"updated":M,"skipped":K}` |
 | `GET /api/accounts/{uid}` | 单号详情：`{"account":{…账号行 + throttle_for/throttle_reason…},"usage":{requests,ok,errors,prompts…},"recent":[…最近 20 条该号的请求…],"model_cooldowns":{"<model>":{"until","for"}}}`。用来回答"这个号现在为什么不接单" |
@@ -270,7 +272,7 @@ X-Panel-Token: 1762500000.9f3c...
 | 方法与路径 | 说明 |
 | --- | --- |
 | `GET /api/settings` | 当前设置（**密码与 device token 不回明文**）；`tunables` 数组给出可在线修改的调优项（`path`/`label`/`kind`/`restart`/`value`） |
-| `POST /api/settings` | `panel_password`（≥6 位）、`prompt_mode`（`passthrough`\|`sanitize`）、`api_key`、`listen`、`keys_add:[{key,name,realm,models}]`、`keys_delete:[name]`、`tunables:{配置路径: 值}` |
+| `POST /api/settings` | `panel_password`（≥6 位）、`prompt_mode`（`passthrough`\|`sanitize`）、`api_key`、`listen`、`keys_add:[{key,name,realm,models,max_concurrency}]`、`keys_delete:[name]`、`tunables:{配置路径: 值}` |
 
 `tunables` 的写入是**逐项校验**的：`duration` 接受 `"30m"`/`"200ms"` 或纯数字（按秒），`int`/`float` 拒绝负数，`schedule.checkin_hour` 不超过 23，`pool.strategy.*` 只接受 `weighted_random`/`round_robin`/`sequential_exhaust`。任何一项非法整单返回 `400 bad_value`、一个都不写；不认识的路径静默忽略（前向兼容）。`server.max_payload_mb` 标了 `restart: true`，改完要重启进程。
 
@@ -281,7 +283,7 @@ X-Panel-Token: 1762500000.9f3c...
 | `GET /api/usage` | 台账汇总：总量、按天/按密钥/按账号/按模型、最近 50 条 |
 | `GET /api/usage/recent?limit=50` | 最近请求明细 |
 | `GET /api/logs?lines=200` | 日志尾部，返回 `{"lines":["...", "..."]}`（只读最后 256KB，不会把大文件读进内存；`lines` 上限 2000） |
-| `GET /api/pool` | 池状态：可用/冷却/禁用、余额合计、各域策略、风控连坐剩余时间；`affinity` 子对象给出会话粘滞的 `sessions`/`hits`/`misses`/`hit_rate`/`page_size`/`rotations`（命中率低说明粘滞没起作用，首字延迟会变差；`rotations` 高说明有长会话在按页换号） |
+| `GET /api/pool` | 池状态：可用/冷却/停用/暂停/在途、余额合计、各域策略、风控连坐剩余时间；`affinity` 子对象给出会话粘滞的 `sessions`/`hits`/`misses`/`hit_rate`/`page_size`/`rotations`（命中率低说明粘滞没起作用，首字延迟会变差；`rotations` 高说明有长会话在按页换号）；`model_locks` 是"这个模型被几个号同时挡住、最晚什么时候解"（单号详情只能看到自己那份，这里是全局视图）；`waf` 给出两个域的 WAF 波次状态——`active: true` 意味着近一分钟内有 ≥2 个不同账号被边缘拦截，网关会直接拒掉新请求一分钟，而不是继续换号 |
 | `GET /api/scheduler` | 后台任务清单与上次/下次运行时间 |
 | `POST /api/scheduler/trigger` | `{"job":"keepalive"}` 立刻跑一次；不传 `job` 则跑全部到期任务 |
 

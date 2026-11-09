@@ -377,10 +377,20 @@
     var holds = [];
     if (pool.hold_cn_remaining) holds.push("cn 风控暂停 " + fmtCountdown(pool.hold_cn_remaining));
     if (pool.hold_global_remaining) holds.push("global 风控暂停 " + fmtCountdown(pool.hold_global_remaining));
+    var waf = pool.waf || {};
+    Object.keys(waf).forEach(function (realm) {
+      if (waf[realm] && waf[realm].active) {
+        holds.push(realm + " 出口被 WAF 盯上（" + waf[realm].uids + " 个号被拦），停手 " +
+          fmtCountdown(waf[realm].for_seconds));
+      }
+    });
+    var locks = pool.model_locks || {};
+    var lockNames = Object.keys(locks);
     host.innerHTML =
       '<div class="pool-realm">' +
         '<div class="pool-row"><strong>' + fmtNum(pool.ready) + "</strong> 可用 · " +
         fmtNum(pool.cooling) + " 冷却 · " + fmtNum(pool.disabled) + " 停用 · " +
+        (pool.paused ? fmtNum(pool.paused) + " 暂停 · " : "") +
         fmtNum(pool.in_flight) + " 在途</div>" +
         '<div class="pool-bars">' +
           '<i class="ready" style="width:' + width(pool.ready) + '"></i>' +
@@ -390,6 +400,14 @@
         '<div class="muted tiny">余额合计 ' + esc(fmtCredit(pool.credits)) +
         (pool.credit_unknown ? " · " + pool.credit_unknown + " 个号余额未知" : "") + "</div>" +
         affinityLine(pool.affinity) +
+        (lockNames.length
+          ? '<div class="muted tiny" style="margin-top:4px">被锁的模型：' +
+            lockNames.slice(0, 4).map(function (name) {
+              return esc(name) + "（" + locks[name].accounts + " 个号，" +
+                fmtCountdown(locks[name].for_seconds) + "）";
+            }).join("；") +
+            (lockNames.length > 4 ? " 等 " + lockNames.length + " 个" : "") + "</div>"
+          : "") +
       "</div>" +
       (holds.length ? '<div class="muted tiny" style="color:var(--warn)">' + esc(holds.join("；")) + "</div>" : "");
   }
@@ -450,6 +468,7 @@
 
   function accountState(account) {
     if (account.disabled) return { key: "disabled", label: "已停用", tone: "" };
+    if (account.paused) return { key: "paused", label: "已暂停", tone: "warn" };
     var now = Date.now() / 1000;
     var until = Number(account.throttle_for || 0);
     if (until > now) {
@@ -572,6 +591,9 @@
             (a.disabled
               ? '<button class="ghost tiny-btn" data-act="enable">启用</button>'
               : '<button class="ghost tiny-btn" data-act="disable">停用</button>') +
+            (a.paused
+              ? '<button class="ghost tiny-btn" data-act="resume">恢复</button>'
+              : '<button class="ghost tiny-btn" data-act="pause" title="暂停：保留令牌与窗口，只是暂时不接单">暂停</button>') +
             '<button class="ghost tiny-btn danger" data-act="delete">删除</button>' +
           "</div></td>" +
           "</tr>";
@@ -708,7 +730,7 @@
     var labels = {
       enable: "启用账号", disable: "停用账号", delete: "删除账号",
       refresh: "续期令牌", checkin: "签到", balance: "查余额", test: "测试账号",
-      report: "活跃上报"
+      report: "活跃上报", pause: "暂停账号", resume: "恢复账号"
     };
     var text = labels[action] || action;
     var account = state.accounts.filter(function (a) { return a.uid === uid; })[0];
@@ -747,7 +769,8 @@
     if (!uids.length) return;
     var body = { action: action, uids: uids };
     var label = { test: "测试", refresh: "续期", balance: "查额度", enable: "启用",
-                  disable: "停用", checkin: "签到", report: "上报" }[action] || action;
+                  disable: "停用", checkin: "签到", report: "上报",
+                  pause: "暂停", resume: "恢复" }[action] || action;
     toast("", "正在" + label + " " + uids.length + " 个账号…", "逐个发，不会同时打上游");
     api("/api/accounts/bulk", { body: body }).then(function (data) {
       var okCount = (data && data.ok_count) || 0;
@@ -756,7 +779,9 @@
       var tone = failed.length ? "warn" : "ok";
       toast(tone, label + "完成 " + okCount + "/" + total,
         failed.slice(0, 3).map(function (r) { return (r.detail || r.uid.slice(0, 8)); }).join("；"));
-      if (action === "enable" || action === "disable") state.selected = Object.create(null);
+      if (action === "enable" || action === "disable" || action === "pause" || action === "resume") {
+        state.selected = Object.create(null);
+      }
       return loadAccounts(true);
     }).catch(function (err) {
       toast("bad", label + "失败", err.message);
@@ -984,8 +1009,9 @@
         '<td class="mono tiny">' + esc(k.key || "") + "</td>" +
         "<td>" + esc(k.realm || "跟随") + "</td>" +
         '<td class="tiny">' + esc((k.models || []).join(",") || "全部") + "</td>" +
+        '<td class="tiny">' + esc(k.max_concurrency ? String(k.max_concurrency) : "不限") + "</td>" +
         '<td><button class="ghost tiny-btn danger" data-key-del="' + esc(k.name || k.key) + '">删除</button></td></tr>';
-    }), 5, "还没有 key（客户端不带 key 时走开放模式）");
+    }), 6, "还没有 key（客户端不带 key 时走开放模式）");
   }
 
   function renderTunables(items) {
@@ -1036,7 +1062,9 @@
     var name = $("#key-name").value.trim() || ("key-" + Date.now().toString(36).slice(-5));
     var realm = $("#key-realm").value;
     var models = $("#key-models").value.split(",").map(function (s) { return s.trim(); }).filter(Boolean);
-    api("/api/settings", { body: { keys_add: [{ name: name, realm: realm, models: models }] } })
+    var maxConc = parseInt(($("#key-maxconc") && $("#key-maxconc").value) || "0", 10);
+    if (!isFinite(maxConc) || maxConc < 0) maxConc = 0;
+    api("/api/settings", { body: { keys_add: [{ name: name, realm: realm, models: models, max_concurrency: maxConc }] } })
       .then(function (data) {
         var created = (data && data.added && data.added[0]) || null;
         var box = $("#key-created");

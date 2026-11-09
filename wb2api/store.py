@@ -73,6 +73,7 @@ class Account:
     proxy: str = ""  # per-account egress: http://user:pass@host:port
     group: str = ""
     disabled: bool = False
+    paused: bool = False  # 人工"先别用它"：不参与调度，但保留令牌与窗口（与 disabled 区分）
     note: str = ""
     # --- upstream identity -------------------------------------------------
     enterprise_id: str = ""  # 企业号才有；决定签到/成长体系是否可用
@@ -159,6 +160,7 @@ class Account:
             "avatar": self.avatar,
             "group": self.group,
             "disabled": self.disabled,
+            "paused": self.paused,
             "note": self.note,
             "added_at": self.added_at,
             "updated_at": self.updated_at,
@@ -213,6 +215,7 @@ class Account:
             "proxy": self.proxy,
             "group": self.group,
             "disabled": self.disabled,
+            "paused": self.paused,
             "note": self.note,
             "enterprise_id": self.enterprise_id,
             "domain": self.domain,
@@ -280,6 +283,7 @@ class ApiKey:
     accounts: List[str] = field(default_factory=list)  # allowed account uids, empty=all
     groups: List[str] = field(default_factory=list)
     disabled: bool = False
+    max_concurrency: int = 0  # 每 key 同时在飞的请求上限；0 = 不限
     created_at: float = 0.0
     last_used_at: float = 0.0
     requests: int = 0
@@ -297,6 +301,7 @@ class ApiKey:
             "accounts": list(self.accounts),
             "groups": list(self.groups),
             "disabled": self.disabled,
+            "max_concurrency": self.max_concurrency,
             "created_at": self.created_at,
             "last_used_at": self.last_used_at,
             "requests": self.requests,

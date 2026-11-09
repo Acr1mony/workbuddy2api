@@ -35,7 +35,7 @@ LOGIN_MAX_ATTEMPTS = 5
 
 # Bulk-capable actions, and the subset that talks to the upstream (those get
 # spaced out — a batch is still a burst from one egress IP).
-BULK_ACTIONS = ("enable", "disable", "test", "refresh", "balance", "checkin", "report")
+BULK_ACTIONS = ("enable", "disable", "pause", "resume", "test", "refresh", "balance", "checkin", "report")
 SLOW_ACTIONS = ("test", "refresh", "balance", "checkin", "report")
 
 
@@ -119,7 +119,7 @@ def register(router: Router, panel: Panel) -> None:
     router.add("GET", r"/api/accounts/(?P<uid>[^/]+)", lambda req, uid: _account_detail(panel, req, uid))
     router.add(
         "POST",
-        r"/api/accounts/(?P<uid>[^/]+)/(?P<action>enable|disable|delete|test|refresh|checkin|balance|report)",
+        r"/api/accounts/(?P<uid>[^/]+)/(?P<action>enable|disable|pause|resume|delete|test|refresh|checkin|balance|report)",
         lambda req, uid, action: _account_action(panel, req, uid, action),
     )
 
@@ -374,6 +374,16 @@ def _account_action(panel: Panel, req: Any, uid: str, action: str) -> Response:
         account.enabled = False
         panel.store.upsert_account(account)
         return json_response({"ok": True})
+    if action == "pause":
+        account.paused = True
+        account.state = "paused"
+        panel.store.upsert_account(account)
+        return json_response({"ok": True, "paused": True})
+    if action == "resume":
+        account.paused = False
+        account.state = "ready"
+        panel.store.upsert_account(account)
+        return json_response({"ok": True, "paused": False})
     if action == "delete":
         panel.store.remove_account(account.key)
         try:
@@ -468,6 +478,16 @@ def _bulk_one(panel: Panel, account: Account, action: str) -> Dict[str, Any]:
         account.enabled = False
         panel.store.upsert_account(account)
         return {"ok": True, "detail": "已禁用"}
+    if action == "pause":
+        account.paused = True
+        account.state = "paused"
+        panel.store.upsert_account(account)
+        return {"ok": True, "detail": "已暂停"}
+    if action == "resume":
+        account.paused = False
+        account.state = "ready"
+        panel.store.upsert_account(account)
+        return {"ok": True, "detail": "已恢复"}
     if action == "test":
         ok, detail = probe_account(panel.service, account)
         note = detail.get("sample") or detail.get("error") or ""
@@ -738,11 +758,17 @@ def _settings_post(panel: Panel, req: Any) -> Response:
             name=str(item.get("name") or ""),
             realm=str(item.get("realm") or ""),
             models=[str(m) for m in models],
+            max_concurrency=max(0, int(item.get("max_concurrency") or 0)),
         )
         panel.store.add_key(created)
         # The plaintext key is returned exactly once — the panel cannot show it
         # again (it only ever holds the masked form).
-        added.append({"name": created.name, "key": created.key, "realm": created.realm})
+        added.append({
+            "name": created.name,
+            "key": created.key,
+            "realm": created.realm,
+            "max_concurrency": created.max_concurrency,
+        })
     deleted = _delete_keys(panel, body.get("keys_delete"))
     return json_response({"ok": True, "added": added, "deleted": deleted})
 
@@ -775,6 +801,8 @@ def _pool(panel: Panel, req: Any) -> Response:
     # 会话亲和也是池的一部分：命中率低说明粘滞没起作用（TTFT 会很差），
     # rotations 高说明有人在长会话里不停换页。
     stats["affinity"] = panel.service.affinity.stats()
+    # WAF 波次：多个号在一分钟内都被边缘拦过，说明问题在出口而不在账号。
+    stats["waf"] = {realm: panel.service.waf_wave(realm) for realm in ("cn", "global")}
     return json_response(stats)
 
 

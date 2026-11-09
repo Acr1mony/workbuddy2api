@@ -234,5 +234,153 @@ class RandHexTest(unittest.TestCase):
         int(value, 16)  # 不是十六进制会抛 ValueError
 
 
+class PausedAccountTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="wb2a-paused-")
+        self.cfg = Config(None, {"data_dir": self.tmp, "panel": {"enabled": False}})
+        self.store = Store(self.tmp)
+        self.store.upsert_account(Account(uid="p1", id="p1", realm="cn", access_token="tok",
+                                          refresh_token="rt", expires_at=time.time() + 86400))
+        self.svc = GatewayService(self.cfg, self.store, client=FakeClient([ok_stream("hi")]))
+
+    def test_paused_account_is_not_picked(self):
+        self.store.get_account("p1").paused = True
+        from wb2api.httpserver import Request
+
+        request = Request("POST", "/v1/chat/completions", {}, {}, json.dumps({
+            "model": "deepseek-v3", "messages": [{"role": "user", "content": "hi"}],
+        }).encode(), ("1.2.3.4", 1))
+        with self.assertRaises(Exception) as ctx:
+            self.svc.chat_completions(request)
+        self.assertEqual(getattr(ctx.exception, "code", ""), "no_account", "暂停不该变成别的原因")
+
+    def test_paused_survives_restart_and_is_reported(self):
+        account = self.store.get_account("p1")
+        account.paused = True
+        account.state = "paused"
+        self.store.upsert_account(account)
+        again = Store(self.tmp)
+        again.load()
+        self.assertTrue(again.get_account("p1").paused, "暂停要能重启后还记得")
+        self.assertTrue(again.get_account("p1").masked()["paused"])
+
+    def test_pool_reports_paused_separately_from_cooling(self):
+        account = self.store.get_account("p1")
+        account.paused = True
+        self.store.upsert_account(account)
+        stats = self.svc.pool.stats("cn")
+        self.assertEqual(stats["paused"], 1)
+        self.assertEqual(stats["cooling"], 0, "暂停不是冷却，面板上得分开说")
+
+    def test_unavailable_reason_says_paused(self):
+        from wb2api.pool import unavailable_reason
+
+        account = self.store.get_account("p1")
+        account.paused = True
+        info = unavailable_reason(account)
+        self.assertEqual(info["kind"], "paused")
+
+
+class KeyConcurrencyTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="wb2a-keyslot-")
+        self.cfg = Config(None, {"data_dir": self.tmp, "panel": {"enabled": False}})
+        self.store = Store(self.tmp)
+        self.store.upsert_account(Account(uid="k1", id="k1", realm="cn", access_token="tok",
+                                          refresh_token="rt", expires_at=time.time() + 86400))
+
+    def test_second_request_over_the_limit_is_429(self):
+        from wb2api.store import ApiKey
+        from wb2api.httpserver import Request
+
+        key = ApiKey(key="sk-lim", name="limited", realm="cn", max_concurrency=1)
+        self.store.add_key(key)
+        svc = GatewayService(self.cfg, self.store, client=FakeClient([ok_stream("a"), ok_stream("b")]))
+        body = json.dumps({
+            "model": "deepseek-v3", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        }).encode()
+        first = Request("POST", "/v1/chat/completions", {}, {"Authorization": "Bearer sk-lim"}, body, ("1.2.3.4", 1))
+        response = svc.chat_completions(first)  # 流没消费，名额还占着
+        second = Request("POST", "/v1/chat/completions", {}, {"Authorization": "Bearer sk-lim"}, body, ("1.2.3.4", 2))
+        with self.assertRaises(Exception) as ctx:
+            svc.chat_completions(second)
+        self.assertEqual(getattr(ctx.exception, "code", ""), "key_concurrency_exceeded")
+        list(response.stream)
+        third = Request("POST", "/v1/chat/completions", {}, {"Authorization": "Bearer sk-lim"}, body, ("1.2.3.4", 3))
+        self.assertEqual(svc.chat_completions(third).status, 200, "上一次结束后名额要还回来")
+
+    def test_no_limit_means_no_counter(self):
+        from wb2api.httpserver import Request
+
+        svc = GatewayService(self.cfg, self.store, client=FakeClient([ok_stream("a")]))
+        self.assertEqual(svc.key_inflight("anything"), 0)
+        request = Request("POST", "/v1/chat/completions", {}, {}, json.dumps({
+            "model": "deepseek-v3", "messages": [{"role": "user", "content": "hi"}],
+        }).encode(), ("1.2.3.4", 1))
+        self.assertEqual(svc.chat_completions(request).status, 200)
+
+
+class WafWaveTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="wb2a-waf-")
+        self.cfg = Config(None, {"data_dir": self.tmp, "panel": {"enabled": False}})
+        self.store = Store(self.tmp)
+        for uid in ("w1", "w2", "w3"):
+            self.store.upsert_account(Account(uid=uid, id=uid, realm="cn", access_token="tok-" + uid,
+                                              refresh_token="rt-" + uid, expires_at=time.time() + 86400))
+
+    def test_two_distinct_accounts_trip_the_wave(self):
+        svc = GatewayService(self.cfg, self.store, client=FakeClient([ok_stream("a")]))
+        self.assertFalse(svc.waf_wave("cn")["active"])
+        svc._note_waf_hit("cn", self.store.get_account("w1"))
+        self.assertFalse(svc.waf_wave("cn")["active"], "一个号踩到只是内容问题")
+        svc._note_waf_hit("cn", self.store.get_account("w2"))
+        wave = svc.waf_wave("cn")
+        self.assertTrue(wave["active"])
+        self.assertEqual(wave["uids"], 2)
+        self.assertGreater(wave["for_seconds"], 0)
+
+    def test_wave_short_circuits_before_touching_any_account(self):
+        from wb2api.httpserver import Request
+
+        client = FakeClient([ok_stream("a")])
+        svc = GatewayService(self.cfg, self.store, client=client)
+        svc._note_waf_hit("cn", self.store.get_account("w1"))
+        svc._note_waf_hit("cn", self.store.get_account("w2"))
+        request = Request("POST", "/v1/chat/completions", {}, {}, json.dumps({
+            "model": "deepseek-v3", "messages": [{"role": "user", "content": "hi"}],
+        }).encode(), ("1.2.3.4", 1))
+        with self.assertRaises(Exception) as ctx:
+            svc.chat_completions(request)
+        self.assertEqual(getattr(ctx.exception, "code", ""), "content_blocked")
+        self.assertEqual(client.calls, [], "波次生效时不该再打上游")
+
+    def test_wave_is_per_realm(self):
+        svc = GatewayService(self.cfg, self.store, client=FakeClient([ok_stream("a")]))
+        account = self.store.get_account("w1")
+        svc._note_waf_hit("cn", account)
+        svc._note_waf_hit("cn", self.store.get_account("w2"))
+        self.assertTrue(svc.waf_wave("cn")["active"])
+        self.assertFalse(svc.waf_wave("global")["active"])
+
+
+class ModelLockViewTest(unittest.TestCase):
+    def test_pool_stats_aggregates_model_locks(self):
+        tmp = tempfile.mkdtemp(prefix="wb2a-locks-")
+        cfg = Config(None, {"data_dir": tmp, "panel": {"enabled": False}})
+        store = Store(tmp)
+        for uid in ("m1", "m2"):
+            store.upsert_account(Account(uid=uid, id=uid, realm="cn", access_token="tok-" + uid,
+                                         refresh_token="rt-" + uid, expires_at=time.time() + 86400))
+        svc = GatewayService(cfg, store, client=FakeClient([]))
+        svc.pool.block_model(store.get_account("m1"), "glm-4.6", "no service")
+        svc.pool.block_model(store.get_account("m2"), "glm-4.6", "no service")
+        locks = svc.pool.stats("cn")["model_locks"]
+        self.assertIn("glm-4.6", locks)
+        self.assertEqual(locks["glm-4.6"]["accounts"], 2)
+        self.assertGreater(locks["glm-4.6"]["for_seconds"], 0)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
