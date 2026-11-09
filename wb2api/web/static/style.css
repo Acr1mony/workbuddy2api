@@ -456,3 +456,201 @@ pre.log {
 }
 
 .metrics-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:10px}
+
+
+/* ---- 设置页：左侧目录 + 单列全宽 ------------------------------------- */
+.settings-layout {
+  display: grid;
+  grid-template-columns: 168px minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.settings-nav {
+  position: sticky;
+  top: 64px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px;
+  background: var(--bg-card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.settings-nav button {
+  text-align: left;
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  padding: 7px 9px;
+  border-radius: 7px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.settings-nav button:hover { background: var(--bg-hover); color: var(--text); }
+
+.settings-nav button.active {
+  background: var(--bg-hover);
+  color: var(--text);
+  font-weight: 600;
+}
+
+.settings-body { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+
+/* 每个设置项单独占满一行：不要再左右并排挤成两列 */
+.set-block .field {
+  display: block;
+  width: 100%;
+  margin-bottom: 12px;
+}
+
+.set-block .field input[type="text"],
+.set-block .field input[type="password"],
+.set-block .field input[type="number"],
+.set-block .field select,
+.set-block .field textarea {
+  display: block;
+  width: 100%;
+  margin-top: 5px;
+  box-sizing: border-box;
+}
+
+.set-form {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 10px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--line);
+}
+
+.set-form .field { margin-bottom: 0; }
+
+@media (max-width: 900px) {
+  .settings-layout { grid-template-columns: 1fr; }
+  .settings-nav { position: static; flex-direction: row; flex-wrap: wrap; }
+  .settings-nav button { flex: 0 0 auto; }
+}
+
+/* ---- 多选下拉（限定模型） -------------------------------------------- */
+.ms { position: relative; }
+
+.ms-control {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  min-height: 34px;
+  padding: 4px 6px;
+  background: var(--bg-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  cursor: text;
+}
+
+.ms-control:focus-within { border-color: var(--accent); }
+
+.ms-chips { display: flex; flex-wrap: wrap; gap: 5px; }
+
+.ms-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: var(--bg-hover);
+  border: 1px solid var(--line);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.ms-chip button {
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 0 1px;
+  font-size: 13px;
+  line-height: 1;
+}
+
+.ms-chip button:hover { color: var(--bad); }
+
+.ms-input {
+  flex: 1 1 140px;
+  min-width: 120px;
+  border: 0 !important;
+  background: transparent !important;
+  margin: 0 !important;
+  padding: 3px 2px !important;
+  outline: none;
+}
+
+.ms-menu {
+  position: absolute;
+  z-index: 30;
+  left: 0;
+  right: 0;
+  top: calc(100% + 4px);
+  background: var(--bg-card);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.22);
+  overflow: hidden;
+}
+
+.ms-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.ms-list { max-height: 260px; overflow-y: auto; padding: 4px; }
+
+.ms-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 7px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.ms-item:hover { background: var(--bg-hover); }
+.ms-item input { accent-color: var(--accent); }
+.ms-item .ms-id { font-family: var(--mono); }
+.ms-item .ms-realm { margin-left: auto; color: var(--muted); font-size: 11px; }
+.ms-empty { padding: 10px; color: var(--muted); font-size: 12px; text-align: center; }
+
+
+/* .field input 是给"单行输入框"写的（display:block; width:100%），
+   多选框和复选框落在 .field 里会被它撑成一列。这里按更具体的层级改回来。 */
+.ms .ms-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ms .ms-item input[type="checkbox"] {
+  display: inline-block;
+  width: 15px;
+  height: 15px;
+  min-width: 15px;
+  margin: 0;
+  flex: 0 0 auto;
+  accent-color: var(--accent);
+}
+
+.ms .ms-item .ms-id { font-size: 12px; }
+
+.ms .ms-input {
+  display: block;
+  width: auto;
+  flex: 1 1 140px;
+  margin: 0 !important;
+}

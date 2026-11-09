@@ -1142,6 +1142,189 @@
     }).join("");
   }
 
+  // ---- 限定模型的多选下拉 -------------------------------------------------
+  // 可选项来自上游目录（/api/models），而不是让用户背模型名：拼错一个字母的代价
+  // 是"这把 key 什么模型都用不了"，而且看起来像网关坏了。
+  var modelPick = { all: [], selected: [], loaded: false };
+
+  function addModelChoice(id) {
+    var value = (id || "").trim();
+    if (!value) return;
+    if (modelPick.selected.indexOf(value) === -1) modelPick.selected.push(value);
+    renderModelChips();
+    renderModelList($("#key-models-search").value);
+  }
+
+  function removeModelChoice(id) {
+    modelPick.selected = modelPick.selected.filter(function (item) { return item !== id; });
+    renderModelChips();
+    renderModelList($("#key-models-search").value);
+  }
+
+  function renderModelChips() {
+    var host = $("#key-models-chips");
+    if (!host) return;
+    host.innerHTML = modelPick.selected.map(function (id) {
+      return '<span class="ms-chip">' + esc(id) +
+        '<button type="button" data-drop="' + esc(id) + '" title="移除">\u00d7</button></span>';
+    }).join("");
+    var count = $("#key-models-count");
+    if (count) {
+      count.textContent = modelPick.selected.length
+        ? "\u5df2\u9009 " + modelPick.selected.length + " / \u5171 " + modelPick.all.length
+        : "\u672a\u9009\uff08= \u5168\u90e8\u6a21\u578b\uff09";
+    }
+  }
+
+  function renderModelList(filter) {
+    var host = $("#key-models-list");
+    if (!host) return;
+    var needle = (filter || "").trim().toLowerCase();
+    var rows = modelPick.all.filter(function (item) {
+      if (!needle) return true;
+      return (item.id || "").toLowerCase().indexOf(needle) !== -1 ||
+        (item.name || "").toLowerCase().indexOf(needle) !== -1;
+    });
+    if (!rows.length) {
+      host.innerHTML = '<div class="ms-empty">' +
+        (modelPick.all.length ? "\u6ca1\u6709\u5339\u914d\u7684\u6a21\u578b"
+          : "\u8fd8\u6ca1\u6709\u6a21\u578b\u76ee\u5f55\u2014\u2014\u5148\u53bb\u300c\u8d26\u53f7\u300d\u9875\u52a0\u4e00\u4e2a\u53f7") +
+        "</div>";
+      return;
+    }
+    host.innerHTML = rows.map(function (item) {
+      var checked = modelPick.selected.indexOf(item.id) !== -1;
+      return '<label class="ms-item">' +
+        '<input type="checkbox" data-pick="' + esc(item.id) + '"' + (checked ? " checked" : "") + ">" +
+        '<span class="ms-id">' + esc(item.id) + "</span>" +
+        '<span class="muted tiny">' + esc(item.name || "") + "</span>" +
+        '<span class="ms-realm">' + esc(item.realm) + "</span></label>";
+    }).join("");
+  }
+
+  function openModelMenu(open) {
+    var menu = $("#key-models-menu");
+    if (!menu) return;
+    menu.hidden = !open;
+    if (open) {
+      loadModelChoices(false);
+      renderModelList($("#key-models-search").value);
+    }
+  }
+
+  function loadModelChoices(force) {
+    if (modelPick.loaded && !force) return;
+    api("/api/models").then(function (data) {
+      modelPick.all = (data && data.models) || [];
+      modelPick.loaded = true;
+      renderModelChips();
+      renderModelList($("#key-models-search").value);
+    }).catch(function (err) {
+      modelPick.loaded = true;
+      toast("warn", "\u6a21\u578b\u76ee\u5f55\u6ca1\u8bfb\u51fa\u6765", err.message);
+    });
+  }
+
+  function bindModelPicker() {
+    var box = $("#key-models");
+    if (!box) return;
+    var search = $("#key-models-search");
+
+    $("#key-models-control").addEventListener("click", function (ev) {
+      if (ev.target.closest("[data-drop]")) return;
+      openModelMenu(true);
+      search.focus();
+    });
+
+    $("#key-models-chips").addEventListener("click", function (ev) {
+      var btn = ev.target.closest("[data-drop]");
+      if (!btn) return;
+      ev.stopPropagation();
+      removeModelChoice(btn.getAttribute("data-drop"));
+    });
+
+    $("#key-models-list").addEventListener("change", function (ev) {
+      var input = ev.target.closest("[data-pick]");
+      if (!input) return;
+      if (input.checked) addModelChoice(input.getAttribute("data-pick"));
+      else removeModelChoice(input.getAttribute("data-pick"));
+    });
+
+    search.addEventListener("input", function () { renderModelList(search.value); });
+
+    search.addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape") { openModelMenu(false); return; }
+      if (ev.key !== "Enter") return;
+      ev.preventDefault();
+      var value = search.value.trim();
+      if (!value) return;
+      // \u7cbe\u786e\u547d\u4e2d\u5c31\u5207\u6362\uff0c\u5426\u5219\u5f53\u6210\u901a\u914d\uff08glm-*\uff09\u76f4\u63a5\u52a0\u4e00\u4e2a chip
+      var exact = modelPick.all.filter(function (item) {
+        return item.id.toLowerCase() === value.toLowerCase();
+      })[0];
+      if (exact) {
+        if (modelPick.selected.indexOf(exact.id) === -1) addModelChoice(exact.id);
+        else removeModelChoice(exact.id);
+      } else {
+        addModelChoice(value);
+      }
+      search.value = "";
+      renderModelList("");
+    });
+
+    $("#key-models-all").addEventListener("click", function () {
+      modelPick.selected = modelPick.all.map(function (item) { return item.id; });
+      renderModelChips();
+      renderModelList(search.value);
+    });
+
+    $("#key-models-none").addEventListener("click", function () {
+      modelPick.selected = [];
+      renderModelChips();
+      renderModelList(search.value);
+    });
+
+    document.addEventListener("click", function (ev) {
+      if (!box.contains(ev.target)) openModelMenu(false);
+    });
+
+    renderModelChips();
+  }
+
+  // ---- 设置页左侧目录 -----------------------------------------------------
+  function bindSettingsNav() {
+    var nav = $("#settings-nav");
+    if (!nav) return;
+    var buttons = Array.prototype.slice.call(nav.querySelectorAll("button[data-target]"));
+
+    function setActive(target) {
+      buttons.forEach(function (btn) {
+        btn.classList.toggle("active", btn.getAttribute("data-target") === target);
+      });
+    }
+
+    nav.addEventListener("click", function (ev) {
+      var btn = ev.target.closest("button[data-target]");
+      if (!btn) return;
+      var target = btn.getAttribute("data-target");
+      var section = document.getElementById(target);
+      if (!section) return;
+      setActive(target);
+      section.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+
+    if (typeof IntersectionObserver === "function") {
+      var observer = new IntersectionObserver(function (entries) {
+        entries.forEach(function (entry) {
+          if (entry.isIntersecting) setActive(entry.target.id);
+        });
+      }, { root: null, rootMargin: "-8% 0px -70% 0px", threshold: 0 });
+      $$("#page-settings .set-block").forEach(function (block) { observer.observe(block); });
+    }
+
+    setActive(buttons.length ? buttons[0].getAttribute("data-target") : "");
+  }
+
   function saveSettings() {
     var body = {};
     var listen = $("#set-listen").value.trim();
@@ -1178,7 +1361,7 @@
   function addKey() {
     var name = $("#key-name").value.trim() || ("key-" + Date.now().toString(36).slice(-5));
     var realm = $("#key-realm").value;
-    var models = $("#key-models").value.split(",").map(function (s) { return s.trim(); }).filter(Boolean);
+    var models = modelPick.selected.slice();
     var maxConc = parseInt(($("#key-maxconc") && $("#key-maxconc").value) || "0", 10);
     if (!isFinite(maxConc) || maxConc < 0) maxConc = 0;
     var rateLimit = parseInt(($("#key-rate") && $("#key-rate").value) || "0", 10);
@@ -1196,7 +1379,9 @@
           toast("ok", "已创建 " + name, "");
         }
         $("#key-name").value = "";
-        $("#key-models").value = "";
+        modelPick.selected = [];
+        renderModelChips();
+        renderModelList("");
         loadSettings();
       })
       .catch(function (err) { toast("bad", "创建失败", err.message); });
@@ -1446,7 +1631,7 @@
     });
 
     // 设置
-    $("#set-save").addEventListener("click", saveSettings);
+    $$(".set-save").forEach(function (btn) { btn.addEventListener("click", saveSettings); });
     $("#tunables-save").addEventListener("click", saveTunables);
     if ($("#copy-guide")) {
       $("#copy-guide").addEventListener("click", function () {
@@ -1628,7 +1813,7 @@
 
   function addProxy() {
     var url = ($("#proxy-url").value || "").trim();
-    if (!url) { toast("先填出口地址，例如 socks5h://user:pass@host:1080", "warn"); return; }
+    if (!url) { toast("warn", "先填出口地址，例如 socks5://user:pass@host:1080"); return; }
     proxyMutate({
       action: "add",
       url: url,
@@ -1687,6 +1872,8 @@
   function main() {
     bind();
     bindObservability();
+    bindModelPicker();
+    bindSettingsNav();
     setAddMode("link");
     // 走到这里说明绑定都成功了；index.html 用它区分"脚本没跑"和"脚本跑了但没登录"。
     window.__WB2A_READY = true;

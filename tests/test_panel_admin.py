@@ -574,3 +574,106 @@ class TestObservability(ServerCase):
         for path in ("/api/requests", "/api/dumps", "/api/proxies"):
             status, _headers, _data = self.request("GET", path)
             self.assertEqual(status, 401, path)
+
+class _FakeInfo(object):
+    """只放 catalog_view 真正会读的字段，避免把 ModelInfo 的全套依赖拖进测试。"""
+
+    def __init__(self, model_id, name, realm, max_output=0, context_length=0, alias_of=""):
+        self.id = model_id
+        self.name = name
+        self.realm = realm
+        self.max_output = max_output
+        self.context_length = context_length
+        self.alias_of = alias_of
+
+
+class TestModelCatalog(ServerCase):
+    """面板"限定模型"下拉要可选项：两个域合并、能按域过滤、隐藏模型不出现。"""
+
+    def _stub(self):
+        by_realm = {
+            "cn": [
+                _FakeInfo("deepseek-v4-flash", "DeepSeek V4 Flash", "cn", max_output=0),
+                _FakeInfo("hidden-one", "Hidden", "cn"),
+            ],
+            "global": [
+                _FakeInfo("glm-5.3", "GLM 5.3", "global", max_output=16000, context_length=200000),
+                _FakeInfo("gpt-4o", "GPT-4o", "global", alias_of="deepseek-v4-flash"),
+            ],
+        }
+
+        class _Catalog(object):
+            def entries(self, realm, account=None, chat_only=True):
+                return by_realm.get(realm, [])
+
+            def hidden(self, model_id):
+                return model_id == "hidden-one"
+
+        self.service.catalog = _Catalog()
+        self.service._ensure_catalog = lambda realm: None
+
+    def test_requires_login(self):
+        status, _headers, _data = self.request("GET", "/api/models")
+        self.assertEqual(status, 401)
+
+    def test_lists_both_realms_and_skips_hidden(self):
+        self._stub()
+        token = self.panel_token()
+        status, _headers, data = self.request("GET", "/api/models", headers={"X-Panel-Token": token})
+        self.assertEqual(status, 200)
+        payload = self.json_of(data)
+        ids = [row["id"] for row in payload["models"]]
+        self.assertNotIn("hidden-one", ids, "面板里藏起来的模型不该出现在下拉里")
+        self.assertEqual(ids, ["deepseek-v4-flash", "glm-5.3", "gpt-4o"], "按 域→id 排序")
+        self.assertEqual(payload["total"], 3)
+        self.assertEqual(payload["realms"], {"cn": 1, "global": 2})
+
+    def test_keeps_capabilities_and_alias(self):
+        self._stub()
+        token = self.panel_token()
+        _status, _headers, data = self.request("GET", "/api/models", headers={"X-Panel-Token": token})
+        rows = {row["id"]: row for row in self.json_of(data)["models"]}
+        self.assertEqual(rows["glm-5.3"]["max_output_tokens"], 16000)
+        self.assertEqual(rows["glm-5.3"]["context_length"], 200000)
+        self.assertEqual(rows["gpt-4o"]["alias_of"], "deepseek-v4-flash")
+        self.assertNotIn("max_output_tokens", rows["deepseek-v4-flash"],
+                         "0 表示不知道，不要编一个数字出来")
+
+    def test_realm_filter(self):
+        self._stub()
+        token = self.panel_token()
+        _status, _headers, data = self.request(
+            "GET", "/api/models?realm=global", headers={"X-Panel-Token": token}
+        )
+        payload = self.json_of(data)
+        self.assertEqual([row["id"] for row in payload["models"]], ["glm-5.3", "gpt-4o"])
+        self.assertEqual(payload["realms"], {"global": 2})
+
+
+class TestSettingsPageLayout(ServerCase):
+    """设置页改版后的结构：左侧目录 + 每项一行，两者缺一个都没法用。"""
+
+    def test_settings_page_has_nav_and_blocks(self):
+        token = self.panel_token()
+        status, _headers, data = self.request("GET", "/panel/", headers={"X-Panel-Token": token})
+        self.assertEqual(status, 200)
+        html = data.decode("utf-8")
+        self.assertIn('id="settings-nav"', html)
+        for block in ("set-gateway", "set-keys", "set-prompt", "set-proxies", "set-tunables", "set-guide"):
+            self.assertIn('data-target="%s"' % block, html)
+            self.assertIn('id="%s"' % block, html)
+
+    def test_model_picker_markup(self):
+        token = self.panel_token()
+        _status, _headers, data = self.request("GET", "/panel/", headers={"X-Panel-Token": token})
+        html = data.decode("utf-8")
+        for anchor in ("key-models-control", "key-models-chips", "key-models-search",
+                       "key-models-menu", "key-models-list", "key-models-all", "key-models-none"):
+            self.assertIn('id="%s"' % anchor, html)
+
+    def test_proxy_hint_says_socks5(self):
+        token = self.panel_token()
+        _status, _headers, data = self.request("GET", "/panel/", headers={"X-Panel-Token": token})
+        html = data.decode("utf-8")
+        self.assertIn("socks5://", html)
+        self.assertNotIn("socks5h", html, "socks5h 是 curl 的写法，用户填进来会连不上")

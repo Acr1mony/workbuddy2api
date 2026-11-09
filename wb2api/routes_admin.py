@@ -131,6 +131,7 @@ def register(router: Router, panel: Panel) -> None:
     router.add("GET", r"/api/logs", lambda req: _logs(panel, req))
     router.add("GET", r"/api/pool", lambda req: _pool(panel, req))
     router.add("GET", r"/api/metrics", lambda req: _metrics(panel, req))
+    router.add("GET", r"/api/models", lambda req: _models(panel, req))
     router.add("GET", r"/api/credits/history", lambda req: _credit_history(panel, req))
     router.add("GET", r"/api/scheduler", lambda req: _scheduler(panel, req))
     router.add("POST", r"/api/scheduler/trigger", lambda req: _scheduler_trigger(panel, req))
@@ -864,6 +865,12 @@ def _pool(panel: Panel, req: Any) -> Response:
 def _metrics(panel: Panel, req: Any) -> Response:
     panel.require(req)
     return json_response(panel.service.metrics.snapshot())
+
+
+def _models(panel: Panel, req: Any) -> Response:
+    """配 key 时用的模型清单：两个域合在一起，让"限定模型"能做成多选。"""
+    panel.require(req)
+    return json_response(panel.service.catalog_view(req.arg("realm") or ""))
 
 
 def _scheduler(panel: Panel, req: Any) -> Response:
