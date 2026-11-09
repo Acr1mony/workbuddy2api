@@ -93,7 +93,7 @@ curl -fsSL .../install.sh | WB2A_REF=v1.2.0 bash
 
 装完它会把面板地址、`wb2a login` 的用法和下一步提示直接打出来。升级＝重跑同一条命令（`data/` 不会被碰）。
 
-> 仓库目前是私有的：`curl` 下载那一行需要带权限的 PAT（`WB2A_TOKEN=ghp_xxx`）；想用纯公开命令，把仓库改成 public 即可。
+> 仓库是公开的，上面那行 `curl` 直接可用。如果你 fork 到了私有仓库，下载时给个 PAT 即可：`WB2A_TOKEN=ghp_xxx`。
 
 ### 安装为命令（可选）
 
@@ -126,17 +126,38 @@ wb2a login --no-wait --json # 只要链接（脚本/远程会话用）
 | --- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 请求体 | `stream` 强制为真、`max_completion_tokens` 翻译、GPT 系 `max_tokens` 抬到 ≥16、`tool_choice` 对象→字符串、`stop` 字符串→数组、工具名/schema 修复、`developer→system`、图片部件归一、工具消息配对（合并/重排/剔孤儿）、推理模型 `thinking` + `reasoning_effort` 双发、历史 `reasoning_content` 回填、glm 类模型缺档位时补最省的一档（否则 11150） |
 | 请求头 | 完整会话头族（`X-Conversation-ID` 等 5 个 id、`X-Machine-ID`/`X-Session-ID` 由 uid 派生、`X-CodeBuddy-Request: 1`）、按域切换 UA / Origin / `X-Domain`                                                                                                |
-| 响应  | SSE → OpenAI 流式（含 `delta.reasoning_content`、`tool_calls` 增量）；非流式在本地聚合；正文里漏出来的 DSML 工具标记被抠成真正的 `tool_calls`                                                                                                                        |
+| 响应  | SSE → OpenAI 流式（含 `delta.reasoning_content`、`tool_calls` 增量）；非流式在本地聚合；正文里漏出来的 DSML 工具标记被抠成真正的 `tool_calls`；每个响应都带 `X-Request-Id`（台账里能按它反查这一条） |
 | 账号  | 令牌自动刷新（单飞，防一次性 refresh token 被并发烧掉）、6 小时前置保活（刷越勤越危险）、余额查询、每日签到                                                                                                                                                                       |
 | 池   | 加权随机选号、会话粘滞（同一对话尽量打同一账号，否则上游 prefix 缓存全废；一个会话最多钉 3 轮就换页，见 `session_sticky.page_size`）、并发槽、软冷却/熔断/降级/风控连坐五类时间窗、失败转移最多 3 次                                                                                                                                                      |
 | 防封  | 同账号最小间隔 200ms、定时任务随机错峰、403 分三路处置（11140 风控 / 边缘 WAF / 凭证失效，风控绝不换号）、内容审核打回时摘掉系统提示词重试一次、媒体请求不绑会话、连接池按凭据分池、半读连接不回池、链路抖动记在出口上而不是账号上、每天一次活跃上报（点连登，企业号跳过）、配额到期用 16 token 的探针验证而不是让真实流量去撞（`upstream.send_stable_ids=false` 可关掉 chat 上的机器 id 头族、`models.min_refresh_seconds` 给目录刷新节流）                                                        |
-| 观测  | 每请求一行 JSONL 台账（tokens、TTFT、命中缓存、账套、账号）、面板实时 KPI                                                                                                                                                                                   |
+| 观测  | 每请求一行 JSONL 台账（tokens、TTFT、命中缓存、账套、账号、`request_id`、`attempts`）、面板实时 KPI |
+| 稳   | 并发槽在 `finally` 里释放（异常、客户端半路断开都不会漏）、状态文件坏了就拒绝启动而不是静默清空、连接读写有超时（慢客户端拖不死网关）、面板页面带 CSP/X-Frame-DENY 且不带 CORS |
 
 ---
 
 ## API Key 能看见什么
 
 GET /v1/models 会按这把 key 的 models（白名单，支持 prefix*）和 excluded_models 过滤：**看得见的就等于调得动的**。直接点名一个没开的模型会回 403 model_not_allowed（不是 404——模型是好的，是你的 key 没开），客户端不用靠猜。
+
+列表里每条还带 `max_output_tokens`（上游给的输出预算）和 `context_length` / `context_window`（可配，见下）——客户端靠这两个数决定什么时候该自己截断历史，缺了它只能瞎猜。
+
+## 模型别名
+
+客户端里写死的模型名往往不是你账号能用的那个（`gpt-4o`、`claude-sonnet-4` 之类）。在配置里登记一行就能把名字接过来，不用改客户端：
+
+```json
+{
+  "models": {
+    "aliases":       { "gpt-4o": "deepseek-v4-flash", "sonnet": "default-1.2" },
+    "context_lengths": { "deepseek-v4-flash": 128000 }
+  }
+}
+```
+
+- 别名会出现在 `/v1/models` 里（带 `alias_of` 指向真名），也继承真名的能力与限制。
+- 出站请求的 `model` 会被换成真名；响应头回一句 `X-Model-Alias: gpt-4o`，让你知道自己写的名字被解析成了什么。
+- key 的白名单里写别名或写真名都放行——否则"配了别名却调不动"。
+- 别名指向一个不存在的模型时，它不会出现在列表里（宁可看不见，也不要调过去报 11102）。
 
 ## 面板
 

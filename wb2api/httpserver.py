@@ -171,9 +171,18 @@ class Request:
 
     @property
     def client_ip(self) -> str:
-        forwarded = self.header("x-forwarded-for")
-        if forwarded:
-            return forwarded.split(",")[0].strip()
+        """调用方 IP。
+
+        ``X-Forwarded-For`` 只有站在反向代理后面时才可信：默认不认它，否则任何人
+        带一个头就能绕过面板登录限流、也能把上游头里的 IP 字段伪造成想要的值。
+        """
+        if getattr(self, "trust_proxy", False):
+            forwarded = self.header("x-forwarded-for")
+            if forwarded:
+                return forwarded.split(",")[0].strip()
+            real = self.header("x-real-ip")
+            if real:
+                return real.strip()
         return self.client[0] if self.client else ""
 
     # -- body ---------------------------------------------------------------
@@ -356,9 +365,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
     def _parse(self) -> Request:
         parsed = urllib.parse.urlsplit(self.path)
         query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
-        max_bytes = int(getattr(self.server.app.service, "max_payload_bytes", 16 * 1024 * 1024))
+        service = getattr(self.server.app, "service", None)  # type: ignore[attr-defined]
+        max_bytes = int(getattr(service, "max_payload_bytes", 16 * 1024 * 1024))
         body = self._read_body(max_bytes)
-        return Request(
+        req = Request(
             method=self.command,
             path=urllib.parse.unquote(parsed.path),
             query=query,
@@ -366,14 +376,33 @@ class GatewayHandler(BaseHTTPRequestHandler):
             body=body,
             client=self.client_address,
         )
+        # X-Forwarded-For 只有站在反代后面才可信，默认不认：否则任何人都能带着
+        # 一个头绕过面板登录限流，还能决定发给上游的 IP 字段。
+        req.trust_proxy = bool(service is not None and service.cfg.get("server.trust_proxy", False))
+        return req
 
     def _write(self, resp: Response) -> None:
         try:
+            panel_path = urllib.parse.urlsplit(self.path).path
+            is_panel = panel_path.startswith("/panel")
             self.send_response(resp.status)
             self.send_header("Content-Type", resp.content_type)
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, x-api-key, anthropic-version")
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            if not is_panel:
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, x-api-key, anthropic-version")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+            else:
+                # 面板是自己的前端，不需要跨源能力；但要把"被别的站点包进 iframe"
+                # 和"页面里跑外站脚本"这两条掐掉。
+                self.send_header("X-Frame-Options", "DENY")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header(
+                    "Content-Security-Policy",
+                    "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+                    "script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; "
+                    "base-uri 'none'; form-action 'self'",
+                )
             for key, value in resp.headers.items():
                 self.send_header(key, value)
             streaming = resp.stream is not None
@@ -392,9 +421,19 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 self.wfile.write(resp.body)
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
-            raise
+            self.close_connection = True
         except OSError as exc:
             log.debug("write failed: %s", exc)
+        finally:
+            # 流式生成器必须显式 close：里面的 finally 才是还槽位、记账的地方。
+            # 客户端半路断开时 CPython 迟早会回收它，但"迟早"可能是一小时后，
+            # 期间这个账号的 in_flight 一直挂着。
+            stream = getattr(resp, "stream", None)
+            if stream is not None:
+                try:
+                    stream.close()  # type: ignore[union-attr]
+                except Exception:
+                    pass
 
     def _write_chunked(self, frames: Iterable[bytes]) -> None:
         count = 0
@@ -441,12 +480,31 @@ class GatewayHandler(BaseHTTPRequestHandler):
         resp.headers["Content-Length"] = "0"
         self._write(resp)
 
+    def _timeout(self, name: str, default: float) -> float:
+        service = getattr(self.server.app, "service", None)  # type: ignore[attr-defined]
+        try:
+            value = float(service.cfg.get(name, default) or default) if service is not None else default
+        except (TypeError, ValueError):
+            return default
+        return value if value > 0 else default
+
     def _handle(self) -> None:
         app: Application = self.server.app  # type: ignore[attr-defined]
+        # 连接必须有超时：一个只发半行请求头、或者声明 16MB 却逐字节发送的客户端，
+        # 会让这条线程永远卡在 read 上；不读响应的客户端会让 write 永远阻塞。
+        # 每连接一线程 → 几十个这样的连接就能把网关拖死。
+        try:
+            self.connection.settimeout(self._timeout("server.request_timeout", 30.0))
+        except (AttributeError, OSError):
+            pass
         try:
             req = self._parse()
         except BadRequest as exc:
             self._write(error_response(exc.status, exc.message, exc.code))
+            return
+        except OSError:
+            # 读超时/对端断开：直接收工，别让异常冒到线程栈里
+            self.close_connection = True
             return
         try:
             resp = app.dispatch(req)
@@ -458,6 +516,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
         except Exception as exc:  # pragma: no cover - defensive
             log.exception("dispatch failed for %s %s", req.method, req.path)
             resp = error_response(500, f"internal error: {exc}", "internal_error")
+        try:
+            self.connection.settimeout(self._timeout("server.write_timeout_seconds", 120.0))
+        except (AttributeError, OSError):
+            pass
         self._write(resp)
 
 

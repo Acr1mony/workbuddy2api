@@ -362,7 +362,10 @@ class Store:
     # -- load / save --------------------------------------------------------
     def load(self) -> None:
         with self._lock:
-            raw_accounts = util.read_json(self._path(ACCOUNT_FILE), {})
+            # 严格解析：这两个文件读错了会变成"空账号池 / 没有 key 继续跑"，
+            # 随后下一次 save 把空库写回去——等于一夜之间把账号和密钥全丢了。
+            # 损坏时 read_json 已经备份成 .corrupt-<ts>，这里直接抛给上层退出。
+            raw_accounts = util.read_json(self._path(ACCOUNT_FILE), {}, strict=True)
             self.accounts = {}
             if isinstance(raw_accounts, dict):
                 entries = raw_accounts.get("accounts", raw_accounts)
@@ -383,7 +386,7 @@ class Store:
                 if account.key:
                     self.accounts[account.key] = account
 
-            raw_keys = util.read_json(self._path(KEY_FILE), [])
+            raw_keys = util.read_json(self._path(KEY_FILE), [], strict=True)
             self.keys = {}
             if isinstance(raw_keys, dict):
                 raw_keys = raw_keys.get("keys", [])

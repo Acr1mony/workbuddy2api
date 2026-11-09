@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -237,7 +238,12 @@ class ServiceTest(unittest.TestCase):
 
     # -- 辅助 ---------------------------------------------------------------
     def test_parse_reset_clock(self):
-        stamp = parse_reset_clock("额度将在 2026-11-08 04:00:00 重置")
+        # 上游时钟是 UTC+8 的墙上时间；断言"大致等于我给的时刻"而不是"大于现在"，
+        # 否则这条用例会在那一天之后自己烂掉（写过一次，第二天就红了）。
+        target = datetime.now(timezone(timedelta(hours=8))) + timedelta(days=1)
+        text = "额度将在 %s 重置" % target.strftime("%Y-%m-%d %H:%M:%S")
+        stamp = parse_reset_clock(text)
+        self.assertAlmostEqual(stamp, target.timestamp(), delta=1.5)
         self.assertGreater(stamp, time.time())
 
     def test_parse_reset_clock_garbage(self):

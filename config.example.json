@@ -6,8 +6,10 @@
   "log_level": "INFO",
   "server": {
     "max_payload_mb": 16,
-    "request_timeout": 300,
-    "shutdown_grace": 5
+    "request_timeout": 30,
+    "write_timeout_seconds": 120,
+    "shutdown_grace": 5,
+    "trust_proxy": false
   },
   "panel": {
     "enabled": true,
@@ -111,6 +113,8 @@
   "models": {
     "hidden": [],
     "default": "",
+    "aliases": {},
+    "context_lengths": {},
     "min_refresh_seconds": 30
   },
   "prompt": {

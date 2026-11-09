@@ -22,6 +22,7 @@ import socket
 import ssl
 import threading
 import time
+import zlib
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from . import identity, sse, util
@@ -275,6 +276,28 @@ class UpstreamResponse:
         # 只有"整段 body 都读完了"的连接才允许回池。半读的连接里还留着上一条流的残帧，
         # 放回去会让下一个请求读到别人的数据（协议错位，比不复用严重得多）。
         self._consumed = False
+        # 上游偶尔无视 Accept-Encoding 直接回 gzip：不解压的话 SSE 里全是二进制，
+        # 一行 data: 都看不见，客户端只会收到一段空回复，日志里还一句错都没有。
+        self._encoding = self.headers.get("content-encoding", "").lower().strip()
+        self._inflate = None
+
+    def _decode(self, data: bytes) -> bytes:
+        if not data or self._encoding not in ("gzip", "deflate"):
+            return data
+        if self._inflate is None:
+            self._inflate = zlib.decompressobj(16 + zlib.MAX_WBITS if self._encoding == "gzip" else zlib.MAX_WBITS)
+        try:
+            return self._inflate.decompress(data)
+        except zlib.error as exc:
+            raise UpstreamError(f"upstream body decode failed: {exc}", kind="transient", status=self.status, retryable=True)
+
+    def _finish_decode(self) -> bytes:
+        if self._inflate is None:
+            return b""
+        try:
+            return self._inflate.flush()
+        except zlib.error:
+            return b""
 
     @property
     def content_type(self) -> str:
@@ -290,8 +313,14 @@ class UpstreamResponse:
             data = self._raw.read(min(65536, limit - total))
             if not data:
                 break
+            data = self._decode(data)
+            if not data:
+                continue
             chunks.append(data)
             total += len(data)
+        tail = self._finish_decode()
+        if tail:
+            chunks.append(tail)
         return b"".join(chunks)
 
     def text(self, limit: int = 1_000_000) -> str:
@@ -322,7 +351,13 @@ class UpstreamResponse:
                         pass
                 chunk = self._raw.read(4096)
                 if not chunk:
+                    tail = self._finish_decode()
+                    if tail:
+                        buffer += tail
                     break
+                chunk = self._decode(chunk)
+                if not chunk:
+                    continue
                 buffer += chunk
                 while b"\n" in buffer:
                     line, buffer = buffer.split(b"\n", 1)
@@ -389,6 +424,9 @@ class _ConnPool:
                         pass
                     continue
                 return conn
+            # 桶空了就把 key 删掉：池键里带凭据指纹，而刷新令牌是轮换的，
+            # 一天下来每个账号会留下几十个永远空的键（字典只增不减）。
+            self._idle.pop(key, None)
         return None
 
     def release(self, key: str, conn: http.client.HTTPConnection, reusable: bool = True) -> None:

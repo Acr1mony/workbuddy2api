@@ -15,7 +15,7 @@ import threading
 import time
 from typing import Any, List, Optional
 
-from . import VERSION
+from . import VERSION, util
 from .app import banner, build
 from .config import Config
 from .log import get_logger, setup as setup_logging
@@ -90,19 +90,36 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"workbuddy2api {VERSION}")
         return 0
 
-    cfg = _config(args)
+    try:
+        cfg = _config(args)
+    except util.CorruptFile as exc:
+        # 配置坏了就停在这里：静默回落默认值意味着"api_key 为空（开放模式）、
+        # 面板密码回 admin、data_dir 换到别处"，比起不来危险得多。
+        print(f"配置文件无法解析：{exc.path}")
+        if exc.backup:
+            print(f"原文件已备份为：{exc.backup}")
+        print("请修好它（或删掉它重新生成）后再启动。")
+        return 2
     setup_logging(
         str(cfg.get("logging.level") or cfg.get("log_level") or "INFO"),
         str(cfg.get("logging.dir") or "./logs"),
     )
 
-    if command == "doctor":
-        return _doctor(cfg)
-    if command == "login":
-        return _login(cfg, args)
-    if command == "accounts":
-        return _accounts(cfg, args)
-    return _serve(cfg, args)
+    try:
+        if command == "doctor":
+            return _doctor(cfg)
+        if command == "login":
+            return _login(cfg, args)
+        if command == "accounts":
+            return _accounts(cfg, args)
+        return _serve(cfg, args)
+    except util.CorruptFile as exc:
+        print(f"状态文件无法解析：{exc.path}")
+        if exc.backup:
+            print(f"原文件已备份为：{exc.backup}")
+        print("账号/密钥文件损坏时不会自动清空重建（那样等于把账号丢了）。")
+        print("请从备份恢复，或手工修好 JSON 后重试。")
+        return 2
 
 
 

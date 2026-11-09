@@ -304,6 +304,9 @@ def common_headers(account: Any, cfg: Any, *, accept: str = "application/json",
             headers["X-Machine-ID"] = machine
         if session:
             headers["X-Session-ID"] = session
+    # 明确要明文：gzip 的 SSE 一旦解压出问题，客户端看到的是"空回复"，日志里
+    # 一句错都没有（我们也解压，这只是少一个变量）。
+    headers["Accept-Encoding"] = "identity"
     return headers
 
 

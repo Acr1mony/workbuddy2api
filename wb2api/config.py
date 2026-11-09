@@ -30,8 +30,14 @@ DEFAULTS: Dict[str, Any] = {
     # --- http --------------------------------------------------------------
     "server": {
         "max_payload_mb": 16,
-        "request_timeout": 300,
+        # 读请求头/体的超时（秒）：慢速客户端一个连接占一条线程，必须有人掐它。
+        "request_timeout": 30,
+        # 写响应的超时（秒）：客户端不读，写到缓冲区满就会永久阻塞。
+        "write_timeout_seconds": 120,
         "shutdown_grace": 5,
+        # 只有在反向代理后面才打开：开了就信任 X-Forwarded-For / X-Real-IP，
+        # 否则任何人带一个头就能绕开面板登录限流。
+        "trust_proxy": False,
     },
     "panel": {
         "enabled": True,
@@ -140,6 +146,12 @@ DEFAULTS: Dict[str, Any] = {
     },
     # 模型目录：hidden 支持 "prefix*" 通配；default 是请求里没带 model 时的兜底
     "models": {"hidden": [], "default": "",
+               # 客户端写的名字 → 上游真名。可以拿它把 gpt-4o / sonnet 这类
+               # 现成客户端里写死的模型名接到上游存在的模型上。
+               "aliases": {},
+               # 上下文长度只在"知道"的时候才报：上游清单里通常没有这个字段，
+               # 客户端拿不到会因为低估窗口而提前截断，所以允许在这里补。
+               "context_lengths": {},
                # force 刷新模型目录的最小间隔（秒）：面板连点、多进程同时冷启动
                # 都会变成一串 /v3/config 请求，那正是"同一机器 id 高频拉目录"的形状。
                "min_refresh_seconds": 30},
@@ -243,7 +255,9 @@ class Config:
     # -- construction -------------------------------------------------------
     @classmethod
     def load(cls, path: Optional[str]) -> "Config":
-        values = util.read_json(path, None) if path else None
+        # 严格解析：损坏的 config.json 静默回落 DEFAULTS 等于"api_key 空了（开放
+        # 模式）、面板密码回 admin、data_dir 换地方"——比直接起不来危险得多。
+        values = util.read_json(path, None, strict=True) if path else None
         config = cls(path, values if isinstance(values, dict) else None)
         config.apply_env(os.environ)
         return config

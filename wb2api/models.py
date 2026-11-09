@@ -43,6 +43,10 @@ SKIP_TAGS = {
 }
 MIN_OUTPUT_TOKENS = 256
 
+# OpenAI 的 /v1/models 每条都带 created（unix 秒）。给一个固定值而不是 0：
+# 部分客户端会把它当"模型上线时间"排序，0 会让它们排在最旧或直接判非法。
+CREATED_AT = 1735689600  # 2025-01-01T00:00:00Z
+
 
 def parse_rate(value: Any) -> Optional[float]:
     """把 ``credits`` 字段解析成"每 1k token 多少积分"。
@@ -72,7 +76,8 @@ def parse_rate(value: Any) -> Optional[float]:
 class ModelInfo:
     """一个模型的最小画像。"""
 
-    __slots__ = ("id", "name", "realm", "max_output", "rate", "tags", "reasoning", "raw")
+    __slots__ = ("id", "name", "realm", "max_output", "rate", "tags", "reasoning", "raw",
+                 "context_length", "alias_of")
 
     def __init__(
         self,
@@ -84,6 +89,8 @@ class ModelInfo:
         tags: Optional[List[str]] = None,
         reasoning: Optional[Dict[str, Any]] = None,
         raw: Optional[Dict[str, Any]] = None,
+        context_length: int = 0,
+        alias_of: str = "",
     ) -> None:
         self.id = id
         self.name = name or id
@@ -93,6 +100,8 @@ class ModelInfo:
         self.tags = list(tags or [])
         self.reasoning = dict(reasoning or {})
         self.raw = raw or {}
+        self.context_length = context_length
+        self.alias_of = alias_of
 
     @property
     def free(self) -> bool:
@@ -125,13 +134,19 @@ class ModelInfo:
         payload: Dict[str, Any] = {
             "id": self.id,
             "object": "model",
-            "created": 0,
+            "created": CREATED_AT,
             "owned_by": "workbuddy",
             "name": self.name,
         }
         if self.max_output:
             # 只报上游真给了的数：瞎填一个 context_length 会让客户端算出错误的截断策略。
             payload["max_output_tokens"] = self.max_output
+        if self.context_length:
+            # 来源只有两个：上游自己说的，或用户在 models.context_lengths 里写的。
+            payload["context_length"] = self.context_length
+            payload["context_window"] = self.context_length
+        if self.alias_of:
+            payload["alias_of"] = self.alias_of
         return payload
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
@@ -277,7 +292,39 @@ class ModelCatalog:
         # 只有配置里真给了 data_dir 才用磁盘缓存：测试与嵌入式用法拿到的是
         # 默认的 ""，不该去仓库根目录里翻别人的清单。
         self._data_dir = str(cfg.get("data_dir") or "")
+        self._loaded = set()
+        self._refresh_meta()
         self._load_disk()
+
+    def _refresh_meta(self) -> None:
+        """从配置里读别名表与上下文长度表（面板改完配置会重新调一次）。"""
+        aliases = self.cfg.get("models.aliases", {}) or {}
+        if not isinstance(aliases, dict):
+            aliases = {}
+        # 别名一律小写比较：客户端写 GPT-4o 还是 gpt-4o 都该通。
+        self.aliases = {str(k).strip().lower(): str(v).strip()
+                        for k, v in aliases.items() if str(k).strip() and str(v).strip()}
+        contexts = self.cfg.get("models.context_lengths", {}) or {}
+        if not isinstance(contexts, dict):
+            contexts = {}
+        self.context_lengths = {}
+        for key, value in contexts.items():
+            try:
+                tokens = int(value)
+            except (TypeError, ValueError):
+                continue
+            if tokens > 0:
+                self.context_lengths[str(key).strip()] = tokens
+
+    def resolve_alias(self, model: str) -> str:
+        """把客户端写的别名换成上游真名；没有别名就原样返回。"""
+        return self.aliases.get(str(model or "").strip().lower(), "")
+
+    def _apply_context(self, entries: List[ModelInfo]) -> None:
+        for info in entries:
+            if info.context_length:
+                continue
+            info.context_length = self.context_lengths.get(info.id, 0)
 
     # -- 磁盘缓存 -----------------------------------------------------------
     def _cache_path(self, realm: str) -> str:
@@ -387,11 +434,17 @@ class ModelCatalog:
         if cached is None and account is not None:
             cached = self.fetch(account, realm)
         items = cached or []
+        if realm not in self._loaded:
+            # 上下文长度来自配置，配置可能在模型清单加载之后才改，所以每次新清单
+            # 进来都补一次（ModelInfo 上只补空的，不覆盖上游自己给的数）。
+            self._apply_context(items)
+            self._loaded.add(realm)
         return [info for info in items if info.chat_capable] if chat_only else list(items)
 
     def get(self, model: str, realm: str = "cn") -> Optional[ModelInfo]:
+        wanted = self.resolve_alias(model) or model
         for info in self.entries(realm, chat_only=False):
-            if info.id == model:
+            if info.id == wanted:
                 return info
         return None
 
@@ -427,12 +480,29 @@ class ModelCatalog:
 
         不过滤会让客户端看见一堆自己调不动的模型：拿到 400 model_not_allowed 之后
         还得人工回来改配置。按 key 的白名单过滤，"看见的"就等于"能用的"。
+
+        别名也要列出来（`alias_of` 指回真名）：客户端只有看见 `gpt-4o` 才会去用它，
+        否则别名等于没配。
         """
+        entries = self.entries(realm)
         data = [
             info.as_openai()
-            for info in self.entries(realm)
+            for info in entries
             if not self.hidden(info.id) and (allowed is None or allowed(info.id))
         ]
+        known = {info.id: info for info in entries}
+        for alias in sorted(self.aliases):
+            target = self.aliases[alias]
+            info = known.get(target)
+            if info is None or self.hidden(alias):
+                continue
+            if allowed is not None and not (allowed(alias) or allowed(target)):
+                continue
+            item = info.as_openai()
+            item["id"] = alias
+            item["name"] = alias
+            item["alias_of"] = target
+            data.append(item)
         return {"object": "list", "data": data}
 
     def names(self, realm: str = "cn") -> List[str]:

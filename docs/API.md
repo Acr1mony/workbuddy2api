@@ -56,6 +56,17 @@ X-API-Key: sk-xxxx
 
 密钥在面板「设置 → 客户端密钥」里创建，可绑定 `realm` 与模型白名单（支持 `prefix*` 通配）。**没配置任何密钥时是开放模式**（谁都能用，包括余额消耗），只建议在本机回环地址上这样跑。
 
+### 响应头
+
+| 头 | 什么时候有 | 用途 |
+| --- | --- | --- |
+| `X-Request-Id` | 每次请求 | `req_` + 8 字节 hex；台账里同名字段，出问题时报这个号就能定位到那一行 |
+| `X-Model-Alias` | 请求用了别名时 | 告诉你写下的名字被解析成了哪个真模型（出站 `model` 已是真名） |
+| `Retry-After` | 429 / 部分 503 | 秒数，来自上游重置时钟或本地退避 |
+| `X-Content-Type-Options: nosniff` | 全部响应 | 固定有 |
+
+面板（`/panel/*`）**不发** CORS 头，改发 `X-Frame-Options: DENY`、`Referrer-Policy: no-referrer` 与 CSP；客户端面（`/v1/*`、`/healthz`、`/status`）保留 `Access-Control-Allow-Origin: *` 以便本地工具直连。
+
 ### 定域
 
 优先级：模型名前缀 `cn:` / `global:` → 密钥绑定的 realm → 请求头 `X-Realm` → query `?realm=` → 默认 `cn`。
@@ -144,6 +155,10 @@ data: [DONE]
 列表来自上游 `/v3/config`（三层回落，缓存 1 小时，落盘一份给重启用），已过滤掉补全类/图像/视频模型。`models.hidden` 里配置的模型（支持 `prefix*`）不会出现。
 
 **列表同时按当前 API key 的 `models`/`excluded_models` 过滤**：看得见的就等于调得动的，客户端不必靠 400 才发现自己被限了模型。本地开放模式（没配任何 key）则全列。
+
+每条还带能力字段：`max_output_tokens`（上游给的输出预算）与 `context_length`/`context_window`（来自 `models.context_lengths` 配置；不知道就不编，字段直接不出现）。
+
+`models.aliases` 里登记的名字也会出现在这个列表里，带 `alias_of` 指向真名；别名指向的模型不存在时它不出现。
 
 ### `GET /v1/models/{id}`
 

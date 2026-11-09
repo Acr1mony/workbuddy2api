@@ -15,6 +15,7 @@ from __future__ import annotations
 import hmac
 import json
 import random
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
@@ -50,6 +51,10 @@ class Panel:
         self.billing = Billing(service.client, cfg)
         self.sessions = SessionAuth(self.store, ttl_seconds=float(cfg.get("panel.session_hours", 12)) * 3600)
         self._attempts: Dict[str, List[float]] = {}
+        # 登录计数是"多线程一起写"的：不加锁会丢计数（限流形同虚设），
+        # 不设上限则一个刷子能把字典撑到内存里（每 IP 一条，永不回收）。
+        self._attempts_lock = threading.Lock()
+        self._attempts_max_ips = 4096
 
     # -- 开关与鉴权 ---------------------------------------------------------
     def enabled(self) -> bool:
@@ -77,12 +82,21 @@ class Panel:
 
     def _throttled(self, ip: str) -> bool:
         now = time.time()
-        history = [stamp for stamp in self._attempts.get(ip, []) if now - stamp < LOGIN_WINDOW]
-        self._attempts[ip] = history
-        return len(history) >= LOGIN_MAX_ATTEMPTS
+        with self._attempts_lock:
+            history = [stamp for stamp in self._attempts.get(ip, []) if now - stamp < LOGIN_WINDOW]
+            if history:
+                self._attempts[ip] = history
+            else:
+                self._attempts.pop(ip, None)
+            return len(history) >= LOGIN_MAX_ATTEMPTS
 
     def _note_attempt(self, ip: str) -> None:
-        self._attempts.setdefault(ip, []).append(time.time())
+        with self._attempts_lock:
+            self._attempts.setdefault(ip, []).append(time.time())
+            if len(self._attempts) > self._attempts_max_ips:
+                # 只保留最近在失败的那些 IP：被刷时宁可丢老记录也不能让字典无限长。
+                keep = sorted(self._attempts.items(), key=lambda kv: kv[1][-1], reverse=True)
+                self._attempts = dict(keep[: self._attempts_max_ips // 2])
 
 
 def register(router: Router, panel: Panel) -> None:
@@ -133,7 +147,9 @@ def _login(panel: Panel, req: Any) -> Response:
         return error_response(429, "登录尝试过于频繁，请稍后再试", "too_many_attempts", kind="rate_limit_error")
     body = req.json_body()
     given = str(body.get("password") or "")
-    if not hmac.compare_digest(given, panel.password()):
+    # compare_digest 只收"同类型字节串"或纯 ASCII 的 str：中文密码走 str 会抛
+    # TypeError，表现是 500 且永远登不进去。统一 encode 再比。
+    if not hmac.compare_digest(given.encode("utf-8"), panel.password().encode("utf-8")):
         panel._note_attempt(ip)
         log.warning("面板登录失败：%s", ip)
         return error_response(401, "密码错误", "bad_password")

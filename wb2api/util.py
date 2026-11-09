@@ -12,6 +12,7 @@ import json
 import os
 import random
 import re
+import secrets
 import string
 import tempfile
 import threading
@@ -98,8 +99,14 @@ _HEX = string.hexdigits.lower()[:16]
 
 
 def rand_hex(length: int = 32) -> str:
-    """Cryptographically adequate random hex string (``length`` characters)."""
-    return "".join(random.choice(_HEX) for _ in range(length))
+    """Random hex string (``length`` characters) from the OS CSPRNG.
+
+    这份输出会被拿去当面板 HMAC 密钥和 API key，所以必须走 ``secrets``：
+    ``random.choice`` 是梅森旋转，看到一段输出就能推出后续。
+    """
+    if length <= 0:
+        return ""
+    return secrets.token_hex((length + 1) // 2)[:length]
 
 
 def uuid_hex() -> str:
@@ -137,22 +144,43 @@ def ensure_dir(path: str) -> str:
     return path
 
 
-def read_json(path: str, default: Any = None) -> Any:
+class CorruptFile(RuntimeError):
+    """A state file exists but cannot be parsed, and the caller asked to be strict.
+
+    对 ``accounts.json`` / ``api_keys.json`` / ``config.json`` 这类"读错了会静默
+    降级成空库或默认配置"的文件，必须让调用方决定：带着一份备份退出，比带着
+    空账号池大开鉴权跑一晚上好得多。
+    """
+
+    def __init__(self, path: str, backup: str = "", error: Optional[BaseException] = None) -> None:
+        super().__init__(f"{path} is not valid JSON" + (f" (backup: {backup})" if backup else ""))
+        self.path = path
+        self.backup = backup
+        self.error = error
+
+
+def read_json(path: str, default: Any = None, *, strict: bool = False) -> Any:
     """Read JSON, returning *default* when the file is missing or corrupt.
 
     A corrupt file is renamed to ``<name>.corrupt-<ts>`` so the next save does
-    not silently destroy whatever the operator hand-edited.
+    not silently destroy whatever the operator hand-edited. With ``strict=True``
+    a corrupt file raises :class:`CorruptFile` instead of quietly returning the
+    default — the backup has already been made at that point.
     """
     try:
         with open(path, "r", encoding="utf-8") as handle:
             return json.load(handle)
     except FileNotFoundError:
         return default
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        backup = ""
         try:
-            os.replace(path, f"{path}.corrupt-{int(now())}")
+            backup = f"{path}.corrupt-{int(now())}"
+            os.replace(path, backup)
         except OSError:
-            pass
+            backup = ""
+        if strict:
+            raise CorruptFile(path, backup, exc) from exc
         return default
 
 

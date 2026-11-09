@@ -201,10 +201,17 @@ class GatewayService:
         )
         tool_names = _tool_names(meta_body)
         completion_id = "chatcmpl-" + identity.new_message_id()[:24]
+        # 请求 id：客户端报障时只要给这个串，日志和台账都能直接定位到那一条。
+        request_id = "req_" + util.rand_hex(8)
+        request.state["request_id"] = request_id
+        alias = str(request.state.get("model_alias") or "")
 
-        account, response = self._open_upstream(
+        account, response, attempts = self._open_upstream(
             realm=realm, model=model, key=key, stick=stick, payload=payload, meta=meta, request=request
         )
+        extra_headers = {"X-Request-Id": request_id}
+        if alias:
+            extra_headers["X-Model-Alias"] = alias
 
         if want_stream:
             return stream_response(
@@ -218,23 +225,33 @@ class GatewayService:
                     tool_names=tool_names,
                     started=started,
                     stick=stick,
-                )
+                    request_id=request_id,
+                    attempts=attempts,
+                    alias=alias,
+                ),
+                headers=extra_headers,
             )
 
         # 非流式：本地聚合。上游本来只给流，是我们替客户端攒完再回一条完整 JSON。
+        # 槽位必须在 finally 里松开：聚合/记账任何一步抛异常都不能把账号永久占住
+        # （in_flight 只增不减 = 几个请求之后整域就是 503 no_account）。
         try:
             lines = list(response.iter_text(float(self.cfg.get("upstream.idle_timeout_seconds", 300))))
+            aggregated = chat_adapter.aggregate(lines, completion_id, model, tool_names)
+            usage = aggregated.get("usage") or {}
+            try:
+                self._record(
+                    started=started, model=model, realm=realm, account=account, key=key,
+                    stream=False, outcome="completed", usage=usage, status=200, ttft=0,
+                    request_id=request_id, attempts=attempts, alias=alias,
+                )
+            except Exception:  # 记账失败不该让一个已经成功的请求变成 500
+                log.exception("记账失败（%s）", model)
+            self.pool.note_success(account, model=model, session_key=stick)
+            return json_response(aggregated, headers=extra_headers)
         finally:
             response.close()
-        aggregated = chat_adapter.aggregate(lines, completion_id, model, tool_names)
-        usage = aggregated.get("usage") or {}
-        self._record(
-            started=started, model=model, realm=realm, account=account, key=key,
-            stream=False, outcome="completed", usage=usage, status=200, ttft=0,
-        )
-        self.pool.note_success(account, model=model, session_key=stick)
-        self.pool.release(account)
-        return json_response(aggregated)
+            self.pool.release(account)
 
     # -- 选号 + 出站 --------------------------------------------------------
     def _open_upstream(
@@ -247,8 +264,8 @@ class GatewayService:
         payload: bytes,
         meta: identity.ChatMeta,
         request: Any,
-    ) -> Tuple[Any, Any]:
-        """选号、发请求，失败按策略换号。返回 (账号, 200 响应)。"""
+    ) -> Tuple[Any, Any, int]:
+        """选号、发请求，失败按策略换号。返回 (账号, 200 响应, 尝试次数)。"""
         exclude: List[str] = []
         last_error: Optional[UpstreamError] = None
         attempts = 0
@@ -288,10 +305,12 @@ class GatewayService:
                     account, self.cfg, meta=meta, client_ip=request.client_ip
                 )
                 proxy = str(getattr(account, "proxy", "") or "")
-                # 同一出口还在退避就先等一等：一口气重试只会让上游更确信这是脚本
+                # 同一出口还在退避就先等一等：一口气重试只会让上游更确信这是脚本。
+                # 但这时账号槽位已经占了，睡太久会把整域的并发额度（默认 3）锁死，
+                # 所以持槽期间最多等 2 秒，剩下的交给下一轮退避。
                 wait = self.egress.wait_for(Egress.key_for(url, proxy))
                 if wait > 0:
-                    time.sleep(min(wait, self.egress.max_wait))
+                    time.sleep(min(wait, 2.0))
                 response = self.client.post(url, headers, raw_body=payload, proxy=proxy)
             except UpstreamError as err:
                 last_error = err
@@ -331,7 +350,7 @@ class GatewayService:
                 log.exception("请求 %s 失败", model)
                 raise ServiceError(f"网关内部错误: {exc}", 500, "internal_error", "api_error") from exc
             self.egress.note_success(Egress.key_for(url, proxy))
-            return account, response
+            return account, response, attempts
 
         error = last_error
         raise self._client_error(error, realm, model) if error is not None else ServiceError(
@@ -497,6 +516,9 @@ class GatewayService:
         tool_names: List[str],
         started: float,
         stick: str = "",
+        request_id: str = "",
+        attempts: int = 1,
+        alias: str = "",
     ) -> Iterator[bytes]:
         """把上游流翻译成客户端帧。
 
@@ -551,17 +573,29 @@ class GatewayService:
                 }
             )
         finally:
-            response.close()
-            self._record(
-                started=started, model=model, realm=realm, account=account, key=key,
-                stream=True, outcome=outcome, usage=usage, status=200,
-                ttft=ttft, error=error_text,
-            )
+            # 顺序很重要：先松开槽位，再关连接、记账。记账要落盘，磁盘满/权限问题
+            # 抛出来时槽位已经还回去了，不会把账号永久占死。
+            self.pool.release(account)
+            try:
+                response.close()
+            except Exception:
+                pass
+            try:
+                self._record(
+                    started=started, model=model, realm=realm, account=account, key=key,
+                    stream=True, outcome=outcome, usage=usage, status=200,
+                    ttft=ttft, error=error_text,
+                    request_id=request_id, attempts=attempts, alias=alias,
+                )
+            except Exception:
+                log.exception("记账失败（%s）", model)
             if outcome == "completed":
                 # 必须用**真实**会话键绑定亲和：流式是主路径，这里传空键等于
                 # 从来没有亲和——同一段对话会被摊到每台"设备"上，既漏缓存也留关联痕迹。
-                self.pool.note_success(account, model=model, session_key=stick)
-            self.pool.release(account)
+                try:
+                    self.pool.note_success(account, model=model, session_key=stick)
+                except Exception:
+                    log.exception("绑定会话亲和失败（%s）", model)
 
     # -- 记账 ---------------------------------------------------------------
     def _record(
@@ -578,6 +612,9 @@ class GatewayService:
         status: int,
         ttft: float = 0.0,
         error: str = "",
+        request_id: str = "",
+        attempts: int = 1,
+        alias: str = "",
     ) -> None:
         elapsed = int((time.time() - started) * 1000)
         prompt = _num(usage.get("prompt_tokens"))
@@ -609,7 +646,11 @@ class GatewayService:
             "account": getattr(account, "uid", "") or getattr(account, "id", ""),
             "key": getattr(key, "key", "")[:12] if key is not None else "",
             "status": status,
+            "request_id": request_id,
+            "attempts": int(attempts),
         }
+        if alias and alias != model:
+            event["alias"] = alias
         if error:
             event["error"] = error[:200]
         if outcome == "failed":
@@ -627,12 +668,18 @@ class GatewayService:
                 realm_hint, raw = realm, raw[len(prefix):]
         if not raw:
             raise ServiceError("缺少 model 字段", 400, "invalid_request")
-        if key is not None and not key.allows_model(raw):
+        # 别名映射：客户端写 gpt-4o，上游收 deepseek-v4-flash。白名单允许任一侧，
+        # 否则"配了别名却用不了"这种坑会让人查很久。
+        alias = str(self.catalog.resolve_alias(raw) or "")
+        model = alias or raw
+        if key is not None and not (key.allows_model(raw) or (alias and key.allows_model(alias))):
             raise ServiceError(f"API key 不允许使用模型 {raw}", 403, "model_not_allowed", "invalid_request_error")
         realm = self.resolve_realm(
             realm_hint or request.arg("realm"), key, request.header("X-Realm")
         )
-        return raw, realm
+        if alias:
+            request.state["model_alias"] = raw
+        return model, realm
 
     def models(self, request: Any) -> Any:
         from .httpserver import json_response
