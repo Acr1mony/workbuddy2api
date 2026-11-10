@@ -97,6 +97,41 @@ def _foo(panel: Panel, req: Any) -> Response:
 - `1.0.0` 以上不再因为"功能变多"而进主版本号。
 - 两处一起改：`pyproject.toml` 的 `version` 与 `wb2api/__init__.py` 的 `VERSION`（`_scratch/bump_version.py 1.9.2` 可代劳），然后重跑 `python tools/gen_example_config.py`。
 
+## 目录结构
+
+```
+wb2api/                 网关本体（零依赖）
+  httpserver.py         HTTP/1.1 + 路由 + chunked SSE + 面板会话
+  identity.py           上游请求头与会话指纹
+  authflow.py           登录（state 轮询）与令牌刷新
+  upstream.py           连接池 / 超时 / 错误分类
+  adapters/chat.py      OpenAI ⇄ 上游 的请求与响应改写
+  adapters/messages.py  Anthropic ⇄ 上游（纯翻译，不碰网络）
+  markup.py             正文里漏出的 DSML 工具调用提取
+  sanitize.py           出站请求体的指纹净化
+  models.py             模型目录（三层回落 + 磁盘缓存 + 别名）
+  billing.py / credits.py  余额、签到、资源包到期分桶
+  pool.py               账号池、五类时间窗、选号策略
+  sticky.py             会话亲和
+  service.py            编排（Relay/Failover 两个 mixin 在此组装）
+  relay.py              流式转发与记账
+  failover.py           错误处置与退避
+  errors.py             错误翻译（纯函数）
+  scheduler.py          后台保活/余额/签到/清理
+  routes_openai.py      /v1/* 客户端面
+  routes_admin.py       /api/* 面板面
+  web/static/           面板前端（原生 JS，无构建）
+  app.py / cli.py       装配与命令行
+tests/                  单测（`python -m unittest discover -s tests -t .`）
+docs/                   架构、协议、API、部署、贡献指南
+tools/                  示例配置生成、配置键审计
+```
+
+## 持续集成
+
+`.github/workflows/ci.yml`：Linux + Windows × Python 3.9/3.12 跑全量测试、跑配置键审计、校验 `config.example.json` 没和默认值分叉、打 wheel 并验证静态资源进包、最后装一次 wheel 起服务探 `/healthz`。
+`.github/workflows/release.yml`：`git tag v1.9.3 && git push --tags` 即发 GitHub Release（附 wheel 与自动生成的变更说明）。
+
 ## 常见坑（踩过的）
 
 | 症状 | 原因 |

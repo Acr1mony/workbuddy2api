@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "workbuddy2api"
-version = "1.9.3"
+version = "1.9.4"
 description = "把 WorkBuddy / CodeBuddy 账号变成 OpenAI 兼容 API 的多账号网关（纯标准库）"
 readme = "README.md"
 requires-python = ">=3.9"
