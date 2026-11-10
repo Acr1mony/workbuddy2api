@@ -50,7 +50,14 @@ python -m unittest tests.test_chat.TestX.test_y      # 单个用例
 | 新客户端接口 | `routes_openai.py` |
 | 配置项 | `config.py::DEFAULTS`，然后跑 `python tools/gen_example_config.py` 重新生成示例 |
 
-**配置项必须真的被读取**：加键的同时确认代码里 `cfg.get("你.的.键")` 存在，并在 `config.example.json` 里出现。本仓库曾经有一批"写进默认值但没人读"的键，改了配置等于没改——有单测之前只能靠人眼，所以改完请顺手 grep 一次。
+**配置项必须真的被读取**：加键的同时确认代码里 `cfg.get("你.的.键")` 存在，并在 `config.example.json` 里出现。本仓库曾经有一批"写进默认值但没人读"的键，改了配置等于没改——现在这条由工具兜底：
+
+```bash
+python tools/audit_config.py       # 有死键退出码 1，CI 的每个矩阵都会跑
+python tools/audit_config.py --list  # 只打印，不返回失败
+```
+
+它会扫 `wb2api/*.py` 里的四种读取形状（`"a.b.c"` 字面量、`_pool_cfg("pool", "x")`、`("pool", "x")` 元组路径、整段 `.get("x")`），与 `DEFAULTS` 的叶子键做差集。**宁可漏报不误报**：像 `cfg.get("upstream", {})` 这种整段读取会把它下面的子键都算作"用过"，所以工具通过不等于每个键都真的生效，仍要看一眼代码。
 
 ## 加一个端点（示例）
 

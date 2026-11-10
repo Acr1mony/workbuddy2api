@@ -327,6 +327,61 @@ class SelectionTests(PoolTestBase):
         self.assertLess(max(counts.values()), 120)
 
 
+class ExpiringTests(PoolTestBase):
+    """额度是"到期作废的东西"：两个号余额相同、到期日差十倍，按余额均分是浪费。"""
+
+    def test_factor_is_one_when_far_away(self) -> None:
+        a = self.add("a", credit=100.0)
+        a.credit_buckets = {"soonest_expire_at": util.now() + 40 * 86400}
+        self.assertEqual(self.pool._expiring_factor(a, util.now(), 7 * 86400), 1.0)
+
+    def test_factor_grows_as_expiry_approaches(self) -> None:
+        now = util.now()
+        a = self.add("a", credit=100.0)
+        a.credit_buckets = {"soonest_expire_at": now + 6 * 86400}
+        later = self.pool._expiring_factor(a, now, 7 * 86400)
+        a.credit_buckets = {"soonest_expire_at": now + 3600}
+        sooner = self.pool._expiring_factor(a, now, 7 * 86400)
+        self.assertGreater(later, 1.0)
+        self.assertGreater(sooner, later)
+
+    def test_factor_needs_a_real_expiry(self) -> None:
+        a = self.add("a", credit=100.0)
+        self.assertEqual(self.pool._expiring_factor(a, util.now(), 7 * 86400), 1.0)
+        a.credit_buckets = {"soonest_expire_at": 0}
+        self.assertEqual(self.pool._expiring_factor(a, util.now(), 7 * 86400), 1.0)
+
+    def test_credit_amount_is_log_scaled(self) -> None:
+        now = util.now()
+        rich = self.add("rich", credit=100000.0)
+        rich.credit_buckets = {"soonest_expire_at": now + 3600}
+        modest = self.add("modest", credit=100.0)
+        modest.credit_buckets = {"soonest_expire_at": now + 3600}
+        self.assertLess(
+            self.pool._expiring_factor(modest, now, 7 * 86400),
+            self.pool._expiring_factor(rich, now, 7 * 86400),
+        )
+        # 但不会因为余额大 1000 倍就吃掉全部流量
+        self.assertLess(self.pool._expiring_factor(rich, now, 7 * 86400), 20.0)
+
+    def test_picks_the_expiring_account_more_often(self) -> None:
+        now = util.now()
+        soon = self.add("soon", credit=100.0)
+        soon.credit_buckets = {"soonest_expire_at": now + 3600}
+        later = self.add("later", credit=100.0)
+        later.credit_buckets = {"soonest_expire_at": now + 60 * 86400}
+        counts = {"soon": 0, "later": 0}
+        for _ in range(300):
+            counts[self.pool.pick("cn", "glm-4").uid] += 1
+        self.assertGreater(counts["soon"], counts["later"])
+
+    def test_switch_off_ignores_expiry(self) -> None:
+        self.cfg.set("pool.prefer_expiring", False)
+        a = self.add("a", credit=10.0)
+        a.credit_buckets = {"soonest_expire_at": util.now() + 60}
+        self.assertEqual(self.pool._expiring_factor(a, util.now(), 0.0), 1.0)
+
+
 class StickyKeyTests(unittest.TestCase):
     def test_header_wins(self) -> None:
         key = sticky.session_key({"X-Conversation-Id": "abc"}, {"conversation_id": "zzz"})

@@ -83,6 +83,29 @@ def user_agent(realm: Optional[str] = None, client_version: str = "", cli_versio
     return f"WorkBuddy/{product} {platform}/{product} CLI/{cli}"
 
 
+def resolve_user_agent(cfg: Any, realm: Optional[str] = None) -> str:
+    """``upstream.user_agent`` 有值就原样用它，否则按域拼一个。
+
+    覆盖的典型用法是"从官方客户端抄一个 UA 填进来"，此时任何自动拼接都会把它改坏；
+    所以显式值一个字都不动（只去首尾空白）。
+    """
+    explicit = ""
+    if cfg is not None:
+        try:
+            explicit = str(cfg.get("upstream.user_agent", "") or "").strip()
+        except (AttributeError, TypeError):
+            explicit = ""
+    if explicit:
+        return explicit
+    if cfg is None:
+        return user_agent(realm)
+    return user_agent(
+        realm,
+        cfg.get("upstream.client_version", DEFAULT_CLIENT_VERSION) or DEFAULT_CLIENT_VERSION,
+        cfg.get("upstream.cli_version", DEFAULT_CLI_VERSION) or DEFAULT_CLI_VERSION,
+    )
+
+
 # --------------------------------------------------------------------------
 # 账号级稳定指纹
 # --------------------------------------------------------------------------
@@ -289,11 +312,7 @@ def common_headers(account: Any, cfg: Any, *, accept: str = "application/json",
         "X-Requested-With": "XMLHttpRequest",
         "Origin": info["origin"],
         "Referer": info["origin"] + "/",
-        "User-Agent": user_agent(
-            realm,
-            cfg.get("upstream.client_version", DEFAULT_CLIENT_VERSION) if cfg else DEFAULT_CLIENT_VERSION,
-            cfg.get("upstream.cli_version", DEFAULT_CLI_VERSION) if cfg else DEFAULT_CLI_VERSION,
-        ),
+        "User-Agent": resolve_user_agent(cfg, realm),
         "X-CodeBuddy-Request": "1",
         "Accept-Language": info["language"],
     }
@@ -435,11 +454,7 @@ def billing_headers(account: Any, cfg: Any) -> Dict[str, str]:
         "Accept-Language": realm_info(realm)["language"],
         "Origin": realm_info(realm)["origin"],
         "Referer": realm_info(realm)["origin"] + "/",
-        "User-Agent": user_agent(
-            realm,
-            cfg.get("upstream.client_version", DEFAULT_CLIENT_VERSION) if cfg else DEFAULT_CLIENT_VERSION,
-            cfg.get("upstream.cli_version", DEFAULT_CLI_VERSION) if cfg else DEFAULT_CLI_VERSION,
-        ),
+        "User-Agent": resolve_user_agent(cfg, realm),
     }
     uid = getattr(account, "uid", "") or ""
     if uid:
@@ -470,11 +485,7 @@ def anonymous_headers(realm: str, cfg: Any) -> Dict[str, str]:
         "Accept": "application/json",
         "Origin": info["origin"],
         "Referer": info["origin"] + "/",
-        "User-Agent": user_agent(
-            realm,
-            cfg.get("upstream.client_version", DEFAULT_CLIENT_VERSION) if cfg else DEFAULT_CLIENT_VERSION,
-            cfg.get("upstream.cli_version", DEFAULT_CLI_VERSION) if cfg else DEFAULT_CLI_VERSION,
-        ),
+        "User-Agent": resolve_user_agent(cfg, realm),
         "X-CodeBuddy-Request": "1",
         "Accept-Language": info["language"],
     }

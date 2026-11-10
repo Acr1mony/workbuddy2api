@@ -36,6 +36,10 @@ jobs:
       - name: Unit tests
         run: python -m unittest discover -s tests -t . -v
 
+      # 配置项最容易腐烂：键名写错了不会报错，用户改了配置等于没改。
+      - name: Config keys are all read somewhere
+        run: python tools/audit_config.py
+
       # 配置样例是由代码生成的，手改会和默认值分叉。这里保证它没分叉。
       - name: Example config is in sync
         shell: bash

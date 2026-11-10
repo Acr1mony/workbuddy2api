@@ -15,6 +15,8 @@ frames are skipped and counted instead of raised.
 from __future__ import annotations
 
 import json
+import queue
+import threading
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from .log import get_logger
@@ -22,6 +24,14 @@ from .log import get_logger
 log = get_logger("sse")
 
 DONE = "[DONE]"
+
+# 心跳帧：SSE 注释行。客户端库会直接忽略它，但中间层（nginx / 负载均衡 / 浏览器）
+# 看到的是"这条连接还活着"。上游思考几十秒不出字时，没有它就会有人替你超时。
+HEARTBEAT_EVENT = "__heartbeat__"
+HEARTBEAT_BYTES = b": keepalive\n\n"
+
+_HEARTBEAT = object()
+_EOF = object()
 
 
 class SSEEvent:
@@ -45,13 +55,50 @@ class SSEEvent:
         return f"<SSEEvent {self.event} {self.data[:60]!r}>"
 
 
-def iter_sse(lines: Iterable[Any]) -> Iterator[SSEEvent]:
+def iter_sse(lines: Iterable[Any], heartbeat: float = 0.0) -> Iterator[SSEEvent]:
     """Yield SSE events from an iterable of byte/str lines.
 
     The iterable may be a socket file object (bytes) or a list of str; both are
     normalised to UTF-8 text.  ``[DONE]`` is yielded as its own event so the
     caller can see it, then iteration stops.
+
+    ``heartbeat`` > 0 时，上游静默超过这么多秒就额外吐一个 ``HEARTBEAT_EVENT``
+    事件，调用方把它写成 ``HEARTBEAT_BYTES`` 即可。上游读放在旁路线程里——
+    "等下一行"和"该发心跳了"这两件事，靠一个阻塞的 for 循环没法同时判断。
     """
+    yield from _iter_sse(_with_heartbeat(lines, heartbeat))
+
+
+def _with_heartbeat(lines: Iterable[Any], heartbeat: float) -> Iterator[Any]:
+    if not heartbeat or heartbeat <= 0:
+        yield from lines
+        return
+    pending: "queue.Queue[Any]" = queue.Queue(maxsize=4096)
+
+    def pump() -> None:
+        try:
+            for item in lines:
+                pending.put(item)
+        except BaseException as exc:  # 读失败要把异常还给消费方，而不是悄悄结束
+            pending.put(exc)
+        finally:
+            pending.put(_EOF)
+
+    threading.Thread(target=pump, name="sse-pump", daemon=True).start()
+    while True:
+        try:
+            item = pending.get(timeout=heartbeat)
+        except queue.Empty:
+            yield _HEARTBEAT
+            continue
+        if item is _EOF:
+            return
+        if isinstance(item, BaseException):
+            raise item
+        yield item
+
+
+def _iter_sse(lines: Iterable[Any]) -> Iterator[SSEEvent]:
     event_name = ""
     data_parts: List[str] = []
     raw_parts: List[str] = []
@@ -66,6 +113,9 @@ def iter_sse(lines: Iterable[Any]) -> Iterator[SSEEvent]:
         return event
 
     for raw in lines:
+        if raw is _HEARTBEAT:
+            yield SSEEvent(HEARTBEAT_EVENT, "", ": keepalive")
+            continue
         if isinstance(raw, (bytes, bytearray)):
             try:
                 line = bytes(raw).decode("utf-8", "replace")

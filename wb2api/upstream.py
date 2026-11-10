@@ -504,13 +504,22 @@ class UpstreamClient:
                 return str(configured).rstrip("/")
         return identity.host_for(realm)
 
-    def _timeouts(self) -> Tuple[float, float]:
+    def _timeouts(self) -> Tuple[float, float, float]:
+        """(连接/握手, 流式空闲, 等响应头) —— 三个阶段各有各的时间尺度。
+
+        连不上是 30ms 级的事，等首字节是秒级，读流中偶尔几十秒不动是正常的。
+        把它们塞进同一个数字，就必然有一个阶段被误杀。
+        """
         if self.cfg is None:
-            return 120.0, 300.0
-        return (
-            float(self.cfg.get("upstream.timeout_seconds", 120)),
-            float(self.cfg.get("upstream.idle_timeout_seconds", 300)),
-        )
+            return 120.0, 300.0, 120.0
+        connect = float(self.cfg.get("upstream.timeout_seconds", 120))
+        idle = float(self.cfg.get("upstream.idle_timeout_seconds", 300))
+        header = self.cfg.get("upstream.header_timeout_seconds", connect)
+        try:
+            header = float(header)
+        except (TypeError, ValueError):
+            header = connect
+        return connect, idle, (header if header > 0 else connect)
 
     # -- 连接 ---------------------------------------------------------------
     def _connect(self, url: str, proxy: str, timeout: float, credential: str = "") -> Tuple[http.client.HTTPConnection, str]:
@@ -552,7 +561,7 @@ class UpstreamClient:
         # 不能被二次 json.dumps（那会多一层字符串转义，上游直接当畸形请求）。
         if raw_body is not None:
             body = raw_body
-        connect_timeout, _idle = self._timeouts()
+        connect_timeout, _idle, header_timeout = self._timeouts()
         timeout = timeout or connect_timeout
         parts = util.split_url(url)
         path = parts[3] or "/"
@@ -569,6 +578,13 @@ class UpstreamClient:
             try:
                 conn, key = self._connect(url, proxy, timeout, credential)
                 reused = getattr(conn, "sock", None) is not None
+                connect = getattr(conn, "connect", None)
+                if not reused and connect is not None:
+                    # http.client 把 TCP+TLS 握手放在第一次 request() 里，用的还是
+                    # 同一个 timeout；先显式连上，好把"等响应头"单独限时。
+                    connect()
+                if getattr(conn, "sock", None) is not None:
+                    conn.sock.settimeout(header_timeout)
                 conn.request(method, path, body=body, headers=headers or {})
                 raw = conn.getresponse()
                 response = UpstreamResponse(conn, raw, key, self._pool)

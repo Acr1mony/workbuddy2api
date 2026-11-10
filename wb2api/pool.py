@@ -31,6 +31,7 @@
 
 from __future__ import annotations
 
+import math
 import random
 import threading
 import time
@@ -306,11 +307,37 @@ class Pool:
         # 用过一轮就换下一个起始位置，避免某个号长期吃第一单
         return ordered[cursor % len(ordered)]
 
+    def _expiring_factor(self, account: Account, now: float, window: float) -> float:
+        """快过期且额度大的号，权重放大。
+
+        额度不是钱，是"到期就作废的东西"：两个号余额都是 5000，一个 30 天后过期、
+        一个 3 天，按余额均分等于每周烧掉一大截。factor 是**乘法**因子，
+        按对数缩放额度，否则一个万级余额的号会吃掉全部流量。
+        """
+        buckets = getattr(account, "credit_buckets", None) or {}
+        try:
+            soonest = float(buckets.get("soonest_expire_at") or 0)
+        except (TypeError, ValueError):
+            return 1.0
+        if soonest <= 0 or window <= 0:
+            return 1.0
+        remaining = soonest - now
+        if remaining > window:
+            return 1.0
+        days = max(0.0, remaining / 86400.0)
+        window_days = max(window / 86400.0, 1e-6)
+        urgency = 1.0 + (1.0 - min(1.0, days / window_days))
+        credit = float(getattr(account, "credit", None) or 0.0)
+        amount = 1.0 + math.log10(1.0 + max(0.0, credit))
+        return max(1.0, urgency * amount)
+
     def _pick_weighted(self, candidates: Sequence[Account], now: float) -> Account:
         credits = [a.credit for a in candidates if a.credit is not None]
         max_credits = max(credits) if credits else 1.0
         idle_per_hour = float(self._pool_cfg("pool", "idle_weight_per_hour", default=0.5) or 0.5)
         idle_max = float(self._pool_cfg("pool", "idle_weight_max", default=5.0) or 5.0)
+        prefer = bool(self._pool_cfg("pool", "prefer_expiring", default=True))
+        window = self._duration(("pool", "expiring_soon"), 168 * 3600.0) if prefer else 0.0
         weights: List[float] = []
         for a in candidates:
             weight = 1.0
@@ -321,6 +348,8 @@ class Pool:
                 weight += min(idle_max, idle_hours * idle_per_hour)
             else:
                 weight += idle_max  # 从没用过的账号给满额空闲奖励
+            if window:
+                weight *= self._expiring_factor(a, now, window)
             weights.append(max(0.1, weight))
         total = sum(weights)
         pick = random.random() * total

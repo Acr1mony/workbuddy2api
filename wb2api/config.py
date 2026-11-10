@@ -22,7 +22,6 @@ DEFAULTS: Dict[str, Any] = {
     # --- process -----------------------------------------------------------
     "listen": "127.0.0.1:8788",
     "data_dir": "./data",
-    "config_version": 1,
     # Initial gateway key; the panel-managed key store takes over once it has
     # at least one key.  Empty means "only the panel-managed keys work".
     "api_key": "",
@@ -111,8 +110,6 @@ DEFAULTS: Dict[str, Any] = {
     "cooldown": {
         "soft_rate": "600s",
         "soft_rate_max": "2h",
-        "hard_rate": "10m",
-        "hard_rate_max": "6h",
         "auth_dead": "24h",
     },
     "pool": {
@@ -149,8 +146,6 @@ DEFAULTS: Dict[str, Any] = {
         "credit_floor": 0,
         "idle_weight_per_hour": 0.5,
         "idle_weight_max": 5.0,
-        "rate_limit_retries": 2,
-        "cross_domain_fallback": False,
         # --- 出口代理池 ---------------------------------------------------
         # 形状：["socks5h://user:pass@host:port", {"url": "...", "realm": "global", "weight": 2}]
         # 空表示直连。上游是按"机器 id + 出口 IP"看请求形状的，出口全是同一个家宽
@@ -164,7 +159,7 @@ DEFAULTS: Dict[str, Any] = {
         "serialize_account": True,
         "serialize_wait": "10s",
     },
-    "session_sticky": {"enabled": True, "ttl": "30m", "gc_interval": "5m", "page_size": 3},
+    "session_sticky": {"enabled": True, "ttl": "30m", "page_size": 3},
     "schedule": {        # 键名必须和 scheduler.py 读的一致，否则配置改了等于没改
         "token_refresh_enabled": True,
         "keepalive_minutes": 60,
@@ -195,8 +190,7 @@ DEFAULTS: Dict[str, Any] = {
     # 出站请求体的反指纹净化。默认开：上游对 Claude Code / Codex 模板句和
     # 字面量 "11-128" 是**逐字匹配**，命中就整单拒（400 11-128）。
     # 想要原样透传自己的 prompt 就显式改成 "passthrough"。
-    "prompt": {"mode": "sanitize", "file": "", "content_retry": True, "append": ""},
-    "features": {},
+    "prompt": {"mode": "sanitize", "content_retry": True, "append": ""},
 }
 
 ENV_OVERRIDES: Dict[str, str] = {
@@ -406,7 +400,6 @@ class Config:
             problems.append("pool.credit_floor must be >= 0")
         for dotted in (
             "cooldown.soft_rate",
-            "cooldown.hard_rate",
             "pool.breaker_cooldown",
             "session_sticky.ttl",
         ):

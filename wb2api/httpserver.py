@@ -22,6 +22,7 @@ import json
 import re
 import socket
 import sys
+import threading
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -294,8 +295,32 @@ class GatewayServer(ThreadingHTTPServer):
 
     def __init__(self, address: Tuple[str, int], app: "Application") -> None:
         self.app = app
+        self._active = 0
+        self._active_lock = threading.Lock()
         super().__init__(address, GatewayHandler)
         self.request_queue_size = 128
+
+    # -- 在途请求计数 -------------------------------------------------------
+    def enter_request(self) -> None:
+        with self._active_lock:
+            self._active += 1
+
+    def leave_request(self) -> None:
+        with self._active_lock:
+            if self._active > 0:
+                self._active -= 1
+
+    @property
+    def active(self) -> int:
+        with self._active_lock:
+            return self._active
+
+    def wait_active(self, timeout: float, step: float = 0.1) -> int:
+        """等正在跑的请求结束，最多 ``timeout`` 秒；返回还剩几个。"""
+        deadline = time.time() + max(0.0, timeout)
+        while self.active and time.time() < deadline:
+            time.sleep(min(step, max(0.0, deadline - time.time())) or step)
+        return self.active
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         exc_type, exc, _tb = sys.exc_info()
@@ -489,6 +514,20 @@ class GatewayHandler(BaseHTTPRequestHandler):
         return value if value > 0 else default
 
     def _handle(self) -> None:
+        server = self.server
+        counter = getattr(server, "enter_request", None)
+        if counter is not None:
+            counter()
+        try:
+            self._handle_inner()
+        finally:
+            # 退出时 `shutdown_grace` 靠这个计数判断"还有没有人在写流"：
+            # 直接杀进程会让正在生成的回答断在半句，用户看到的是截断。
+            leaver = getattr(server, "leave_request", None)
+            if leaver is not None:
+                leaver()
+
+    def _handle_inner(self) -> None:
         app: Application = self.server.app  # type: ignore[attr-defined]
         # 连接必须有超时：一个只发半行请求头、或者声明 16MB 却逐字节发送的客户端，
         # 会让这条线程永远卡在 read 上；不读响应的客户端会让 write 永远阻塞。

@@ -30,6 +30,20 @@ class FlakyResponse(FakeResponse):
         raise RuntimeError("boom")
 
 
+class SlowTailResponse(FakeResponse):
+    """出字之后沉默一会儿再结束：心跳应该出现在这段沉默里。"""
+
+    def __init__(self, lines, delay=0.25):
+        super().__init__(lines)
+        self.delay = delay
+
+    def iter_text(self, idle_timeout=300.0):
+        for line in self.lines:
+            if line.startswith("data: [DONE]"):
+                time.sleep(self.delay)
+            yield line
+
+
 class ServiceHardeningTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="wb2a-hard-")
@@ -88,6 +102,31 @@ class ServiceHardeningTest(unittest.TestCase):
             self.assertEqual(account.in_flight, 0)
 
     # -- 请求 id + 别名 -----------------------------------------------------
+    def test_stream_heartbeat_when_upstream_goes_quiet(self):
+        self.cfg.set("upstream.stream_heartbeat_seconds", 0.05)
+        svc, _client = self.service([SlowTailResponse(sse_lines(chat_chunk("hi"), "data: [DONE]"))])
+        resp = svc.chat_completions(self.request(self.body(stream=True)))
+        frames = list(resp.stream)
+        self.assertIn(b": keepalive\n\n", frames)
+        # 心跳不能替代结尾帧：客户端还得收到 [DONE]
+        self.assertTrue(any(b"[DONE]" in frame for frame in frames))
+
+    def test_heartbeat_is_off_by_zero(self):
+        self.cfg.set("upstream.stream_heartbeat_seconds", 0)
+        svc, _client = self.service([SlowTailResponse(sse_lines(chat_chunk("hi"), "data: [DONE]"), delay=0.15)])
+        resp = svc.chat_completions(self.request(self.body(stream=True)))
+        self.assertNotIn(b": keepalive\n\n", list(resp.stream))
+
+    def test_heartbeat_does_not_count_as_first_byte(self):
+        self.cfg.set("upstream.stream_heartbeat_seconds", 0.05)
+        svc, _client = self.service([SlowTailResponse(sse_lines(chat_chunk("hi"), "data: [DONE]"), delay=0.2)])
+        resp = svc.chat_completions(self.request(self.body(stream=True)))
+        list(resp.stream)
+        event = svc.ledger.recent(1)[0]
+        # 首字时间是"第一个真 token"，不是心跳间隔
+        self.assertIsNotNone(event.get("ttft_ms"))
+        self.assertGreaterEqual(float(event["ttft_ms"]), 0.0)
+
     def test_request_id_echoed_and_recorded(self):
         svc, _client = self.service([ok_stream("hi")])
         resp = svc.chat_completions(self.request(self.body()))
@@ -544,3 +583,33 @@ class ObservabilityTest(unittest.TestCase):
         row = svc.reqlog.recent()[0]
         self.assertIsNone(row["ttft_ms"])
         self.assertGreaterEqual(row["elapsed_ms"], 0)
+
+
+class GracefulShutdownTest(unittest.TestCase):
+    """关机不该把正在写的响应掐断；等不到就记一条日志走人。"""
+
+    def test_wait_active_reports_leftovers_then_zero(self):
+        from wb2api.httpserver import Application, GatewayServer, Router
+
+        server = GatewayServer(("127.0.0.1", 0), Application(Router()))
+        try:
+            self.assertEqual(server.active, 0)
+            server.enter_request()
+            self.assertEqual(server.active, 1)
+            started = time.time()
+            self.assertEqual(server.wait_active(0.15), 1, "还有请求在跑就该如实报数")
+            self.assertGreaterEqual(time.time() - started, 0.1, "必须真的等满 grace")
+            server.leave_request()
+            self.assertEqual(server.wait_active(0.15), 0)
+        finally:
+            server.server_close()
+
+
+class ActiveCounterTest(ServerCase):
+    def test_request_does_not_leak_the_counter(self):
+        status, _headers, _data = self.request("GET", "/healthz")
+        self.assertEqual(status, 200)
+        # 响应写完和"工作线程退出 finally"之间有极短的窗口，等一下再断言，
+        # 否则测的是调度运气而不是计数逻辑。
+        left = self.server.wait_active(2.0, step=0.02)
+        self.assertEqual(left, 0, "请求结束后在途计数必须归零")

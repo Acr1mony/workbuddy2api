@@ -477,6 +477,16 @@ def _serve(cfg: Config, args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         shutdown()
     finally:
+        # 先给正在生成的回答一点时间写完：直接把进程杀掉，客户端看到的是
+        # 半句话（而且上游已经把这段 token 计费了）。等不到就记账走人。
+        grace = 5.0
+        try:
+            grace = float(cfg.get("server.shutdown_grace", 5.0) or 0.0)
+        except (TypeError, ValueError):
+            pass
+        left = server.wait_active(grace) if hasattr(server, "wait_active") else 0
+        if left:
+            get_logger("cli").warning("还有 %d 个请求没写完（等满 %.1fs），强制退出", left, grace)
         try:
             server.server_close()
         finally:

@@ -352,7 +352,7 @@ class GatewayService:
             try:
                 self._record(
                     started=started, model=model, realm=realm, account=account, key=key,
-                    stream=False, outcome="completed", usage=usage, status=200, ttft=0,
+                    stream=False, outcome="completed", usage=usage, status=200, ttft=None,
                     request_id=request_id, attempts=attempts, alias=alias,
                     extra=req_extra,
                 )
@@ -451,7 +451,7 @@ class GatewayService:
             try:
                 self._record(
                     started=started, model=model, realm=realm, account=account, key=key,
-                    stream=False, outcome="completed", usage=usage, status=200, ttft=0,
+                    stream=False, outcome="completed", usage=usage, status=200, ttft=None,
                     request_id=request_id, attempts=attempts, alias=alias, kind="messages",
                     extra=req_extra,
                 )
@@ -488,12 +488,15 @@ class GatewayService:
         usage: Dict[str, Any] = {}
         outcome = "completed"
         error_text = ""
-        ttft = 0.0
+        ttft: Optional[float] = None
         first = True
         try:
             for item in stream.start():
                 yield msg_adapter.stream_frames([item]).__next__()
-            for parsed in sse.iter_sse(response.iter_text(idle)):
+            for parsed in sse.iter_sse(response.iter_text(idle), heartbeat=self._heartbeat()):
+                if parsed.event == sse.HEARTBEAT_EVENT:
+                    yield sse.HEARTBEAT_BYTES
+                    continue
                 if parsed.event == "done" or (parsed.data or "").strip() == "[DONE]":
                     break
                 raw = (parsed.data or "").strip()
@@ -747,6 +750,14 @@ class GatewayService:
             time.sleep(min(delay, 5.0))
         self.pool.note_chat_sent(account)
 
+    def _heartbeat(self) -> float:
+        """上游静默多少秒就补一条 `: keepalive`。0（或负数）= 关闭。"""
+        try:
+            value = float(self.cfg.get("upstream.stream_heartbeat_seconds", 15))
+        except (TypeError, ValueError):
+            return 15.0
+        return value if value > 0 else 0.0
+
     def _ensure_ready(self, account: Any, realm: str) -> None:
         """出站前确保令牌可用；未过期就不碰上游（刷新令牌是一次性的，别乱用）。"""
         if not self.auth.ensure_token(account):
@@ -942,7 +953,7 @@ class GatewayService:
         （这些 token 上游已经计费了，装作没发生只会让额度悄悄漏掉）。
         """
         idle = float(self.cfg.get("upstream.idle_timeout_seconds", 300))
-        ttft = 0.0
+        ttft: Optional[float] = None
         first_byte_at = 0.0
         usage: Dict[str, Any] = {}
         outcome = "completed"
@@ -950,8 +961,13 @@ class GatewayService:
         try:
             filt = None
             for payload in chat_adapter.stream_frames(
-                response.iter_text(idle), completion_id, model, tool_names
+                response.iter_text(idle), completion_id, model, tool_names, heartbeat=self._heartbeat()
             ):
+                if payload == sse.HEARTBEAT_BYTES:
+                    # 心跳不是"第一个字"：它只证明连接还活着。把它算进 TTFT，
+                    # 面板上的首字延迟就会变成"心跳间隔"，越调越好看、越假。
+                    yield payload
+                    continue
                 if not first_byte_at:
                     first_byte_at = time.time()
                     ttft = (first_byte_at - started) * 1000.0
@@ -1027,7 +1043,7 @@ class GatewayService:
         outcome: str,
         usage: Dict[str, Any],
         status: int,
-        ttft: float = 0.0,
+        ttft: Optional[float] = None,
         error: str = "",
         request_id: str = "",
         attempts: int = 1,
@@ -1056,7 +1072,7 @@ class GatewayService:
             "elapsed_ms": elapsed,
             # 非流式没有"首字"可言：写 0 会让分位数统计把一堆 0 算成"快得离谱"，
             # 写 None 让面板显示"—"、让 metrics 直接跳过这个样本。
-            "ttft_ms": int(ttft) if ttft > 0 else None,
+            "ttft_ms": round(ttft, 1) if ttft is not None else None,
             "prompt_tokens": int(prompt),
             "completion_tokens": int(completion),
             "reasoning_tokens": int(reasoning),

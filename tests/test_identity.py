@@ -69,6 +69,18 @@ class TestUserAgent(unittest.TestCase):
         ua = identity.user_agent("cn", client_version="9.9.9", cli_version="1.1.1")
         self.assertEqual(ua, "WorkBuddy/9.9.9 WorkBuddy/9.9.9 CLI/1.1.1")
 
+    def test_explicit_config_value_wins_verbatim(self):
+        cfg = FakeCfg({"upstream": {"user_agent": "  MyClient/1.0 (custom) "}})
+        self.assertEqual(identity.resolve_user_agent(cfg, "global"), "MyClient/1.0 (custom)")
+
+    def test_no_explicit_value_derives(self):
+        cfg = FakeCfg({"upstream": {"client_version": "7.7.7", "cli_version": "0.0.2"}})
+        self.assertEqual(
+            identity.resolve_user_agent(cfg, "global"),
+            "WorkBuddy/7.7.7 WorkBuddy AI/7.7.7 CLI/0.0.2",
+        )
+        self.assertEqual(identity.resolve_user_agent(None, "cn"), identity.user_agent("cn"))
+
 
 class TestStableIds(unittest.TestCase):
     def test_stable_per_uid(self):

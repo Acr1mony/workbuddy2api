@@ -1,7 +1,6 @@
 {
   "listen": "127.0.0.1:8788",
   "data_dir": "./data",
-  "config_version": 1,
   "api_key": "",
   "log_level": "INFO",
   "server": {
@@ -72,8 +71,6 @@
   "cooldown": {
     "soft_rate": "600s",
     "soft_rate_max": "2h",
-    "hard_rate": "10m",
-    "hard_rate_max": "6h",
     "auth_dead": "24h"
   },
   "pool": {
@@ -101,8 +98,6 @@
     "credit_floor": 0,
     "idle_weight_per_hour": 0.5,
     "idle_weight_max": 5.0,
-    "rate_limit_retries": 2,
-    "cross_domain_fallback": false,
     "proxies": [],
     "proxy_cooldown": "5m",
     "proxy_cooldown_max": "1h",
@@ -112,7 +107,6 @@
   "session_sticky": {
     "enabled": true,
     "ttl": "30m",
-    "gc_interval": "5m",
     "page_size": 3
   },
   "schedule": {
@@ -143,9 +137,7 @@
   },
   "prompt": {
     "mode": "sanitize",
-    "file": "",
     "content_retry": true,
     "append": ""
-  },
-  "features": {}
+  }
 }

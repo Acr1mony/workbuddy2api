@@ -280,7 +280,20 @@ class TestBaseUrl(unittest.TestCase):
 
     def test_timeouts(self):
         client = upstream.UpstreamClient(FakeCfg({"upstream": {"timeout_seconds": 30, "idle_timeout_seconds": 90}}))
-        self.assertEqual(client._timeouts(), (30.0, 90.0))
+        # (连接/握手, 流式空闲, 等响应头)；没配 header 时跟连接超时一致
+        self.assertEqual(client._timeouts(), (30.0, 90.0, 30.0))
+
+    def test_header_timeout_is_separate(self):
+        client = upstream.UpstreamClient(
+            FakeCfg({"upstream": {"timeout_seconds": 30, "idle_timeout_seconds": 90, "header_timeout_seconds": 5}})
+        )
+        self.assertEqual(client._timeouts(), (30.0, 90.0, 5.0))
+
+    def test_header_timeout_garbage_falls_back(self):
+        client = upstream.UpstreamClient(
+            FakeCfg({"upstream": {"timeout_seconds": 30, "idle_timeout_seconds": 90, "header_timeout_seconds": "soon"}})
+        )
+        self.assertEqual(client._timeouts(), (30.0, 90.0, 30.0))
 
 
 class CaptureConn(FakeConn):

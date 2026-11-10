@@ -771,11 +771,15 @@ def stream_frames(
     completion_id: str,
     model: str,
     tool_names: Optional[Iterable[str]] = None,
+    heartbeat: float = 0.0,
 ) -> Iterable[bytes]:
     """上游 SSE 行 -> 客户端 SSE 帧（含结尾 ``[DONE]``）。
 
     正文要过一遍 ``MarkupFilter``：上游偶尔把工具调用以标记文本写进 ``content``，
     直接透传等于把标记糊到用户脸上。
+
+    ``heartbeat`` 秒上游没动静就往客户端补一条 SSE 注释帧——思考模型经常几十秒
+    憋不出第一个字，中间层会先把连接掐掉。
     """
     filt = markup.MarkupFilter(list(tool_names) if tool_names else None)
     emitted = False
@@ -786,7 +790,10 @@ def stream_frames(
         emitted = True
         yield sse.sse_bytes(chunk)
 
-    for event in sse.iter_sse(lines):
+    for event in sse.iter_sse(lines, heartbeat=heartbeat):
+        if event.event == sse.HEARTBEAT_EVENT:
+            yield sse.HEARTBEAT_BYTES
+            continue
         if event.data == "[DONE]":
             break
         try:

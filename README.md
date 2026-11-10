@@ -262,7 +262,17 @@ docs/                   架构、协议、API、部署、贡献指南
 | `WB_DEVICE_TOKEN`          | `upstream.device_token`         | 上游设备令牌（一般留空，自动从账号派生/文件读取）           |
 | `WB_CLIENT_VERSION` 等      | `upstream.*`                    | 伪装的上游客户端版本号                         |
 
-Docker / 服务化部署见 [docs/DEPLOY.md](docs/DEPLOY.md)。
+几个容易忽略但真会生效的：
+
+| 配置键                                | 默认          | 说明                                                        |
+| ---------------------------------- | ----------- | --------------------------------------------------------- |
+| `upstream.header_timeout_seconds`  | 跟建连超时一致     | 连上之后等**响应头**的时间。上游在排队时这一段比建连更能卡住                  |
+| `upstream.stream_heartbeat_seconds` | `15`        | 上游静默时往客户端写 `: keepalive`；`0` 关闭。心跳**不计入**首字延迟            |
+| `upstream.user_agent`              | 空           | 填了就原样发送，不再按 `client_version`/`cli_version` 拼。上游换 UA 时不用改代码 |
+| `server.shutdown_grace`            | `5`         | 退出前等在途请求写完的秒数；等不到会记一条 `还有 N 个请求没写完` 再退出                 |
+| `pool.prefer_expiring`             | `true`      | 余额快过期且量大的账号优先派活（`pool.expiring_soon` 默认 168 小时）           |
+
+Docker / 服务化部署见 [docs/DEPLOY.md](docs/DEPLOY.md)。改配置键之后跑一次 `python tools/audit_config.py`，它会列出"写了但没人读"的键。
 
 ### 出口代理池
 
