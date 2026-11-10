@@ -14,7 +14,7 @@ python -m wb2api doctor                      # 配置自检
 ## 代码约定
 
 - **中文注释，讲"为什么"**。`# 这里必须单飞，否则第二个请求拿着已消费的 refresh token` 有用；`# 刷新令牌` 没用。
-- **单文件不超过约 700 行**。超过就说明该拆模块了。
+- **单文件不超过约 700 行**。超过就说明该拆模块了——`service.py` 就是这样拆成 `relay.py` / `failover.py` / `errors.py` 的（多继承接回 `GatewayService`，import 路径不变）。拆完加两条结构守卫：`tests/test_request_id.py::ModuleLayoutTest` 会检查行数，并检查同名方法没在 service 和 mixin 里各写一遍（MRO 静默选一个，最难查）。
 - 公开函数写类型注解，返回 `Dict[str, Any]` 这类结构时在 docstring 里写清形状。
 - 错误用 `ServiceError(message, status, code, kind)`；`code` 是稳定的字符串符号（`no_account`、`fingerprint_rejected`），不要用数字状态码当 `code`。
 - 日志用 `get_logger("模块名")`，**永远不要打印 token**（用 `util.mask_secret`）。

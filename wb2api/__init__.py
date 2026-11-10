@@ -27,9 +27,13 @@
     routes_openai.py  客户端面：/v1/chat/completions、/v1/models、/healthz、/status
     routes_admin.py   面板 API：账号（含备份）、设置、用量、日志、调度、请求明细、出口池
     web/            面板静态页（零构建）
+    service.py      编排：鉴权 → 选号 → 出站 → 转发 → 记账（Relay/Failover 两个 mixin 在此组装）
+    relay.py        流式转发与记账（不选号、不换号）
+    failover.py     错误处置：谁该换号、谁绝对不能换
+    errors.py       错误翻译成客户端信封（纯函数）
     app.py          装配：把上面这些拼成一个应用
     cli.py          命令行入口（serve / doctor / version / accounts）
 """
 
-VERSION = "1.9.2"
+VERSION = "1.9.3"
 __version__ = VERSION

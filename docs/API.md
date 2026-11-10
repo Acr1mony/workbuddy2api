@@ -62,7 +62,7 @@ X-API-Key: sk-xxxx
 
 | 头 | 什么时候有 | 用途 |
 | --- | --- | --- |
-| `X-Request-Id` | 每次请求 | `req_` + 8 字节 hex；台账里同名字段，出问题时报这个号就能定位到那一行 |
+| `X-Request-Id` | 每次请求 | 你带了 `X-Request-Id` / `X-Correlation-Id` / `Request-Id` 就**原样沿用**（限 `[A-Za-z0-9._:-]`、≤64 字符，不合规就忽略），否则生成 `req_` + 8 字节 hex。台账里同名字段，报这个号就能定位到那一行 |
 | `X-Model-Alias` | 请求用了别名时 | 告诉你写下的名字被解析成了哪个真模型（出站 `model` 已是真名） |
 | `Retry-After` | 429 / 部分 503 | 秒数，来自上游重置时钟或本地退避 |
 | `X-Content-Type-Options: nosniff` | 全部响应 | 固定有 |

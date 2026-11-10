@@ -35,6 +35,24 @@ from .sticky import SessionAffinity, session_key as make_session_key
 from .upstream import UpstreamClient, UpstreamError, is_restricted
 from .metrics import Metrics
 from .usage import DEFAULT_MAX_BYTES, UsageLedger
+from .errors import (
+    CODE_EFFORT_UNSUPPORTED,
+    CODE_FINGERPRINT,
+    CODE_MODEL_FORBIDDEN,
+    CODE_MODEL_UNAVAILABLE,
+    CODE_PROMPT_TOO_LONG,
+    CODE_QUEUE_FULL,
+    CODE_QUOTA,
+    CODE_RESTRICTED,
+    CODE_SESSION_DEAD,
+    CODE_TOOL_PAIRING,
+    CODE_UA_REJECTED,
+    ServiceError,
+    client_error,
+    parse_reset_clock,
+)
+from .failover import FailoverMixin
+from .relay import RelayMixin, _is_usage_frame, _mentions_model, _num, _tool_names, _usage_of
 
 log = get_logger("service")
 
@@ -45,70 +63,24 @@ CHAT_PATH = "/v2/chat/completions"
 KEY_RATE_WINDOW = 60.0  # 每 key 速率窗口：滑动一分钟，不是固定分钟桶
 
 # 上游业务码。判断"换不换号"全靠它，所以每个都单独命名，别写成裸数字。
-CODE_PROMPT_TOO_LONG = 11115
-CODE_MODEL_UNAVAILABLE = 11102
-CODE_MODEL_FORBIDDEN = 11158
-CODE_TOOL_PAIRING = 11148
-CODE_EFFORT_UNSUPPORTED = 11150
-CODE_UA_REJECTED = 12403
-CODE_FINGERPRINT = "11-128"  # 上游把指纹错误写成带连字符的字符串，不是数字
-CODE_RESTRICTED = 11140
-CODE_SESSION_DEAD = 12153
-CODE_QUOTA = 6004
-CODE_QUEUE_FULL = 6021
+_REQUEST_ID_OK = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 
 
-class ServiceError(Exception):
-    """可以直接变成 OpenAI 错误信封的失败。"""
+def _request_id(request: Any) -> str:
+    """沿用客户端自带的请求 id；没有或不合规才自己生成。
 
-    def __init__(
-        self,
-        message: str,
-        status: int = 400,
-        code: str = "bad_request",
-        kind: str = "invalid_request_error",
-        retry_after: float = 0.0,
-    ) -> None:
-        super().__init__(message)
-        self.message = message
-        self.status = status
-        self.code = code
-        self.kind = kind
-        # 有它就往响应里带 Retry-After：客户端自己会退避，比它盲目重试把墙撞穿好
-        self.retry_after = retry_after
-
-
-_RESET_CLOCK_RE = re.compile(r"(\d{4}-\d{1,2}-\d{1,2})[ T](\d{1,2}:\d{2}(?::\d{2})?)")
-
-
-def parse_reset_clock(text: str, now: Optional[float] = None) -> float:
-    """从 ``将在 YYYY-MM-DD HH:MM:SS 重置`` 解析出冷却到什么时候。
-
-    上游用的是 UTC+8 的墙上时间且不带时区，按本地时间解析会被跨时区部署搞错
-    （差 8 小时就是一个半天不能用的账号）。
+    复用是排障的关键：客户端（SDK、网关、你自己写的脚本）报障时给的是**它**的
+    id，我们如果另发一个，日志和台账就对不上号。但原样收下也有代价——它会进日志、
+    台账、响应头，所以字符集和白名单一样收窄，长度封顶，不合规就当没给。
     """
-    if not text:
-        return 0.0
-    match = _RESET_CLOCK_RE.search(text)
-    if match is None:
-        return 0.0
-    try:
-        stamp = time.strptime(match.group(1) + " " + match.group(2), "%Y-%m-%d %H:%M:%S" if match.group(2).count(":") == 2 else "%Y-%m-%d %H:%M")
-    except ValueError:
-        try:
-            stamp = time.strptime(match.group(1) + " " + match.group(2), "%Y-%m-%d %H:%M")
-        except ValueError:
-            return 0.0
-    epoch = time.mktime(stamp)  # 本地时间 → 先把墙钟当本地
-    offset = _local_offset() - 8 * 3600  # 再校正回 UTC+8
-    return epoch - offset
+    for name in ("X-Request-Id", "X-Correlation-Id", "Request-Id"):
+        raw = str(request.header(name, "") or "").strip()
+        if raw and _REQUEST_ID_OK.match(raw):
+            return raw
+    return "req_" + util.rand_hex(8)
 
 
-def _local_offset() -> float:
-    return -time.timezone if not time.daylight else -time.altzone
-
-
-class GatewayService:
+class GatewayService(RelayMixin, FailoverMixin):
     """网关的全部业务逻辑。HTTP 层只负责把 Request 递进来、把 Response 发出去。"""
 
     def __init__(self, cfg: Any, store: Any, client: Optional[UpstreamClient] = None) -> None:
@@ -300,8 +272,8 @@ class GatewayService:
         )
         tool_names = _tool_names(meta_body)
         completion_id = "chatcmpl-" + identity.new_message_id()[:24]
-        # 请求 id：客户端报障时只要给这个串，日志和台账都能直接定位到那一条。
-        request_id = "req_" + util.rand_hex(8)
+        # 请求 id：有客户端自带的就沿用，没有才生成——报障时两边对得上号。
+        request_id = _request_id(request)
         request.state["request_id"] = request_id
         alias = str(request.state.get("model_alias") or "")
         req_extra = {
@@ -408,7 +380,7 @@ class GatewayService:
         )
         tool_names = _tool_names(prepared)
         completion_id = "chatcmpl-" + identity.new_message_id()[:24]
-        request_id = "req_" + util.rand_hex(8)
+        request_id = _request_id(request)
         request.state["request_id"] = request_id
         alias = str(request.state.get("model_alias") or "")
         input_tokens = msg_adapter.count_tokens(body)
@@ -464,106 +436,6 @@ class GatewayService:
             self.pool.release(account)
             self._release_key(key_slot)
 
-    def _relay_messages(
-        self,
-        *,
-        account: Any,
-        response: Any,
-        stream: Any,
-        model: str,
-        realm: str,
-        key: Optional[ApiKey],
-        started: float,
-        stick: str = "",
-        request_id: str = "",
-        attempts: int = 1,
-        alias: str = "",
-        key_slot: str = "",
-        extra: Optional[Dict[str, Any]] = None,
-    ) -> Iterator[bytes]:
-        """把上游的 OpenAI 流重排成 Anthropic 事件流。"""
-        from .adapters import messages as msg_adapter
-
-        idle = float(self.cfg.get("upstream.idle_timeout_seconds", 300))
-        usage: Dict[str, Any] = {}
-        outcome = "completed"
-        error_text = ""
-        ttft: Optional[float] = None
-        first = True
-        try:
-            for item in stream.start():
-                yield msg_adapter.stream_frames([item]).__next__()
-            for parsed in sse.iter_sse(response.iter_text(idle), heartbeat=self._heartbeat()):
-                if parsed.event == sse.HEARTBEAT_EVENT:
-                    yield sse.HEARTBEAT_BYTES
-                    continue
-                if parsed.event == "done" or (parsed.data or "").strip() == "[DONE]":
-                    break
-                raw = (parsed.data or "").strip()
-                if not raw:
-                    continue
-                try:
-                    chunk = json.loads(raw)
-                except ValueError:
-                    continue
-                if not isinstance(chunk, dict):
-                    continue
-                if chunk.get("usage"):
-                    usage = chunk["usage"] or usage
-                    if first:
-                        # 第一帧就有 usage 的情况很少，真有时至少别把 input_tokens 记成 0
-                        first = False
-                if first:
-                    ttft = (time.time() - started) * 1000.0
-                    first = False
-                for item in stream.feed(chunk):
-                    yield msg_adapter.stream_frames([item]).__next__()
-            for item in stream.finish():
-                yield msg_adapter.stream_frames([item]).__next__()
-        except GeneratorExit:
-            outcome = "client_aborted"
-            raise
-        except UpstreamError as err:
-            outcome = "upstream_aborted"
-            error_text = err.message or str(err)
-            for item in stream.error("上游流中断：" + error_text[:200], "upstream_stream_error"):
-                yield msg_adapter.stream_frames([item]).__next__()
-        except Exception as exc:
-            outcome = "failed"
-            error_text = str(exc)
-            log.exception("Messages 流处理失败 %s/%s", realm, model)
-            for item in stream.error("网关转发失败：" + error_text[:200], "gateway_error"):
-                yield msg_adapter.stream_frames([item]).__next__()
-        finally:
-            self.pool.release(account)
-            self._release_key(key_slot)
-            try:
-                response.close()
-            except Exception:
-                pass
-            if not usage.get("completion_tokens"):
-                usage = dict(usage)
-                usage["completion_tokens"] = stream.output_tokens
-            if not usage.get("prompt_tokens"):
-                usage = dict(usage)
-                usage["prompt_tokens"] = stream.input_tokens
-            try:
-                self._record(
-                    started=started, model=model, realm=realm, account=account, key=key,
-                    stream=True, outcome=outcome, usage=usage,
-                    status=200 if outcome == "completed" else 499, ttft=ttft,
-                    error=error_text, request_id=request_id, attempts=attempts,
-                    alias=alias, kind="messages", extra=extra,
-                )
-            except Exception:
-                log.exception("记账失败（%s）", model)
-            if outcome == "completed":
-                try:
-                    self.pool.note_success(account, model=model, session_key=stick)
-                except Exception:
-                    log.exception("标记成功失败（%s）", model)
-
-    # -- 选号 + 出站 --------------------------------------------------------
     def _open_upstream(
         self,
         *,
@@ -601,7 +473,7 @@ class GatewayService:
             )
             if account is None:
                 if last_error is not None:
-                    raise self._client_error(last_error, realm, model)
+                    raise client_error(last_error, realm, model)
                 blocked = self.pool.model_blocked(realm, model)
                 if blocked:
                     # 池子是空的，但原因是"这个模型谁都跑不通"，不是"账号都在冷却"。
@@ -670,7 +542,7 @@ class GatewayService:
                         self.pool.note_auth_dead(account)
                         rotate = True
                 if not rotate:
-                    raise self._client_error(err, realm, model) from err
+                    raise client_error(err, realm, model) from err
                 self._backoff(attempts)
                 continue
             except Exception as exc:  # 本地配置/网络栈问题，不该重试
@@ -683,435 +555,11 @@ class GatewayService:
             return account, response, attempts
 
         error = last_error
-        raise self._client_error(error, realm, model) if error is not None else ServiceError(
+        raise client_error(error, realm, model) if error is not None else ServiceError(
             "上游持续失败", 503, "upstream_unavailable", "api_error"
         )
 
-    def _dump_failure(
-        self,
-        err: UpstreamError,
-        *,
-        account: Any,
-        realm: str,
-        model: str,
-        url: str,
-        meta: Any = None,
-        request: Any = None,
-        payload: Any = b"",
-    ) -> None:
-        """把上游这次的拒绝原文留下来。
-
-        只留"有 body 的拒绝"：超时的 body 是空的，留一条空记录没有意义。脱敏、限
-        大小、按天封顶都在 :mod:`wb2api.diagnostics` 里做——这里只负责把上下文凑齐。
-        """
-        body = getattr(err, "body", "") or ""
-        if not getattr(self.diag, "enabled", False) or not body:
-            return
-        request_id = ""
-        client_ip = ""
-        alias = ""
-        if request is not None:
-            state = getattr(request, "state", {}) or {}
-            request_id = str(state.get("request_id") or "")
-            alias = str(state.get("model_alias") or "")
-            client_ip = str(getattr(request, "client_ip", "") or "")
-        headers: Dict[str, Any] = {}
-        try:
-            headers = identity.chat_headers(account, self.cfg, meta=meta, client_ip=client_ip)
-        except Exception:
-            headers = {}
-        try:
-            self.diag.dump(
-                request_id=request_id,
-                realm=realm,
-                model=model,
-                alias=alias,
-                account=str(getattr(account, "label", "") or getattr(account, "uid", "")),
-                url=url,
-                status=int(getattr(err, "status", 0) or 0),
-                code=str(getattr(err, "code", "") or ""),
-                message=str(getattr(err, "message", "") or ""),
-                request_headers=headers,
-                body=body,
-                request_body=payload,
-            )
-        except Exception:
-            log.debug("失败报文留存失败", exc_info=True)
-
-    def _pace(self, account: Any) -> None:
-        """同账号两次出站请求之间留最小间隔。
-
-        真人不会 200ms 连发；被 agent 驱动的客户端会。对上游来说"同一机器 id
-        高频调用"是最像脚本的特征，所以宁可让客户端多等一会儿。
-        """
-        delay = self.pool.pace_delay(account)
-        if delay > 0:
-            log.debug("账号 %s 节奏等待 %.0fms", account.label, delay * 1000)
-            time.sleep(min(delay, 5.0))
-        self.pool.note_chat_sent(account)
-
-    def _heartbeat(self) -> float:
-        """上游静默多少秒就补一条 `: keepalive`。0（或负数）= 关闭。"""
-        try:
-            value = float(self.cfg.get("upstream.stream_heartbeat_seconds", 15))
-        except (TypeError, ValueError):
-            return 15.0
-        return value if value > 0 else 0.0
-
-    def _ensure_ready(self, account: Any, realm: str) -> None:
-        """出站前确保令牌可用；未过期就不碰上游（刷新令牌是一次性的，别乱用）。"""
-        if not self.auth.ensure_token(account):
-            self.pool.note_auth_dead(account, "令牌不可用")
-            raise UpstreamError("账号令牌不可用", kind="auth", status=401)
-
-    # -- WAF 波次 ------------------------------------------------------------
-    WAF_WAVE_WINDOW = 60.0
-    WAF_WAVE_UIDS = 2
-    WAF_WAVE_HOLD = 60.0
-
-    def _note_waf_hit(self, realm: str, account: Any) -> None:
-        uid = str(getattr(account, "uid", "") or getattr(account, "id", ""))
-        now = time.time()
-        with self._key_lock:
-            hits = [item for item in self._waf_hits.get(realm, []) if now - item[1] <= self.WAF_WAVE_WINDOW]
-            hits.append((uid, now))
-            self._waf_hits[realm] = hits
-
-    def waf_wave(self, realm: str) -> Dict[str, Any]:
-        """短时间内多个不同账号都踩到 WAF：这是出口/IP 级的问题。
-
-        这时再换号只是把剩下的账号一个个送上去记一笔——而它们本来什么事都没有。
-        停手一分钟，比"全池各被记一次"划算得多。
-        """
-        now = time.time()
-        with self._key_lock:
-            hits = [item for item in self._waf_hits.get(realm, []) if now - item[1] <= self.WAF_WAVE_WINDOW]
-            self._waf_hits[realm] = hits
-        uids = {item[0] for item in hits}
-        active = len(uids) >= self.WAF_WAVE_UIDS
-        until = (max(item[1] for item in hits) + self.WAF_WAVE_HOLD) if hits else 0.0
-        return {
-            "active": active,
-            "uids": len(uids),
-            "realm": realm,
-            "until": until if active else 0.0,
-            "for_seconds": int(max(0.0, until - now)) if active else 0,
-        }
-
-    def _absorb(self, account: Any, err: UpstreamError, model: str, realm: str) -> Tuple[bool, bool]:
-        """把一次失败记到号上，并决定"换不换号 / 要不要先刷新令牌"。"""
-        message = err.message or ""
-        code = err.code
-        if CODE_FINGERPRINT in message:
-            # 指纹拦截：换号没用，换的是"客户端指纹"，不是账号。
-            log.warning("指纹被拦（%s）：检查 UA/头族，不要换号", model)
-            return False, False
-        if err.kind == "restricted" or code == CODE_RESTRICTED or is_restricted(message):
-            # 风控：实测一轮请求能把 7 个号一起封掉，所以绝不换号。
-            self.pool.note_restricted(account, message)
-            return False, False
-        if err.kind == "waf":
-            # 内容审核 / 边缘 WAF：跟账号健康无关，换号也一样被拦，
-            # 而且"换号继续打"正是连坐的形态。给一分钟软冷却，然后把错交给客户端。
-            self.pool.note_waf(account, message)
-            self._note_waf_hit(realm, account)
-            return False, False
-        if code == CODE_PROMPT_TOO_LONG:
-            return False, False
-        if code == CODE_SESSION_DEAD or "12153" in message or "Offline user session" in message:
-            self.pool.note_session_dead(account)
-            return True, False
-        if err.kind == "auth":
-            return True, True
-        if code == CODE_QUOTA or err.kind == "quota":
-            self.pool.note_hard_credit(account, message or "余额不足")
-            return True, False
-        if err.kind == "rate_limit" or err.status == 429:
-            if code == CODE_QUEUE_FULL:
-                # queue.full 是排队打满，不是配额；短暂等待即可，不记到号上。
-                return True, False
-            reset_at = parse_reset_clock(message)
-            if reset_at:
-                self.pool.note_soft_rate(account, reset_at=reset_at, model=model)
-            elif code == CODE_QUOTA:
-                self.pool.note_hard_credit(account, message or "额度耗尽")
-            elif _mentions_model(message) or code == 6004:
-                self.pool.block_model(account, model, message or "模型限流")
-            else:
-                self.pool.note_unscoped_rate(account, message or "429")
-            return True, False
-        if code == CODE_MODEL_UNAVAILABLE:
-            # "service info not found"：模型侧没接入，所有账号都一样，换号只会多烧三次退避。
-            self.pool.block_model(account, model, message or "模型不可用")
-            return False, False
-        if code == CODE_MODEL_FORBIDDEN:
-            # 11158 是"这个账号的用户类型/权限用不了这个模型"，换号可能就通了，所以换。
-            self.pool.block_model(account, model, message or "模型不可用")
-            return True, False
-        if code in (CODE_TOOL_PAIRING, CODE_EFFORT_UNSUPPORTED, CODE_UA_REJECTED):
-            return False, False
-        if err.status == 404:
-            return True, False
-        if err.kind == "timeout":
-            # 超时绝不换号：同一份请求换个号只会再撞一次慢上游，还可能被重复生成。
-            # 客户端拿到 503 自己决定要不要重来，比网关偷偷重试安全。
-            return False, False
-        if err.kind == "transient" or err.status >= 500:
-            # 链路问题不记在账号上（已记到出口）。换号可以，只是别再罚这个号。
-            return True, False
-        if err.kind == "bad_request":
-            return False, False
-        self.pool.note_unknown_failure(account, message or "未知失败")
-        return True, False
-
-    def _backoff(self, attempt: int) -> None:
-        delay = min(BACKOFF_MAX, BACKOFF_BASE * (2 ** (attempt - 1)))
-        delay *= 1 + random.uniform(-0.25, 0.25)
-        time.sleep(max(0.0, delay))
-
-    def _client_error(self, err: Optional[UpstreamError], realm: str, model: str) -> ServiceError:
-        """把上游错误翻译成客户端看得懂的信封。"""
-        if err is None:
-            return ServiceError("上游不可用", 503, "upstream_unavailable", "api_error")
-        message = err.message or "上游失败"
-        if CODE_FINGERPRINT in message:
-            return ServiceError(
-                "上游拒绝了本次请求（客户端指纹）。可尝试 prompt.mode=sanitize 或改用官方客户端头族。",
-                400, "fingerprint_rejected", "invalid_request_error",
-            )
-        if err.kind == "restricted" or err.code == CODE_RESTRICTED or is_restricted(message):
-            return ServiceError("账号被上游风控限制，已停止重试以免连坐", 403, "restricted", "api_error")
-        if err.kind == "waf":
-            return ServiceError(
-                "上游内容审核拦截了本次请求（与账号无关，换号无效）。请改写触发内容或稍后重试。",
-                403, "content_blocked", "api_error",
-            )
-        if err.code == CODE_PROMPT_TOO_LONG:
-            return ServiceError("prompt 过长，上游拒绝（换号无效）", 400, "prompt_too_long", "invalid_request_error")
-        if err.kind == "quota":
-            return ServiceError("所有可用账号额度不足", 402, "insufficient_quota", "api_error")
-        if err.kind == "rate_limit":
-            return ServiceError(
-                "上游限流，请稍后重试", 429, "rate_limited", "rate_limit_error",
-                retry_after=float(err.retry_after or 0.0),
-            )
-        if err.kind == "timeout":
-            return ServiceError(
-                "上游响应超时（换号重试无效，请稍后再来）", 503, "upstream_timeout", "api_error", retry_after=0.0
-            )
-        if err.kind == "transient" or err.status >= 500:
-            return ServiceError(
-                "上游暂时不可用", 503, "upstream_unavailable", "api_error",
-                retry_after=float(err.retry_after or 0.0),
-            )
-        if err.kind == "auth":
-            return ServiceError("账号认证失败，需要重新登录", 503, "account_auth_failed", "api_error")
-        # 以下这些是"请求本身有问题"，客户端改一下就好：一律 400，别用 502。
-        # 502/503 会让客户端自动重试同一个坏请求，把配额和账号都白烧一遍。
-        if err.code in (CODE_MODEL_UNAVAILABLE, CODE_MODEL_FORBIDDEN):
-            return ServiceError(
-                f"模型 {model} 在上游不可用（{message[:120]}），请换一个模型",
-                400, "model_unavailable", "invalid_request_error",
-            )
-        if err.code == CODE_TOOL_PAIRING:
-            return ServiceError(
-                "工具调用配对不完整（assistant.tool_calls 与 tool 结果必须成对）", 400, "tool_call_mismatch", "invalid_request_error"
-            )
-        if err.code == CODE_EFFORT_UNSUPPORTED:
-            return ServiceError(
-                f"该模型不支持所请求的 reasoning_effort（{message[:120]}）", 400, "reasoning_effort_unsupported", "invalid_request_error"
-            )
-        if err.code == CODE_UA_REJECTED:
-            return ServiceError("上游拒绝了客户端 UA（12403）", 400, "user_agent_rejected", "invalid_request_error")
-        if err.kind == "bad_request":
-            return ServiceError(message[:300], 400, "upstream_rejected", "invalid_request_error")
-        return ServiceError(message[:300], 502, "upstream_error", "api_error")
-
     # -- 流式转发 -----------------------------------------------------------
-    def _relay_stream(
-        self,
-        *,
-        account: Any,
-        response: Any,
-        completion_id: str,
-        model: str,
-        realm: str,
-        key: Optional[ApiKey],
-        tool_names: List[str],
-        started: float,
-        stick: str = "",
-        request_id: str = "",
-        attempts: int = 1,
-        alias: str = "",
-        key_slot: str = "",
-        extra: Optional[Dict[str, Any]] = None,
-    ) -> Iterator[bytes]:
-        """把上游流翻译成客户端帧。
-
-        进了这个生成器就说明响应头已经发出去了：**再失败也不能换号**，只能把错误
-        作为一帧 ``upstream_stream_error`` 告诉客户端，并按已产生的用量记账
-        （这些 token 上游已经计费了，装作没发生只会让额度悄悄漏掉）。
-        """
-        idle = float(self.cfg.get("upstream.idle_timeout_seconds", 300))
-        ttft: Optional[float] = None
-        first_byte_at = 0.0
-        usage: Dict[str, Any] = {}
-        outcome = "completed"
-        error_text = ""
-        try:
-            filt = None
-            for payload in chat_adapter.stream_frames(
-                response.iter_text(idle), completion_id, model, tool_names, heartbeat=self._heartbeat()
-            ):
-                if payload == sse.HEARTBEAT_BYTES:
-                    # 心跳不是"第一个字"：它只证明连接还活着。把它算进 TTFT，
-                    # 面板上的首字延迟就会变成"心跳间隔"，越调越好看、越假。
-                    yield payload
-                    continue
-                if not first_byte_at:
-                    first_byte_at = time.time()
-                    ttft = (first_byte_at - started) * 1000.0
-                if _is_usage_frame(payload):
-                    usage = _usage_of(payload) or usage
-                yield payload
-        except GeneratorExit:
-            outcome = "client_aborted"
-            raise
-        except UpstreamError as err:
-            outcome = "upstream_aborted"
-            error_text = err.message or str(err)
-            log.warning("流中断 %s/%s: %s", realm, model, error_text)
-            yield sse.sse_bytes(
-                {
-                    "error": {
-                        "message": "上游流中断：" + error_text[:200],
-                        "type": "upstream_stream_error",
-                        "code": "stream_interrupted",
-                    }
-                }
-            )
-        except Exception as exc:  # 解析/网络都可能炸，别让线程带着异常死掉
-            outcome = "failed"
-            error_text = str(exc)
-            log.exception("流处理失败 %s/%s", realm, model)
-            yield sse.sse_bytes(
-                {
-                    "error": {
-                        "message": "网关转发失败：" + error_text[:200],
-                        "type": "gateway_error",
-                        "code": "stream_failed",
-                    }
-                }
-            )
-        finally:
-            # 顺序很重要：先松开槽位，再关连接、记账。记账要落盘，磁盘满/权限问题
-            # 抛出来时槽位已经还回去了，不会把账号永久占死。
-            self.pool.release(account)
-            self._release_key(key_slot)
-            try:
-                response.close()
-            except Exception:
-                pass
-            try:
-                self._record(
-                    started=started, model=model, realm=realm, account=account, key=key,
-                    stream=True, outcome=outcome, usage=usage, status=200,
-                    ttft=ttft, error=error_text,
-                    request_id=request_id, attempts=attempts, alias=alias,
-                    extra=extra,
-                )
-            except Exception:
-                log.exception("记账失败（%s）", model)
-            if outcome == "completed":
-                # 必须用**真实**会话键绑定亲和：流式是主路径，这里传空键等于
-                # 从来没有亲和——同一段对话会被摊到每台"设备"上，既漏缓存也留关联痕迹。
-                try:
-                    self.pool.note_success(account, model=model, session_key=stick)
-                except Exception:
-                    log.exception("绑定会话亲和失败（%s）", model)
-
-    # -- 记账 ---------------------------------------------------------------
-    def _record(
-        self,
-        *,
-        started: float,
-        model: str,
-        realm: str,
-        account: Any,
-        key: Optional[ApiKey],
-        stream: bool,
-        outcome: str,
-        usage: Dict[str, Any],
-        status: int,
-        ttft: Optional[float] = None,
-        error: str = "",
-        request_id: str = "",
-        attempts: int = 1,
-        alias: str = "",
-        kind: str = "chat.completions",
-        extra: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        elapsed = int((time.time() - started) * 1000)
-        prompt = _num(usage.get("prompt_tokens"))
-        completion = _num(usage.get("completion_tokens"))
-        reasoning = _num(usage.get("completion_tokens_details", {}).get("reasoning_tokens") if isinstance(usage.get("completion_tokens_details"), dict) else usage.get("reasoning_tokens"))
-        cached = _num((usage.get("prompt_tokens_details") or {}).get("cached_tokens") if isinstance(usage.get("prompt_tokens_details"), dict) else usage.get("cached_tokens"))
-        total = _num(usage.get("total_tokens")) or (prompt + completion)
-        # 上游 usage 里带 credit（这次请求扣了多少积分）。台账要记它，否则面板上
-        # 永远显示"花了 0 积分"，用户没法知道钱去哪了。
-        credit = _num(usage.get("credit"))
-        if not credit:
-            credit = _num(usage.get("credits")) or _num(usage.get("credit_cost"))
-        event = {
-            "at": int(started),
-            "iso": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started)),
-            "model": model,
-            "stream": stream,
-            "outcome": outcome,
-            "kind": kind,
-            "elapsed_ms": elapsed,
-            # 非流式没有"首字"可言：写 0 会让分位数统计把一堆 0 算成"快得离谱"，
-            # 写 None 让面板显示"—"、让 metrics 直接跳过这个样本。
-            "ttft_ms": round(ttft, 1) if ttft is not None else None,
-            "prompt_tokens": int(prompt),
-            "completion_tokens": int(completion),
-            "reasoning_tokens": int(reasoning),
-            "cached_tokens": int(cached),
-            "total_tokens": int(total),
-            "credit": round(float(credit), 6),
-            "realm": realm,
-            "account": getattr(account, "uid", "") or getattr(account, "id", ""),
-            "key": getattr(key, "key", "")[:12] if key is not None else "",
-            "status": status,
-            "request_id": request_id,
-            "attempts": int(attempts),
-        }
-        if alias and alias != model:
-            event["alias"] = alias
-        if error:
-            event["error"] = error[:200]
-        if outcome == "failed":
-            event["status"] = status or 502
-        if extra:
-            # 明细字段（客户端 IP / UA / 入口路径）只进逐请求日志，不进聚合台账：
-            # 聚合表要小，明细表要全。
-            for name, value in extra.items():
-                if value not in (None, ""):
-                    event[name] = value
-        self.ledger.record(event)
-        try:
-            self.reqlog.record(event)
-        except Exception:
-            log.debug("逐请求日志写入失败", exc_info=True)
-        # 指标只留最近 N 条（内存里），和台账的 7 天回放是两件事。
-        try:
-            self.metrics.observe(event)
-        except Exception:
-            log.debug("metrics observe failed", exc_info=True)
-        if key is not None and hasattr(self.store, "touch_key"):
-            self.store.touch_key(key.key, int(prompt), int(completion))
-
-    # -- 辅助端点 -----------------------------------------------------------
     def _resolve_model(self, body: Dict[str, Any], request: Any, key: Optional[ApiKey]) -> Tuple[str, str]:
         raw = str(body.get("model") or self.cfg.get("models.default") or "").strip()
         realm_hint = ""
@@ -1249,50 +697,3 @@ class GatewayService:
         }
 
 
-def _tool_names(body: Dict[str, Any]) -> List[str]:
-    tools = body.get("tools")
-    if not isinstance(tools, list):
-        return []
-    names = []
-    for tool in tools:
-        function = tool.get("function") if isinstance(tool, dict) else None
-        if isinstance(function, dict) and isinstance(function.get("name"), str):
-            names.append(function["name"])
-    return names
-
-
-def _mentions_model(message: str) -> bool:
-    lowered = message.lower()
-    return "model" in lowered or "模型" in message
-
-
-def _num(value: Any) -> float:
-    if isinstance(value, bool):
-        return 0.0
-    if isinstance(value, (int, float)):
-        return float(value)
-    return 0.0
-
-
-def _is_usage_frame(payload: bytes) -> bool:
-    return b'"usage"' in payload
-
-
-def _usage_of(payload: bytes) -> Optional[Dict[str, Any]]:
-    try:
-        text = payload.decode("utf-8")
-    except UnicodeDecodeError:
-        return None
-    for line in text.splitlines():
-        if not line.startswith("data:"):
-            continue
-        chunk = line[5:].strip()
-        if not chunk or chunk == "[DONE]":
-            continue
-        try:
-            obj = json.loads(chunk)
-        except ValueError:
-            continue
-        if isinstance(obj, dict) and isinstance(obj.get("usage"), dict):
-            return obj["usage"]
-    return None
