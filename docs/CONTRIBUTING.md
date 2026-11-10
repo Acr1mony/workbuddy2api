@@ -83,6 +83,13 @@ def _foo(panel: Panel, req: Any) -> Response:
 - 改完跑一遍全量单测与 `python -m wb2api doctor`，把结果贴进 PR 描述。
 - **不要**提交 `data/`、`logs/`、`config.json`（`.gitignore` 已覆盖）。
 
+## 版本号
+
+- **默认只进 `0.0.1`**（`1.9.1` → `1.9.2`）。修 bug、改 UI、加一个端点、补文档，都算 patch。
+- 只有"别人需要重新读文档才能用"的量级才进 `0.1.0`（新增协议入口、配置结构变化、行为不兼容）。
+- `1.0.0` 以上不再因为"功能变多"而进主版本号。
+- 两处一起改：`pyproject.toml` 的 `version` 与 `wb2api/__init__.py` 的 `VERSION`（`_scratch/bump_version.py 1.9.2` 可代劳），然后重跑 `python tools/gen_example_config.py`。
+
 ## 常见坑（踩过的）
 
 | 症状 | 原因 |
