@@ -457,6 +457,25 @@ class Pool:
         entry = accounts[0].model_cooldowns.get(model) or {}
         return {"until": min(untils), "reason": str(entry.get("reason") or "")}
 
+    def earliest_ready(self, realm: str = "", model: str = "", now: Optional[float] = None) -> Optional[float]:
+        """距离"下一次有号能用"还有多少秒；池子里根本没有候选号时返回 ``None``。
+
+        这个值最终会变成 ``503 no_account`` 上的 ``Retry-After``：客户端与服务端对
+        "等多久"有同一个答案，才不会出现客户端每 200ms 撞一次、把冷却越撞越长。
+        """
+        now = util.now() if now is None else now
+        best: Optional[float] = None
+        for account in self.store.list_accounts(realm):
+            if account.disabled or getattr(account, "paused", False):
+                continue
+            until, _window = throttle_until(account, model or "")
+            if until <= now:
+                return 0.0
+            wait = until - now
+            if best is None or wait < best:
+                best = wait
+        return best
+
     def _mark_used(self, account: Account) -> None:
         with self._lock:
             self._used_seq += 1

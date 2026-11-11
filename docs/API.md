@@ -30,7 +30,7 @@
 | 429 | `rate_limited` | 真限流 | 看响应头 `Retry-After` 退避重试 |
 | 429 | `key_concurrency_exceeded` | 这把 key 自己的并发上限满了（`max_concurrency`） | 等自己的请求结束，或加并发上限 |
 | 429 | `key_rate_limited` | 这把 key 自己的每分钟速率满了（`rate_limit`，滑动窗口） | 等 `Retry-After` 秒再发 |
-| 503 | `no_account` | 池里没有可用账号（冷却/禁用/暂停/槽满） | 等冷却结束或去面板加号 |
+| 503 | `no_account` | 池里没有可用账号（冷却/禁用/暂停/槽满） | 等冷却结束或去面板加号；响应头带 `Retry-After`（池子算好的最早解禁秒数） |
 | 503 | `upstream_unavailable` | 上游 5xx | 稍后重试（有 `Retry-After` 时按它来） |
 | 503 | `upstream_timeout` | 上游超时 | 稍后重试；网关**不会**替你换号重发 |
 | 503 | `account_auth_failed` | 账号令牌失效需要重新登录 | 面板里重新授权 |
@@ -179,6 +179,32 @@ curl -s http://127.0.0.1:8788/v1/messages \
 
 本地估算（不打上游）：按"字符数 / 2.2"取整，偏保守。返回 `{"input_tokens": 123}`。
 
+### `POST /v1/responses`（OpenAI Responses 形状）
+
+Codex CLI 和新版 OpenAI SDK 只认这个入口。字段映射：
+
+| Responses | 上游 chat/completions |
+|---|---|
+| `instructions` | `messages[0]`（system） |
+| `input`（字符串 / 数组 / 对象） | `messages`（`input_text`/`output_text` → text 部件，`function_call` → assistant.tool_calls，`function_call_output` → role=tool） |
+| `tools`（只有 `type: "function"`） | `tools`；`web_search` / `file_search` 等内置工具直接跳过 |
+| `tool_choice: {"type":"function","name":X}` | `{"type":"function","function":{"name":X}}` |
+| `max_output_tokens` | `max_tokens` |
+| `text.format: {"type":"json_object"}` | `response_format` |
+| `reasoning.effort` | `reasoning_effort` |
+
+响应里 `output` 是 item 列表：`reasoning`（带 summary 文本）、`message`（`content: [{type:"output_text"}]`）、`function_call`（`arguments` 是字符串）。`status` 为 `completed`；被 token 预算截断时是 `incomplete` + `incomplete_details: {"reason": "max_output_tokens"}`。`usage` 映射成 `{input_tokens, output_tokens, input_tokens_details:{cached_tokens}, output_tokens_details:{reasoning_tokens}}`。
+
+流式用 `event:` + `data:` 双行（**不发 `[DONE]`**，Responses 协议本身就没有），事件依次是 `response.created` → `response.in_progress` → 若干 `response.output_item.added` / `response.output_text.delta` / `response.reasoning_summary_text.delta` / `response.function_call_arguments.delta` → `response.output_text.done` 等逐项 done → `response.completed`（或 `response.failed`）。每帧带单调递增的 `sequence_number`。
+
+```bash
+curl -s http://127.0.0.1:8788/v1/responses \
+  -H "Authorization: Bearer sk-你的密钥" -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v3","instructions":"be brief","input":"1+1=?","max_output_tokens":64}'
+```
+
+Codex CLI：`OPENAI_BASE_URL=http://127.0.0.1:8788/v1`、`OPENAI_API_KEY=sk-...`，并把它配置里的 `wire_api` 设为 `responses`。
+
 ### `GET /v1/models`
 
 ```json
@@ -321,6 +347,8 @@ X-Panel-Token: 1762500000.9f3c...
 | `GET /api/requests?limit=100&status=&model=&account=&q=` | **逐请求明细**（落盘 + 内存环形，默认留 500 条 / 3 天）。每行：`at/iso/request_id/model/account/status/outcome/attempts/elapsed_ms/ttft_ms/prompt_tokens/completion_tokens/credit/path/client_ip/ua/error`。`ttft_ms` 对**非流式**请求是 `null`（没有"首字"这回事，写 0 会让分位数说谎）。`status` 支持 `200`、`4xx`、`5xx`、`error`；`q` 是大小写不敏感的子串（匹配模型/账号/错误/request id）。返回 `{"items":[...],"filters":{...},"stats":{buffered,files,enabled}}` |
 | `GET /api/dumps?limit=50` | **失败报文摘要**（默认每天最多 200 条、3 天、body 截 8KB）。返回 `{"items":[{request_id,time,status,code,message,model,account,kind}],"stats":{...}}`，**不含 body** |
 | `GET /api/dumps/{request_id}` | 单条完整报文：`{"request_headers":{...已脱敏},"response_headers":{...},"body":"上游原文","truncated":bool,...}`。未知 id → 404 `unknown_dump` |
+| `GET /api/dumps/{request_id}/preview` | **净化前后对照，一个字节都不发上游**：`{"changed","changes":[{index,role,before,after}],"system_before","system_after","prompt_mode"}`。没留请求体 → 404 `no_request_body`，留了但被截断 → 400 `truncated_body` |
+| `POST /api/dumps/{request_id}/replay` | 用存下来的体重发一次，判断"上游到底认不认这个请求"。body 可选 `{"sanitize":true\|false,"realm":"","model":""}`（`sanitize` 不传则沿用当前 `prompt.mode`）。**不换号、不重试、强制非流式**；成功 `{ok:true,status,sample,usage,elapsed_ms,credit}`，失败 `{ok:false,status,code,message}`。这次重发会进台账（`kind="replay"`、`request_id="replay:<原id>"`），因为它真的花了积分 |
 | `GET /api/proxies?realm=` | **出口代理池**：`{"total","ready","cooling","entries":[{url(掩码),realm,weight,note,enabled,failures,cooldown_for,cooldown_until,used}]}` |
 | `POST /api/proxies` | `{"action":"add"\|"remove"\|"update"\|"reset","url":"http://user:pass@host:port","realm":"cn"\|"global"\|"","weight":1,"note":"","enabled":true}`。重复 `add` → 400 `duplicate_proxy`，未知 `url` → 404 `unknown_proxy`；改完即写入 `pool.proxies` 并落盘 |
 | `GET /api/pool` | 池状态：可用/冷却/停用/暂停/在途、余额合计、各域策略、风控连坐剩余时间；`affinity` 子对象给出会话粘滞的 `sessions`/`hits`/`misses`/`hit_rate`/`page_size`/`rotations`（命中率低说明粘滞没起作用，首字延迟会变差；`rotations` 高说明有长会话在按页换号）；`model_locks` 是"这个模型被几个号同时挡住、最晚什么时候解"（单号详情只能看到自己那份，这里是全局视图）；`waf` 给出两个域的 WAF 波次状态——`active: true` 意味着近一分钟内有 ≥2 个不同账号被边缘拦截，网关会直接拒掉新请求一分钟，而不是继续换号 |

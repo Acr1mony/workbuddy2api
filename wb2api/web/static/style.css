@@ -654,3 +654,14 @@ pre.log {
   flex: 1 1 140px;
   margin: 0 !important;
 }
+
+/* 失败报文卡里的回放按钮条 */
+.replay-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.replay-bar .muted { margin-left: auto; }

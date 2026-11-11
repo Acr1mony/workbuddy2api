@@ -97,14 +97,15 @@ wb2a login --realm global   # 另一个域
 
 ---
 
-## 两种协议
+## 三种协议
 
 | 入口 | 给谁用 |
 | --- | --- |
 | `POST /v1/chat/completions` | OpenAI SDK、各种兼容 OpenAI 的客户端 |
-| `POST /v1/messages`（+ `/v1/messages/count_tokens`） | Claude Code、Codex 这类只会说 Anthropic 协议的客户端 |
+| `POST /v1/messages`（+ `/v1/messages/count_tokens`） | Claude Code 这类只会说 Anthropic 协议的客户端 |
+| `POST /v1/responses` | Codex CLI、新版 OpenAI SDK（只认 Responses 协议） |
 
-两边走同一套选号、重试、冷却、台账：
+三个入口走同一套选号、重试、冷却、台账：
 
 ```bash
 curl -s http://127.0.0.1:8788/v1/messages \
@@ -112,7 +113,8 @@ curl -s http://127.0.0.1:8788/v1/messages \
   -d '{"model":"deepseek-v4-flash","max_tokens":256,"messages":[{"role":"user","content":"hi"}]}'
 ```
 
-Claude Code 里当自定义端点填：`ANTHROPIC_BASE_URL=http://127.0.0.1:8788`、`ANTHROPIC_API_KEY=sk-...`。
+Claude Code 里当自定义端点填：`ANTHROPIC_BASE_URL=http://127.0.0.1:8788`、`ANTHROPIC_API_KEY=sk-...`；
+Codex CLI 填：`OPENAI_BASE_URL=http://127.0.0.1:8788/v1`、`OPENAI_API_KEY=sk-...`，`wire_api` 选 `responses`。
 
 ## 模型
 
@@ -141,7 +143,7 @@ Claude Code 里当自定义端点填：`ANTHROPIC_BASE_URL=http://127.0.0.1:8788
 | 账号 | 搜索筛选排序分页；每行说清**为什么现在不接单**（冷却/熔断/风控/余额各自倒计时）；点「详情」看这个号的全部因果（窗口剩多久、哪些模型被单独封、余额什么时候过期、花掉多少积分、最近请求）；备注/分组/权重行内改；批量测试/续期/查额度/签到/启停/暂停；导出导入备份 |
 | 用量 | 按模型 / 账号 / key / 天四个维度 |
 | 日志 | 尾部日志，关键字过滤 |
-| 请求 | 逐请求明细，以及**失败报文**：上游拒绝时的原话，连我们发出去的请求体一起留（脱敏后） |
+| 请求 | 逐请求明细，以及**失败报文**：上游拒绝时的原话，连我们发出去的请求体一起留（脱敏后）。每条报文可以「看看净化会改成什么」（不发上游）和「用净化后的体重发一次」（真发、花积分、结果进台账） |
 | 设置 | 监听、面板密码、客户端密钥（明文只显示一次，可设并发上限与每分钟速率、点选限定模型）、出口代理池、提示词模式、17 个可在线调的参数 |
 
 「暂停」和「停用」不是一回事：停用是"这个号不要了"，暂停是"先按住它、令牌和余额都留着"。

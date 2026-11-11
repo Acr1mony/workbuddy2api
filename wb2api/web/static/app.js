@@ -23,7 +23,8 @@
     logFollow: true,
     timers: {},
     status: null,
-    tunables: []
+    tunables: [],
+    dumpId: ""
   };
 
   var $ = function (sel) { return document.querySelector(sel); };
@@ -1767,8 +1768,63 @@
         lines.push(row.body || "");
         box.hidden = false;
         box.textContent = lines.join("\n");
+        state.dumpId = row.request_id || requestId;
+        var bar = $("#dump-replay");
+        if (bar) bar.hidden = false;
+        var out = $("#dump-replay-out");
+        if (out) { out.hidden = true; out.textContent = ""; }
+        var note = $("#dump-replay-note");
+        if (note) note.textContent = "";
       })
       .catch(function (err) { toast("bad", "读原文失败", err.message); });
+  }
+
+  // 回放是"诊断工具"，所以两条路都显式摆出来：先看净化会改什么（不打上游），
+  // 再决定要不要真发一次（会花积分）。
+  function previewDump() {
+    var id = state.dumpId;
+    if (!id) return;
+    api("/api/dumps/" + encodeURIComponent(id) + "/preview")
+      .then(function (data) {
+        var out = $("#dump-replay-out");
+        if (!out) return;
+        var lines = [];
+        lines.push("prompt.mode = " + (data.prompt_mode || ""));
+        lines.push("会改动的消息：" + (data.changed ? data.changes.length + " 条" : "无（原本就干净）"));
+        (data.changes || []).forEach(function (item) {
+          lines.push("");
+          lines.push("--- #" + item.index + " " + item.role + " ---");
+          lines.push("改前：" + item.before);
+          lines.push("改后：" + item.after);
+        });
+        out.hidden = false;
+        out.textContent = lines.join("\n");
+      })
+      .catch(function (err) { toast("bad", "预览失败", err.message); });
+  }
+
+  function replayDump() {
+    var id = state.dumpId;
+    if (!id) return;
+    var note = $("#dump-replay-note");
+    if (note) note.textContent = "正在重发…";
+    api("/api/dumps/" + encodeURIComponent(id) + "/replay", { method: "POST", body: { sanitize: true } })
+      .then(function (data) {
+        var out = $("#dump-replay-out");
+        if (out) {
+          out.hidden = false;
+          out.textContent = data.ok
+            ? "状态 " + data.status + "，用时 " + (data.elapsed_ms || 0) + "ms，积分 " + (data.credit || 0) + "\n\n" + (data.sample || "（空回复）")
+            : "失败了：状态 " + data.status + " code=" + data.code + "\n" + (data.message || "");
+        }
+        if (note) note.textContent = data.ok ? "重发成功（已记入台账）" : "重发失败";
+        toast(data.ok ? "ok" : "bad", data.ok ? "重发完成" : "重发失败", data.ok ? "已记入台账" : (data.message || ""));
+        loadRequests();
+      })
+      .catch(function (err) {
+        if (note) note.textContent = "";
+        toast("bad", "重发失败", err.message);
+      });
   }
 
   function loadProxies() {
@@ -1870,6 +1926,10 @@
       proxyMutate({ action: "update", url: btn.getAttribute("data-url"), enabled: btn.getAttribute("data-enabled") !== "1" },
         "已更新出口");
     });
+    var previewBtn = $("#dump-preview-btn");
+    if (previewBtn) previewBtn.addEventListener("click", previewDump);
+    var replayBtn = $("#dump-replay-btn");
+    if (replayBtn) replayBtn.addEventListener("click", replayDump);
   }
 
   function main() {

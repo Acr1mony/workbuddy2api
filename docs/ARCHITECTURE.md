@@ -224,13 +224,16 @@ logs/
 | `errors.py` | `upstream` | 纯函数，不碰账号、不碰池、不碰磁盘 |
 | `relay.py`（`RelayMixin`） | `sse`, `adapters.chat`, `errors` | 不选号、不换号 |
 | `failover.py`（`FailoverMixin`） | `pool`, `errors`, `egress`, `proxies` | 不写 SSE 帧 |
+| `endpoint_models.py`（`ModelsEndpoint`） | `models`, `identity` | 只拼形状，不参与选号 |
+| `endpoint_responses.py`（`ResponsesEndpoint`） | `adapters.responses`, `relay` | 翻译在适配器里，这里只编排 |
+| `replay.py` | `adapters.chat`, `diagnostics`, `errors` | 不换号、不重试：一次回放就是一次观测 |
 | `service.py` | 以上全部 | 不碰 `Request` 以外的 HTTP 细节 |
 | `routes_*.py`, `web/` | `httpserver`, `service` | 不直接打上游 |
 | `scheduler.py` | `service` | 不起第二个 HTTP 服务器 |
 
 新增能力时先问"它属于哪一层"：改写请求体 → `adapters/chat.py`；新的上游端点 → 各自模块 + `service` 里的方法；新的管理操作 → `routes_admin.py`。
 
-`service.py` 曾经长到 1298 行（约定是 700），2026-11 按"谁会读这段代码"拆成三块：`relay.py`（流式转发 + 记账，改这段的人关心的是帧和台账）、`failover.py`（错误处置，改这段的人关心的是"这个码要不要换号"）、`errors.py`（错误翻译，纯函数，可以脱离网关单独测）。`GatewayService(RelayMixin, FailoverMixin)` 多继承接回去，调用方与测试的 import 路径都不变。`tests/test_request_id.py::ModuleLayoutTest` 守着两条线：`service.py` 不许再超过 700 行，方法名不许在 service 和 mixin 里各写一遍（MRO 会静默选一个，是最难查的那种 bug）。
+`service.py` 曾经长到 1298 行（约定是 700），2026-11 按"谁会读这段代码"拆成三块：`relay.py`（流式转发 + 记账，改这段的人关心的是帧和台账）、`failover.py`（错误处置，改这段的人关心的是"这个码要不要换号"）、`errors.py`（错误翻译，纯函数，可以脱离网关单独测）。`GatewayService(RelayMixin, FailoverMixin)` 多继承接回去，调用方与测试的 import 路径都不变。加 `/v1/responses` 时 `service.py` 又涨到 707 行，于是 `ModelsEndpoint` 也搬了出去（`endpoint_models.py`）——**行数上限不是洁癖，它是"这个文件还能一次读完"的唯一可执行指标**。`tests/test_request_id.py::ModuleLayoutTest` 守着两条线：`service.py` 不许再超过 700 行，方法名不许在 service 和 mixin 里各写一遍（MRO 会静默选一个，是最难查的那种 bug）。
 
 ## 已知取舍与未尽事项
 

@@ -540,6 +540,40 @@ class TestObservability(ServerCase):
         self.assertEqual(status, 404)
         self.assertEqual(self.json_of(data)["error"]["code"], "unknown_dump")
 
+    def test_dump_preview_shows_sanitized_text_without_calling_upstream(self):
+        self.service.diag.dump(
+            request_id="req_p", model="deepseek-v3", realm="cn", status=400, code="11-128",
+            body='{"code":"11-128"}', request_headers={},
+            request_body=json.dumps({
+                "model": "deepseek-v3",
+                "messages": [
+                    {"role": "system", "content": "You are an AI agent powered by DeepSeek Harness."},
+                    {"role": "user", "content": "hi"},
+                ],
+            }),
+        )
+        token = self.panel_token()
+        from tests.test_service import FakeClient
+        original = self.service.client
+        fake = FakeClient([])
+        self.service.client = fake
+        try:
+            status, _headers, data = self._get("/api/dumps/req_p/preview", token)
+        finally:
+            self.service.client = original
+        self.assertEqual(status, 200)
+        payload = self.json_of(data)
+        self.assertTrue(payload["changed"])
+        self.assertIn("helpful AI assistant", payload["system_after"][0])
+        # 预览绝对不能打上游（只是看字面会变成什么）
+        self.assertEqual(fake.calls, [])
+
+    def test_dump_replay_unknown_id_is_404(self):
+        token = self.panel_token()
+        status, _headers, data = self._post("/api/dumps/nope/replay", {"sanitize": True}, token)
+        self.assertEqual(status, 404)
+        self.assertEqual(self.json_of(data)["error"]["code"], "unknown_dump")
+
     def test_proxies_crud_roundtrip(self):
         token = self.panel_token()
         status, _headers, data = self._post(

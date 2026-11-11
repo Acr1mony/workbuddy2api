@@ -392,6 +392,12 @@
           </table>
         </div>
         <pre class="log" id="dump-body" hidden></pre>
+        <div class="replay-bar" id="dump-replay" hidden>
+          <button class="ghost tiny-btn" id="dump-preview-btn">看看净化会改成什么</button>
+          <button class="ghost tiny-btn" id="dump-replay-btn">用净化后的体重发一次</button>
+          <span class="muted tiny" id="dump-replay-note"></span>
+        </div>
+        <pre class="log" id="dump-replay-out" hidden></pre>
         <p class="muted tiny" style="margin:6px 0 0">
           只留被拒的请求，且 Authorization / Cookie / 令牌串都已脱敏；默认单条 8KB、每天最多 200 条。
         </p>

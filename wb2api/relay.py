@@ -143,6 +143,109 @@ class RelayMixin:
                 except Exception:
                     log.exception("标记成功失败（%s）", model)
 
+    # -- Responses（Codex / 新版 SDK）--------------------------------------
+    def _relay_responses(
+        self,
+        *,
+        account: Any,
+        response: Any,
+        stream: Any,
+        model: str,
+        realm: str,
+        key: Optional[ApiKey],
+        started: float,
+        stick: str = "",
+        request_id: str = "",
+        attempts: int = 1,
+        alias: str = "",
+        key_slot: str = "",
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Iterator[bytes]:
+        """把上游的 chat 流转成 ``/v1/responses`` 的事件流。"""
+        from .adapters import responses as resp_adapter
+
+        idle = float(self.cfg.get("upstream.idle_timeout_seconds", 300))
+        usage: Dict[str, Any] = {}
+        outcome = "completed"
+        error_text = ""
+        ttft: Optional[float] = None
+        first = True
+        finish_reason = "stop"
+        try:
+            for item in stream.start():
+                yield resp_adapter.stream_frames([item]).__next__()
+            for parsed in sse.iter_sse(response.iter_text(idle), heartbeat=self._heartbeat()):
+                if parsed.event == sse.HEARTBEAT_EVENT:
+                    yield sse.HEARTBEAT_BYTES
+                    continue
+                if parsed.event == "done" or (parsed.data or "").strip() == "[DONE]":
+                    break
+                raw = (parsed.data or "").strip()
+                if not raw:
+                    continue
+                try:
+                    chunk = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(chunk, dict):
+                    continue
+                if chunk.get("usage"):
+                    usage = chunk["usage"] or usage
+                for choice in chunk.get("choices") or []:
+                    if choice.get("finish_reason"):
+                        finish_reason = str(choice["finish_reason"])
+                if not chunk.get("choices") and not chunk.get("usage"):
+                    continue
+                if first:
+                    ttft = (time.time() - started) * 1000.0
+                    first = False
+                for item in stream.feed(chunk):
+                    yield resp_adapter.stream_frames([item]).__next__()
+            for item in stream.finish(finish_reason=finish_reason, usage=usage or None):
+                yield resp_adapter.stream_frames([item]).__next__()
+        except GeneratorExit:
+            outcome = "client_aborted"
+            raise
+        except UpstreamError as err:
+            outcome = "upstream_aborted"
+            error_text = err.message or str(err)
+            for item in stream.error("上游流中断：" + error_text[:200], "upstream_error"):
+                yield resp_adapter.stream_frames([item]).__next__()
+        except Exception as exc:
+            outcome = "failed"
+            error_text = str(exc)
+            log.exception("Responses 流处理失败 %s/%s", realm, model)
+            for item in stream.error("网关转发失败：" + error_text[:200], "gateway_error"):
+                yield resp_adapter.stream_frames([item]).__next__()
+        finally:
+            self.pool.release(account)
+            self._release_key(key_slot)
+            try:
+                response.close()
+            except Exception:
+                pass
+            if not usage.get("completion_tokens") and stream.output_tokens:
+                usage = dict(usage)
+                usage["completion_tokens"] = stream.output_tokens
+            if not usage.get("prompt_tokens") and stream.input_tokens:
+                usage = dict(usage)
+                usage["prompt_tokens"] = stream.input_tokens
+            try:
+                self._record(
+                    started=started, model=model, realm=realm, account=account, key=key,
+                    stream=True, outcome=outcome, usage=usage,
+                    status=200 if outcome == "completed" else 499, ttft=ttft,
+                    error=error_text, request_id=request_id, attempts=attempts,
+                    alias=alias, kind="responses", extra=extra,
+                )
+            except Exception:
+                log.exception("记账失败（%s）", model)
+            if outcome == "completed":
+                try:
+                    self.pool.note_success(account, model=model, session_key=stick)
+                except Exception:
+                    log.exception("标记成功失败（%s）", model)
+
     # -- 选号 + 出站 --------------------------------------------------------
 
     def _relay_stream(

@@ -111,6 +111,8 @@ def register(router: Router, service: Any) -> None:
     # Anthropic 形状：Claude Code / Codex 只认这个入口。count_tokens 不需要打上游。
     router.add("POST", r"/v1/messages", anthropic_guard(lambda req: service.messages(req)))
     router.add("POST", r"/v1/messages/count_tokens", anthropic_guard(lambda req: _count_tokens(req)))
+    # Responses 形状：Codex CLI 与新版 SDK 只认这个入口（OpenAI 的错误信封）。
+    router.add("POST", r"/v1/responses", guard(lambda req: service.responses(req)))
     router.add("GET", r"/v1/models", guard(lambda req: service.models(req)))
     router.add("GET", r"/healthz", lambda req: json_response({"ok": True}))
     router.add("GET", r"/status", guard(lambda req: json_response(service.status(req))))

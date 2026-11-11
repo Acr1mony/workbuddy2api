@@ -51,6 +51,8 @@ from .errors import (
     client_error,
     parse_reset_clock,
 )
+from .endpoint_models import ModelsEndpoint
+from .endpoint_responses import ResponsesEndpoint
 from .failover import FailoverMixin
 from .relay import RelayMixin, _is_usage_frame, _mentions_model, _num, _tool_names, _usage_of
 
@@ -80,7 +82,7 @@ def _request_id(request: Any) -> str:
     return "req_" + util.rand_hex(8)
 
 
-class GatewayService(RelayMixin, FailoverMixin):
+class GatewayService(RelayMixin, FailoverMixin, ResponsesEndpoint, ModelsEndpoint):
     """网关的全部业务逻辑。HTTP 层只负责把 Request 递进来、把 Response 发出去。"""
 
     def __init__(self, cfg: Any, store: Any, client: Optional[UpstreamClient] = None) -> None:
@@ -482,8 +484,14 @@ class GatewayService(RelayMixin, FailoverMixin):
                         f"模型 {model} 在上游不可用（{detail}），请换一个模型",
                         400, "model_unavailable", "invalid_request_error",
                     )
+                # 池子知道最早什么时候会有号解禁：直接告诉客户端等多久，比让它在
+                # "等一会儿再说"里反复撞墙强。没有可靠的等待时间就不编一个。
+                wait = self.pool.earliest_ready(realm, model)
+                hint = f"，最早约 {int(wait)} 秒后恢复" if wait and wait > 0 else ""
                 raise ServiceError(
-                    f"{realm} 域没有可用账号（都被冷却或未启用）", 503, "no_account", "api_error"
+                    f"{realm} 域没有可用账号（都被冷却或未启用）{hint}",
+                    503, "no_account", "api_error",
+                    retry_after=min(float(wait), 3600.0) if wait and wait > 0 else 0.0,
                 )
             exclude.append(account.key)
 
@@ -494,7 +502,8 @@ class GatewayService(RelayMixin, FailoverMixin):
                 self._pace(account)
                 url = self.client.base_url(realm) + CHAT_PATH
                 headers = identity.chat_headers(
-                    account, self.cfg, meta=meta, client_ip=request.client_ip
+                    account, self.cfg, meta=meta,
+                    client_ip=str(getattr(request, "client_ip", "") or ""),
                 )
                 proxy = str(getattr(account, "proxy", "") or "")
                 if not proxy and self.proxies.enabled():
@@ -581,41 +590,6 @@ class GatewayService(RelayMixin, FailoverMixin):
             request.state["model_alias"] = raw
         return model, realm
 
-    def models(self, request: Any) -> Any:
-        from .httpserver import json_response
-
-        token = request.bearer() or request.arg("api_key")
-        key = self.authenticate(token)
-        realm = self.resolve_realm(request.arg("realm"), key, request.header("X-Realm"))
-        self._ensure_catalog(realm)
-        allowed = key.allows_model if key is not None else None
-        return json_response(self.catalog.openai_list(realm, allowed))
-
-    def catalog_view(self, realm: str = "") -> Dict[str, Any]:
-        """面板用：把模型列成"可以直接多选"的清单。
-
-        `realm` 留空时返回两个域的全部（配一把 key 本来就不该被迫先选域），
-        每项都带 `realm`，选中之后写进 `key.models` 的是确定的模型 id。
-        """
-        realms = [identity.normalize_realm(realm)] if realm else ["cn", "global"]
-        rows: List[Dict[str, Any]] = []
-        for item in realms:
-            self._ensure_catalog(item)
-            for info in self.catalog.entries(item, chat_only=True):
-                if self.catalog.hidden(info.id):
-                    continue
-                row: Dict[str, Any] = {"id": info.id, "name": info.name, "realm": item}
-                if info.alias_of:
-                    row["alias_of"] = info.alias_of
-                if info.max_output:
-                    row["max_output_tokens"] = info.max_output
-                if info.context_length:
-                    row["context_length"] = info.context_length
-                rows.append(row)
-        rows.sort(key=lambda entry: (entry["realm"], entry["id"]))
-        counts = {item: sum(1 for entry in rows if entry["realm"] == item) for item in realms}
-        return {"models": rows, "realms": counts, "total": len(rows)}
-
     def refresh_credit(self, account: Any, realm: str = "", note: str = "") -> Dict[str, Any]:
         """刷新一个账号的余额，并把"钱什么时候过期"一起留下。
 
@@ -671,14 +645,6 @@ class GatewayService(RelayMixin, FailoverMixin):
             "package_count": summary.get("package_count") or 0,
             "packages": summary.get("packages") or [],
         }
-
-    def _ensure_catalog(self, realm: str) -> None:
-        if self.catalog.names(realm):
-            return
-        accounts = [item for item in self.store.list_accounts(realm) if item.enabled and item.access_token]
-        if not accounts:
-            return
-        self.catalog.fetch(accounts[0], realm)
 
     def status(self, request: Any = None) -> Dict[str, Any]:
         # /status 里有账号数量、余额合计与用量：这些不该匿名可见，所以和 /v1/* 同等待遇。

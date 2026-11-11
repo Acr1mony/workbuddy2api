@@ -139,6 +139,16 @@ def register(router: Router, panel: Panel) -> None:
     router.add("GET", r"/api/requests", lambda req: _requests(panel, req))
     router.add("GET", r"/api/dumps", lambda req: _dumps(panel, req))
     router.add("GET", r"/api/dumps/(?P<request_id>[^/]+)", lambda req, request_id: _dump(panel, req, request_id))
+    router.add(
+        "GET",
+        r"/api/dumps/(?P<request_id>[^/]+)/preview",
+        lambda req, request_id: _dump_preview(panel, req, request_id),
+    )
+    router.add(
+        "POST",
+        r"/api/dumps/(?P<request_id>[^/]+)/replay",
+        lambda req, request_id: _dump_replay(panel, req, request_id),
+    )
     router.add("GET", r"/api/proxies", lambda req: _proxies(panel, req))
     router.add("POST", r"/api/proxies", lambda req: _proxies_post(panel, req))
 
@@ -951,6 +961,43 @@ def _dump(panel: Panel, req: Any, request_id: str) -> Response:
     if record is None:
         raise BadRequest("没有这条失败报文（可能已过期或从未落盘）", 404, "unknown_dump")
     return json_response(record)
+
+
+def _dump_preview(panel: Panel, req: Any, request_id: str) -> Response:
+    """净化前后对照：只做本地翻译，一个字节都不发上游。"""
+    from . import replay as replay_mod
+    from .errors import ServiceError
+
+    panel.require(req)
+    try:
+        data = replay_mod.preview(panel.service, request_id, req.arg("realm", ""), req.arg("model", ""))
+    except ServiceError as exc:
+        return error_response(exc.status, exc.message, exc.code)
+    return json_response(data)
+
+
+def _dump_replay(panel: Panel, req: Any, request_id: str) -> Response:
+    """照着实发一次。默认沿用当前 prompt 模式；``sanitize`` 可显式覆盖。"""
+    from . import replay as replay_mod
+    from .errors import ServiceError
+
+    panel.require(req)
+    _require_writable(panel, req)
+    body = req.json_body()
+    body = body if isinstance(body, dict) else {}
+    sanitize = body.get("sanitize")
+    try:
+        result = replay_mod.replay(
+            panel.service,
+            request_id,
+            sanitize=bool(sanitize) if sanitize is not None else None,
+            realm=str(body.get("realm") or ""),
+            model=str(body.get("model") or ""),
+            request=req,
+        )
+    except ServiceError as exc:
+        return error_response(exc.status, exc.message, exc.code)
+    return json_response(result)
 
 
 def _proxies(panel: Panel, req: Any) -> Response:
