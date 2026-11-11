@@ -26,6 +26,7 @@ from .log import get_logger
 from .probe import probe_account
 from .service import ServiceError
 from .pool import throttle_until
+from .proxies import describe_binding
 from .store import Account, ApiKey
 
 log = get_logger("panel")
@@ -224,6 +225,9 @@ def _accounts(panel: Panel, req: Any) -> Response:
         row["throttle_for"] = int(max(0.0, (wait or 0) - now))
         row["throttle_reason"] = window
         row["in_flight"] = getattr(account, "in_flight", 0)
+        egress, shared = describe_binding(panel.service.proxies, account.uid)
+        row["egress"] = egress
+        row["egress_shared"] = shared
         rows.append(row)
     return json_response({"accounts": rows, "realm": realm or "all"})
 
@@ -358,6 +362,10 @@ def _account_detail(panel: Panel, req: Any, uid: str) -> Response:
     row["throttle_for"] = int(max(0.0, (wait or 0) - now))
     row["throttle_reason"] = window
     row["in_flight"] = getattr(account, "in_flight", 0)
+    egress, shared = describe_binding(panel.service.proxies, account.uid)
+    row["egress"] = egress
+    row["egress_shared"] = shared
+    row["egress_manual"] = str(getattr(account, "proxy", "") or "") != ""
 
     summary = panel.service.ledger.summary()
     usage = dict(summary.get("by_account", {}).get(account.uid) or {})
@@ -441,6 +449,11 @@ def _account_action(panel: Panel, req: Any, uid: str, action: str) -> Response:
             panel.service.affinity.drop(account.key)
         except Exception:  # 亲和表里没有也无所谓
             pass
+        # 出口绑定跟着账号走：号删了，那个出口就该空出来给别的号用。
+        try:
+            panel.service.proxies.release(account.uid)
+        except Exception:
+            log.debug("释放出口绑定失败", exc_info=True)
         log.info("删除账号 %s", account.label)
         return json_response({"ok": True})
     if action == "test":
@@ -1002,9 +1015,8 @@ def _dump_replay(panel: Panel, req: Any, request_id: str) -> Response:
 
 def _proxies(panel: Panel, req: Any) -> Response:
     panel.require(req)
-    stats = panel.service.proxies.stats(req.arg("realm", ""))
+    stats = panel.service.proxies.stats()
     stats["enabled"] = panel.service.proxies.enabled()
-    stats["realm"] = req.arg("realm", "")
     return json_response(stats)
 
 
@@ -1020,19 +1032,24 @@ def _proxies_post(panel: Panel, req: Any) -> Response:
         url = str(body.get("url") or "").strip()
         if not url:
             raise BadRequest("缺少 url", 400, "missing_url")
-        added = pool.add(url, realm=str(body.get("realm") or ""), weight=body.get("weight", 1.0), note=str(body.get("note") or ""))
+        added = pool.add(url, weight=body.get("weight", 1.0), note=str(body.get("note") or ""))
         if not added:
             raise BadRequest("这个出口已经在池里了（或者地址不合法）", 400, "duplicate_proxy")
     elif action in ("remove", "delete"):
         url = str(body.get("url") or "").strip()
         if not pool.remove(url):
             raise BadRequest("池里没有这个出口", 404, "unknown_proxy")
+        _drop_egress_bindings(panel, url)
     elif action in ("update", "set"):
         url = str(body.get("url") or "").strip()
         if not pool.update(url, **{k: v for k, v in body.items() if k not in ("action", "url")}):
             raise BadRequest("池里没有这个出口", 404, "unknown_proxy")
     elif action == "reset":
         pool.reset_health()
+    elif action in ("rebind", "shuffle"):
+        # 重新洗牌：清掉所有账号的出口绑定，下次请求按"占用最少"重新分配。
+        pool.rebind_all()
+        _drop_egress_bindings(panel, "")
     else:
         raise BadRequest("未知操作：%s" % action, 400, "bad_action")
     # 池子的真源是配置：改完就写回去，否则重启就回到旧列表。
@@ -1041,6 +1058,28 @@ def _proxies_post(panel: Panel, req: Any) -> Response:
         panel.cfg.save()
     except Exception:
         log.debug("保存出口池配置失败", exc_info=True)
-    stats = pool.stats("")
+    stats = pool.stats()
     stats["enabled"] = pool.enabled()
     return json_response(stats)
+
+
+def _drop_egress_bindings(panel: Panel, url: str) -> None:
+    """删除出口（``url=""`` 表示全部）后，把账号上指向它的绑定点清掉。
+
+    不清的话账号会一直带着一个不存在的出口，而 ``observe`` 在启动时又会把它
+    悄悄丢掉——同一条数据两处不同解释，排障时最费时间。
+    """
+    touched = False
+    for account in panel.store.list_accounts(""):
+        extra = getattr(account, "extra", None)
+        if not isinstance(extra, dict):
+            continue
+        bound = str(extra.get("egress") or "")
+        if bound and (not url or bound == url):
+            extra.pop("egress", None)
+            touched = True
+    if touched:
+        try:
+            panel.store.save_accounts()
+        except Exception:
+            log.debug("清理出口绑定失败", exc_info=True)

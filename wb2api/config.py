@@ -147,9 +147,10 @@ DEFAULTS: Dict[str, Any] = {
         "idle_weight_per_hour": 0.5,
         "idle_weight_max": 5.0,
         # --- 出口代理池 ---------------------------------------------------
-        # 形状：["socks5h://user:pass@host:port", {"url": "...", "realm": "global", "weight": 2}]
-        # 空表示直连。上游是按"机器 id + 出口 IP"看请求形状的，出口全是同一个家宽
-        # 地址时，账号再多也只是同一台机器在轮着用。
+        # 形状：["socks5h://user:pass@host:port", {"url": "http://10.0.0.9:3128", "weight": 2}]
+        # 空表示直连。出口是**按账号**绑的：每个号第一次发请求时钉死一个出口，出口够多
+        # 就不会有两个号共用同一个（两个号同一个 IP 等于把它们拴在一起）。旧配置里的
+        # realm 字段仍会被忽略地接受——出口不再按域分组。
         "proxies": [],
         "proxy_cooldown": "5m",
         "proxy_cooldown_max": "1h",

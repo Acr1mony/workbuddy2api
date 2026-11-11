@@ -55,6 +55,7 @@ def _file(name: str) -> Response:
         # 页面本身绝不缓存，且把版本号填进静态资源 URL —— 只缓存一份 app.js
         # 的浏览器会在升级后继续用旧脚本，登录按钮看着没反应（它绑的是旧 DOM）。
         body = body.replace(b"{{VERSION}}", __version().encode("utf-8"))
+        body = body.replace(b"{{REPO}}", __repo().encode("utf-8"))
         headers: Dict[str, str] = {"Cache-Control": "no-store"}
     else:
         headers = {"Cache-Control": "public, max-age=300"}
@@ -70,3 +71,10 @@ def __version() -> str:
     from .. import VERSION
 
     return VERSION
+
+
+def __repo() -> str:
+    """面板里那个"跳到仓库"的地址：只在 ``wb2api/__init__.py`` 里写一次。"""
+    from .. import PROJECT_URL
+
+    return PROJECT_URL

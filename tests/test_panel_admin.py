@@ -576,12 +576,16 @@ class TestObservability(ServerCase):
 
     def test_proxies_crud_roundtrip(self):
         token = self.panel_token()
+        # 老客户端还会带 realm，服务端应当忽略它而不是报错。
         status, _headers, data = self._post(
             "/api/proxies", {"action": "add", "url": "http://10.0.0.9:3128", "realm": "cn", "weight": 2}, token)
         self.assertEqual(status, 200)
         payload = self.json_of(data)
         self.assertEqual(payload["total"], 1)
-        self.assertEqual(payload["entries"][0]["realm"], "cn")
+        self.assertEqual(payload["entries"][0]["weight"], 2)
+        self.assertEqual(payload["entries"][0]["accounts"], [], "刚加进来的出口还没绑号")
+        self.assertEqual(payload["free"], 1)
+        self.assertNotIn("realm", payload["entries"][0])
 
         status, _headers, data = self._get("/api/proxies", token)
         self.assertEqual(self.json_of(data)["total"], 1)
@@ -603,6 +607,32 @@ class TestObservability(ServerCase):
         self.assertEqual(self.json_of(data)["error"]["code"], "duplicate_proxy")
         status, _headers, data = self._post("/api/proxies", {"action": "remove", "url": "http://nope:1"}, token)
         self.assertEqual(status, 404)
+
+    def test_account_rows_show_which_exit_they_use(self):
+        """面板上要能直接看到"这个号走哪个出口"，否则出口池就是黑盒。"""
+        token = self.panel_token()
+        self.app.store.upsert_account(make_account("uid-exit"))
+        self._post("/api/proxies", {"action": "add", "url": "http://exit:9"}, token)
+        account = self.app.store.get_account("uid-exit")
+        proxy = self.app.panel.service._egress_for(account)
+        self.assertEqual(proxy, "http://exit:9")
+
+        status, _headers, data = self._get("/api/accounts", token)
+        self.assertEqual(status, 200)
+        rows = {row["uid"]: row for row in self.json_of(data)["accounts"]}
+        self.assertTrue(rows["uid-exit"]["egress"], "列表里要写出口（打码后的）")
+        self.assertEqual(rows["uid-exit"]["egress_shared"], 1)
+
+        status, _headers, data = self._get("/api/accounts/uid-exit", token)
+        self.assertEqual(status, 200)
+        detail = self.json_of(data)
+        self.assertEqual(detail["account"]["egress"], rows["uid-exit"]["egress"])
+        self.assertFalse(detail["account"]["egress_manual"])
+
+        status, _headers, data = self._post("/api/proxies", {"action": "rebind"}, token)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.json_of(data)["bound"], 0, "重新分配后绑定清空")
+        self.assertFalse(self.app.store.get_account("uid-exit").extra.get("egress"))
 
     def test_observability_requires_login(self):
         for path in ("/api/requests", "/api/dumps", "/api/proxies"):

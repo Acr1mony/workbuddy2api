@@ -733,6 +733,12 @@
       (a.token_expired ? " · <span class=\"badge bad\">已过期</span>" : ""));
     html += detailRow("到期", esc(a.token_expires_at ? fmtTime(a.token_expires_at) : "—"));
     html += detailRow("在途", esc(String(a.in_flight || 0)));
+    var egressText = a.egress
+      ? '<span class="tiny mono">' + esc(a.egress) + "</span>" +
+        (a.egress_shared > 1 ? ' <span class="badge warn">这个出口上还有 ' + esc(String(a.egress_shared - 1)) + " 个号</span>" : "")
+      : '<span class="muted">直连（池里没有出口）</span>';
+    if (a.egress_manual) egressText += ' <span class="badge">账号单独指定</span>';
+    html += detailRow("出口", egressText);
     html += "</div>";
 
     // 余额的"钱"视角：这些钱分别什么时候过期。只看总数会在最大那个包到期的
@@ -1842,9 +1848,14 @@
     } else {
       body.innerHTML = rows.map(function (row) {
         var cooling = Number(row.cooling_for) > 0;
+        var count = Number(row.account_count || 0);
+        var bound = count === 0
+          ? '<span class="muted">空闲</span>'
+          : '<span class="badge ' + (count > 1 ? "warn" : "ok") + '">' +
+            (count > 1 ? "共 " + count + " 个号" : "1 个号") + "</span>";
         return "<tr>" +
           '<td class="tiny">' + esc(row.url) + "</td>" +
-          "<td>" + esc(row.realm) + "</td>" +
+          "<td>" + bound + "</td>" +
           "<td>" + esc(row.weight) + "</td>" +
           '<td class="muted">' + esc(row.note || "") + "</td>" +
           "<td>" + (cooling ? '<span class="badge warn">' + fmtCountdown(row.cooling_for) + "</span>" : '<span class="badge ok">可用</span>') + "</td>" +
@@ -1857,7 +1868,9 @@
     }
     var note = $("#proxy-note");
     if (note) {
-      note.textContent = "共 " + (data.total || 0) + " 个 · 可用 " + (data.ready || 0) + " · 冷却 " + (data.cooling || 0);
+      note.textContent = "共 " + (data.total || 0) + " 个 · 可用 " + (data.ready || 0) +
+        " · 冷却 " + (data.cooling || 0) + " · 绑定 " + (data.bound || 0) +
+        " · 空闲 " + (data.free || 0) + (data.shared ? " · 共用 " + data.shared : "");
     }
   }
 
@@ -1865,18 +1878,17 @@
     return api("/api/proxies", { method: "POST", body: payload })
       .then(function (data) {
         renderProxies(data);
-        toast(okText, "ok");
+        toast("ok", okText);
       })
-      .catch(function (err) { toast("操作失败：" + err.message, "bad"); });
+      .catch(function (err) { toast("bad", "操作失败：" + err.message); });
   }
 
   function addProxy() {
     var url = ($("#proxy-url").value || "").trim();
-    if (!url) { toast("warn", "先填出口地址，例如 socks5://user:pass@host:1080"); return; }
+    if (!url) { toast("warn", "先填出口地址", "例如 socks5://user:pass@host:1080"); return; }
     proxyMutate({
       action: "add",
       url: url,
-      realm: $("#proxy-realm").value,
       weight: Number($("#proxy-weight").value) || 1,
       note: ($("#proxy-note-input").value || "").trim()
     }, "已添加出口").then(function () {
@@ -1918,6 +1930,11 @@
     var resetBtn = $("#proxy-reset");
     if (resetBtn) resetBtn.addEventListener("click", function () {
       proxyMutate({ action: "reset" }, "冷却已清空");
+    });
+    var rebindBtn = $("#proxy-rebind");
+    if (rebindBtn) rebindBtn.addEventListener("click", function () {
+      if (!confirm("重新分配会把每个号和出口的绑定全部清掉，下次请求按「占用最少」重新配。继续？")) return;
+      proxyMutate({ action: "rebind" }, "已重新分配（下次请求生效）");
     });
     var proxyTable = $("#proxy-table");
     if (proxyTable) proxyTable.addEventListener("click", function (ev) {

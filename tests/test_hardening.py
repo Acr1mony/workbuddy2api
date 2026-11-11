@@ -524,6 +524,29 @@ class ObservabilityTest(unittest.TestCase):
         self.assertEqual(client.calls[0]["proxy"], "http://10.0.0.9:3128")
         self.assertEqual(svc.proxies.stats()["entries"][0]["used"], 1)
 
+    def test_bindings_are_per_account_and_persisted(self):
+        """一个出口只服务一个号，而且绑定要写回账号（重启也不洗牌）。"""
+        from wb2api.config import Config as C
+
+        cfg = C(None, {"data_dir": self.tmp, "panel": {"enabled": False},
+                       "pool": {"proxies": ["http://10.0.0.1:1", "http://10.0.0.2:2"]}})
+        store = Store(self.tmp)
+        store.upsert_account(Account(uid="u1", id="u1", realm="cn", access_token="t1",
+                                     expires_at=time.time() + 86400))
+        store.upsert_account(Account(uid="u2", id="u2", realm="cn", access_token="t2",
+                                     expires_at=time.time() + 86400))
+        svc = GatewayService(cfg, store, client=FakeClient([]))
+        a1 = store.get_account("u1")
+        a2 = store.get_account("u2")
+        first = svc._egress_for(a1)
+        second = svc._egress_for(a2)
+        self.assertTrue(first)
+        self.assertNotEqual(first, second, "出口够用时两个号不该共用一个出口")
+        self.assertEqual(a1.extra.get("egress"), first)
+        # 写回账号了：换一个进程（新的 Store）读出来还是同一个出口
+        self.assertEqual(Store(self.tmp).get_account("u1").extra.get("egress"), first)
+        self.assertEqual(svc.proxies.stats()["bound"], 2)
+
     def test_account_proxy_wins_over_pool(self):
         from wb2api.config import Config as C
 

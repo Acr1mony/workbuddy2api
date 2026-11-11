@@ -30,6 +30,9 @@
     <input type="password" id="login-password" placeholder="面板密码" autocomplete="current-password" required>
     <button type="submit" id="login-submit">登录</button>
     <p class="muted tiny" id="login-error" style="margin:0;color:var(--bad)" hidden></p>
+    <p class="muted tiny" style="margin:2px 0 0">
+      <a href="{{REPO}}" target="_blank" rel="noopener noreferrer">项目主页与部署说明</a>
+    </p>
   </form>
 </div>
 
@@ -56,6 +59,7 @@
       <a href="#settings" data-page="settings">设置</a>
     </nav>
     <div class="topbar-right">
+      <a class="ghost tiny-btn repo-link" id="repo-link" href="{{REPO}}" target="_blank" rel="noopener noreferrer" title="打开 GitHub 仓库">GitHub 仓库</a>
       <span class="muted tiny" id="updated-at"></span>
       <button class="ghost tiny-btn" id="refresh-btn" title="立即刷新">刷新</button>
       <button class="ghost tiny-btn" id="logout-btn">退出</button>
@@ -525,7 +529,7 @@
             <div class="table-wrap">
               <table class="data" id="proxy-table">
                 <thead>
-                  <tr><th>出口</th><th>域</th><th>权重</th><th>备注</th><th>冷却</th><th>用过</th><th>状态</th><th></th></tr>
+                  <tr><th>出口</th><th>绑定的账号</th><th>权重</th><th>备注</th><th>冷却</th><th>用过</th><th>状态</th><th></th></tr>
                 </thead>
                 <tbody></tbody>
               </table>
@@ -534,14 +538,7 @@
               <label class="field" style="grid-column:1/-1">出口地址
                 <input type="text" id="proxy-url" placeholder="socks5://user:pass@host:port">
               </label>
-              <label class="field">域
-                <select id="proxy-realm">
-                  <option value="">两个域</option>
-                  <option value="cn">cn</option>
-                  <option value="global">global</option>
-                </select>
-              </label>
-              <label class="field">权重
+              <label class="field">权重（出口比账号少时，权重高的先被共用）
                 <input type="number" id="proxy-weight" placeholder="1" min="0.1" step="0.1" value="1">
               </label>
               <label class="field" style="grid-column:1/-1">备注
@@ -550,12 +547,14 @@
               <div style="grid-column:1/-1">
                 <button id="proxy-add">添加出口</button>
                 <button class="ghost" id="proxy-reset">清空冷却</button>
+                <button class="ghost" id="proxy-rebind">重新分配</button>
               </div>
             </div>
             <p class="muted tiny" style="margin:6px 0 0">
               留空表示直连。支持 <code>http://</code>、<code>https://</code>、<code>socks5://</code>。
-              上游是按"机器 id + 出口 IP"看请求形状的：出口全是一个家宽地址时，号再多也只是同一台机器在轮着用。
-              某个出口被拦会自己冷却（5 分钟起、翻倍封顶 1 小时），全在冷却时仍会挑最早解禁的那个——不会退回直连。
+              出口是<strong>按账号分</strong>的：每个号第一次发请求时钉死一个出口，之后一直用它；出口够多时不会有两个号共用同一个出口，
+              不够时才共用（表格里会写"共 N 个"）。上游按"机器 id + 出口 IP"看形状，两个号同一个出口等于把它们拴在一起。
+              某个出口被拦会自己冷却（5 分钟起、翻倍封顶 1 小时），冷却期间账号仍绑着它；连续失败 3 次才换出口，全在冷却时不会退回直连。
             </p>
           </section>
 

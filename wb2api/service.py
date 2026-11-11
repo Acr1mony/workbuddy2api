@@ -116,8 +116,14 @@ class GatewayService(RelayMixin, FailoverMixin, ResponsesEndpoint, ModelsEndpoin
         )
         self.max_payload_bytes = int(float(cfg.get("server.max_payload_mb", 16)) * 1024 * 1024) if cfg else 16 * 1024 * 1024
         data_dir = store.data_dir if hasattr(store, "data_dir") else "./data"
-        # 出口池：账号自己配了 proxy 的永远优先，其它请求从池里挑。
+        # 出口池：一个出口只服务一个账号。启动时先把账号上存的绑定灌回来，
+        # 否则重启会把"谁走哪个出口"重新洗一遍——那本身就是一次可疑变化。
         self.proxies = ProxyPool(cfg)
+        try:
+            for bound in store.list_accounts(""):
+                self.proxies.observe(bound)
+        except Exception:  # 账号文件坏了不该拖垮启动，后面还有审计工具管它
+            log.exception("恢复出口绑定失败")
         # 失败报文留存（脱敏、限大小、按天封顶）：排障时"上游原话"比 code 有用得多。
         self.diag = Diagnostics(
             data_dir,
@@ -438,6 +444,24 @@ class GatewayService(RelayMixin, FailoverMixin, ResponsesEndpoint, ModelsEndpoin
             self.pool.release(account)
             self._release_key(key_slot)
 
+    def _egress_for(self, account: Any) -> str:
+        """这个账号该走哪个出口：手配的 > 已绑定的 > 新分配（并写回账号）。
+
+        绑定写回账号是这里唯一会落盘的动作，而且只在**变了**的时候发生：
+        拿到一个出口就等于换了一张脸，不该每次请求都重新决定。
+        """
+        proxy = self.proxies.assign(account)
+        if not proxy:
+            return ""
+        extra = getattr(account, "extra", None)
+        if isinstance(extra, dict) and extra.get("egress") != proxy:
+            extra["egress"] = proxy
+            try:
+                self.store.save_accounts()
+            except Exception:
+                log.debug("出口绑定写盘失败（不影响本次请求）", exc_info=True)
+        return proxy
+
     def _open_upstream(
         self,
         *,
@@ -505,11 +529,7 @@ class GatewayService(RelayMixin, FailoverMixin, ResponsesEndpoint, ModelsEndpoin
                     account, self.cfg, meta=meta,
                     client_ip=str(getattr(request, "client_ip", "") or ""),
                 )
-                proxy = str(getattr(account, "proxy", "") or "")
-                if not proxy and self.proxies.enabled():
-                    # 账号没单独配出口时从池里挑一个：出口 IP 跟着请求一起变，
-                    # 比"所有账号都从家里那条宽带出去"难关联得多。
-                    proxy = self.proxies.pick(realm)
+                proxy = self._egress_for(account)
                 # 同一出口还在退避就先等一等：一口气重试只会让上游更确信这是脚本。
                 # 但这时账号槽位已经占了，睡太久会把整域的并发额度（默认 3）锁死，
                 # 所以持槽期间最多等 2 秒，剩下的交给下一轮退避。
