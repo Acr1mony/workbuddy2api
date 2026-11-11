@@ -141,6 +141,108 @@ class TestParseEntries(unittest.TestCase):
         self.assertFalse(plain.meta()["reasoning"])
 
 
+class TestVision(unittest.TestCase):
+    """/v1/models 要报"能不能看图"，但只报上游真说过的。"""
+
+    def _catalog(self, entries, cfg=None):
+        catalog = models.ModelCatalog(FakeClient({models.CONFIG_PATH: {"data": {"models": entries}}}),
+                                      cfg or FakeCfg())
+        catalog.fetch(FakeAccount(), "cn")
+        return catalog
+
+    def _item(self, catalog, model_id="m"):
+        for item in catalog.openai_list("cn")["data"]:
+            if item["id"] == model_id:
+                return item
+        raise AssertionError("模型 %s 不在清单里" % model_id)
+
+    def test_vision_from_tag(self):
+        catalog = self._catalog([{"id": "m", "tags": ["vision"]}])
+        self.assertIs(self._item(catalog)["supports_vision"], True)
+        self.assertIs(self._item(catalog)["capabilities"]["vision"], True)
+
+    def test_vision_from_capability_map(self):
+        catalog = self._catalog([{"id": "m", "capabilities": {"vision": True}}])
+        self.assertIs(self._item(catalog)["supports_vision"], True)
+
+    def test_vision_from_modalities(self):
+        catalog = self._catalog([{"id": "m", "input_modalities": ["text", "image"]}])
+        item = self._item(catalog)
+        self.assertIs(item["supports_vision"], True)
+        self.assertEqual(item["capabilities"]["input_modalities"], ["text", "image"])
+
+    def test_explicit_false_is_reported(self):
+        catalog = self._catalog([{"id": "m", "supports_vision": False}])
+        self.assertIs(self._item(catalog)["supports_vision"], False)
+
+    def test_unknown_vision_is_omitted(self):
+        catalog = self._catalog([{"id": "m"}])
+        item = self._item(catalog)
+        self.assertNotIn("supports_vision", item, "认不出来就别猜")
+        self.assertNotIn("vision", item["capabilities"])
+        self.assertNotIn("input_modalities", item["capabilities"])
+
+    def test_capabilities_always_describe_the_gateway(self):
+        catalog = self._catalog([{"id": "m"}, {"id": "r", "reasoning": {"enabled": True}}])
+        plain = self._item(catalog)
+        reasoning = self._item(catalog, "r")
+        self.assertTrue(plain["capabilities"]["chat"])
+        self.assertTrue(plain["capabilities"]["stream"])
+        self.assertTrue(plain["capabilities"]["tools"])
+        self.assertNotIn("reasoning", plain["capabilities"])
+        self.assertTrue(reasoning["capabilities"]["reasoning"])
+
+    def test_config_can_fix_what_upstream_left_out(self):
+        cfg = FakeCfg({"models": {"vision": {"m": True, "not-vision": "false"}}})
+        catalog = models.ModelCatalog(FakeClient({models.CONFIG_PATH: {"data": {"models": [
+            {"id": "m"}, {"id": "not-vision", "supports_vision": True},
+        ]}}}), cfg)
+        catalog.fetch(FakeAccount(), "cn")
+        self.assertIs(self._item(catalog, "m")["supports_vision"], True)
+        self.assertIs(self._item(catalog, "not-vision")["supports_vision"], False,
+                      "配置应该能覆盖上游说错的")
+
+    def test_id_heuristic_says_it_is_a_guess(self):
+        catalog = self._catalog([{"id": "glm-4.6v"}])
+        item = self._item(catalog, "glm-4.6v")
+        self.assertIs(item["supports_vision"], True, "名字里带 v 的多模态模型该被认出来")
+        self.assertEqual(item["capabilities"]["vision_source"], "id", "猜的就要说是猜的")
+
+    def test_heuristics_can_be_switched_off(self):
+        cfg = FakeCfg({"models": {"vision_heuristics": False}})
+        catalog = models.ModelCatalog(FakeClient({models.CONFIG_PATH: {"data": {"models": [
+            {"id": "glm-4.6v"},
+        ]}}}), cfg)
+        catalog.fetch(FakeAccount(), "cn")
+        self.assertNotIn("supports_vision", self._item(catalog, "glm-4.6v"))
+
+    def test_upstream_statement_beats_the_heuristic(self):
+        catalog = self._catalog([{"id": "glm-4.6v", "supports_vision": False}])
+        item = self._item(catalog, "glm-4.6v")
+        self.assertIs(item["supports_vision"], False)
+        self.assertEqual(item["capabilities"]["vision_source"], "upstream")
+
+    def test_config_statement_beats_everything(self):
+        cfg = FakeCfg({"models": {"vision": {"glm-4.6v": False}}})
+        catalog = models.ModelCatalog(FakeClient({models.CONFIG_PATH: {"data": {"models": [
+            {"id": "glm-4.6v"},
+        ]}}}), cfg)
+        catalog.fetch(FakeAccount(), "cn")
+        item = self._item(catalog, "glm-4.6v")
+        self.assertIs(item["supports_vision"], False)
+        self.assertEqual(item["capabilities"]["vision_source"], "config")
+
+    def test_alias_inherits_capabilities(self):
+        cfg = FakeCfg({"models": {"aliases": {"gpt-4o": "m"}}})
+        catalog = models.ModelCatalog(FakeClient({models.CONFIG_PATH: {"data": {"models": [
+            {"id": "m", "tags": ["vision"]},
+        ]}}}), cfg)
+        catalog.fetch(FakeAccount(), "cn")
+        item = self._item(catalog, "gpt-4o")
+        self.assertIs(item["supports_vision"], True)
+        self.assertEqual(item["alias_of"], "m")
+
+
 class TestCatalog(unittest.TestCase):
     def _catalog(self, responses, cfg=None):
         client = FakeClient(responses)
@@ -209,7 +311,7 @@ class TestDiskCache(unittest.TestCase):
     PAYLOAD = {
         models.CONFIG_PATH: {"data": {"models": [
             {"id": "m1", "maxOutputTokens": 4096, "credits": "x0.11"},
-            {"id": "m2"},
+            {"id": "m2", "tags": ["vision"], "input_modalities": ["text", "image"]},
         ]}}
     }
 
@@ -258,6 +360,15 @@ class TestDiskCache(unittest.TestCase):
         self.assertEqual(client2.calls, [], "新鲜缓存不该再打上游")
         self.assertAlmostEqual(revived.rate("m1", "cn"), 0.11)
         self.assertEqual(revived.get("m1", "cn").max_output, 4096)
+
+    def test_vision_survives_the_disk_round_trip(self):
+        catalog, _ = self._catalog(self.PAYLOAD, self._cfg())
+        catalog.fetch(FakeAccount(), "cn")
+        revived = models.ModelCatalog(FakeClient({}), self._cfg())
+        info = revived.get("m2", "cn")
+        self.assertIs(info.vision, True, "落盘时丢了 vision，重启后又变成「不知道」")
+        self.assertEqual(info.modalities, ["text", "image"])
+        self.assertIsNone(revived.get("m1", "cn").vision, "先说不知道的，重启后还是不知道")
 
     def test_stale_file_is_ignored(self):
         self._write_stale()

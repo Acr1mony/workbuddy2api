@@ -118,7 +118,7 @@ Codex CLI 填：`OPENAI_BASE_URL=http://127.0.0.1:8788/v1`、`OPENAI_API_KEY=sk-
 
 ## 模型
 
-`GET /v1/models` 只列出**这把 key 能调**的模型（按 key 的白名单与排除项过滤），每条带 `max_output_tokens` 与可配的 `context_length`。点名一个没开的模型会回 `403 model_not_allowed`——模型是好的，是 key 没开。
+`GET /v1/models` 只列出**这把 key 能调**的模型（按 key 的白名单与排除项过滤），每条带 `max_output_tokens`、可配的 `context_length`，以及 `capabilities`（`chat`/`stream`/`tools`，推理模型多一个 `reasoning`）和 `supports_vision` + `capabilities.vision`。视觉能力只在上游真说过时才写——认不出来宁可留空，也不让客户端以为能塞图片。点名一个没开的模型会回 `403 model_not_allowed`——模型是好的，是 key 没开。
 
 客户端里写死的模型名往往不是账号能用的那个，可以在配置里登记别名，不用改客户端：
 
@@ -126,12 +126,13 @@ Codex CLI 填：`OPENAI_BASE_URL=http://127.0.0.1:8788/v1`、`OPENAI_API_KEY=sk-
 {
   "models": {
     "aliases":         { "gpt-4o": "deepseek-v4-flash", "sonnet": "default-1.2" },
-    "context_lengths": { "deepseek-v4-flash": 128000 }
+    "context_lengths": { "deepseek-v4-flash": 128000 },
+    "vision":          { "glm-4.6v": true }
   }
 }
 ```
 
-别名会出现在模型列表里（带 `alias_of`），出站时换成真名，响应头回一句 `X-Model-Alias`。
+别名会出现在模型列表里（带 `alias_of`），出站时换成真名，响应头回一句 `X-Model-Alias`。`vision` 用来补上游没说的（或纠正它说错的）。
 
 ## 面板
 

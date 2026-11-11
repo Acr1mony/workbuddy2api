@@ -16,6 +16,7 @@ UA 和 ``X-Product`` 是硬要求：同一个接口换个 UA 就 400 ``12403``�
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 from typing import Any, Dict, Iterable, List, Optional
@@ -42,6 +43,21 @@ SKIP_TAGS = {
     "image", "embedding", "rerank",
 }
 MIN_OUTPUT_TOKENS = 256
+
+# "能不能看图"在不同地方有四种说法：标签、能力表、布尔字段、模态列表。
+# 只认明确的说法——把不能看图的模型报成能看图，客户端就会塞图片进来，
+# 然后上游回 400 11135，我们还查不出来是谁的错。
+VISION_TAGS = {"vision", "visual", "image-input", "image_input", "multimodal", "vlm"}
+VISION_BOOL_FIELDS = ("supports_vision", "supportsVision", "vision", "is_vision")
+VISION_CAP_KEYS = ("vision", "image_input", "imageInput", "image")
+MODALITY_FIELDS = ("input_modalities", "inputModalities", "modalities", "inputTypes")
+
+# 上游目录里从来没有"能不能看图"这个字段（实测 66 个条目，标签只有 craft /
+# text-to-image 这类），但模型名本身很诚实：`glm-4.6v`、`qwen-vl`、`xxx-vision`、
+# `xxx-omni`。所以留一条**可关掉**的名字启发式：只在四个地方都没说时兜底，
+# 并且在 capabilities.vision_source 里写明结论是猜的（`id`）还是上游说的（`upstream`）。
+# 边界里带数字是因为 `glm-4.6v` 的 v 前面是版本号里的 6，不是连字符。
+VISION_ID_RE = re.compile(r"(?:^|[-_/0-9.])(?:v|vl|vision|omni|multimodal)$", re.IGNORECASE)
 
 # OpenAI 的 /v1/models 每条都带 created（unix 秒）。给一个固定值而不是 0：
 # 部分客户端会把它当"模型上线时间"排序，0 会让它们排在最旧或直接判非法。
@@ -77,7 +93,7 @@ class ModelInfo:
     """一个模型的最小画像。"""
 
     __slots__ = ("id", "name", "realm", "max_output", "rate", "tags", "reasoning", "raw",
-                 "context_length", "alias_of")
+                 "context_length", "alias_of", "vision", "modalities", "vision_source")
 
     def __init__(
         self,
@@ -91,6 +107,9 @@ class ModelInfo:
         raw: Optional[Dict[str, Any]] = None,
         context_length: int = 0,
         alias_of: str = "",
+        vision: Optional[bool] = None,
+        modalities: Optional[List[str]] = None,
+        vision_source: str = "",
     ) -> None:
         self.id = id
         self.name = name or id
@@ -102,6 +121,9 @@ class ModelInfo:
         self.raw = raw or {}
         self.context_length = context_length
         self.alias_of = alias_of
+        self.vision = vision
+        self.modalities = list(modalities or [])
+        self.vision_source = vision_source
 
     @property
     def free(self) -> bool:
@@ -142,12 +164,37 @@ class ModelInfo:
             # 只报上游真给了的数：瞎填一个 context_length 会让客户端算出错误的截断策略。
             payload["max_output_tokens"] = self.max_output
         if self.context_length:
-            # 来源只有两个：上游自己说的，或用户在 models.context_lengths 里写的。
+            # 来源只有三个：上游自己说的、``models.context_lengths`` 里配的、别名继承的。
             payload["context_length"] = self.context_length
             payload["context_window"] = self.context_length
         if self.alias_of:
             payload["alias_of"] = self.alias_of
+        caps = self.capabilities()
+        if caps:
+            payload["capabilities"] = caps
+            # 这两套拼写客户端各认一半：老客户端读 supports_vision，
+            # 新客户端读 capabilities.vision。都带上下不冲突。
+            if "vision" in caps:
+                payload["supports_vision"] = caps["vision"]
         return payload
+
+    def capabilities(self) -> Dict[str, Any]:
+        """能力表：只写我们真能断定的事。
+
+        聊天/流式/工具这三项是网关自身的能力（我们三种请求都原样转发），
+        视觉和推理是模型自身的属性，上游没说就不写——留空比写错强。
+        """
+        caps: Dict[str, Any] = {"chat": True, "stream": True, "tools": True}
+        if self.reasoning:
+            caps["reasoning"] = True
+        if self.vision is not None:
+            caps["vision"] = bool(self.vision)
+            if self.vision_source:
+                # 让调用方分得清"上游说的"和"按名字猜的"：猜错的时候好排查。
+                caps["vision_source"] = self.vision_source
+        if self.modalities:
+            caps["input_modalities"] = list(self.modalities)
+        return caps
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"<ModelInfo {self.id} realm={self.realm} rate={self.rate}>"
@@ -173,6 +220,60 @@ def _tags_of(entry: Dict[str, Any]) -> List[str]:
     if isinstance(raw, list):
         return [str(item) for item in raw if isinstance(item, (str, int))]
     return []
+
+
+def _modalities_of(entry: Dict[str, Any]) -> List[str]:
+    """上游的"输入模态"列表，归一到 ``text`` / ``image`` / ``audio`` / ``video``。"""
+    raw: Any = None
+    for key in MODALITY_FIELDS:
+        if key in entry:
+            raw = entry.get(key)
+            break
+    if isinstance(raw, str):
+        parts: List[str] = [part for part in raw.split(",")]
+    elif isinstance(raw, list):
+        parts = [str(item) for item in raw]
+    else:
+        return []
+    out: List[str] = []
+    for part in parts:
+        word = part.strip().lower()
+        if not word:
+            continue
+        if word in ("image", "images", "vision", "image_url", "image-input", "image_input"):
+            word = "image"
+        elif word in ("text", "chat", "prompt"):
+            word = "text"
+        elif word in ("audio", "voice"):
+            word = "audio"
+        elif word in ("video", "videos"):
+            word = "video"
+        if word not in out:
+            out.append(word)
+    return out
+
+
+def _vision_of(entry: Dict[str, Any], tags: List[str], modalities: List[str]) -> Optional[bool]:
+    """能不能看图：明确说了才返回 True/False，认不出来返回 ``None``。"""
+    caps = entry.get("capabilities") or entry.get("abilities")
+    if isinstance(caps, list):
+        caps = {str(item).lower(): True for item in caps}
+    if isinstance(caps, dict):
+        for key in VISION_CAP_KEYS:
+            value = caps.get(key)
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str) and value.lower() in ("true", "yes", "1"):
+                return True
+    for key in VISION_BOOL_FIELDS:
+        value = entry.get(key)
+        if isinstance(value, bool):
+            return value
+    if "image" in modalities:
+        return True
+    if {tag.lower() for tag in tags} & VISION_TAGS:
+        return True
+    return None
 
 
 def _reasoning_of(entry: Dict[str, Any]) -> Dict[str, Any]:
@@ -232,15 +333,21 @@ def parse_entries(payload: Any, realm: str = "cn") -> List[ModelInfo]:
 
 
 def _build(entry: Dict[str, Any], model_id: str, realm: str) -> ModelInfo:
+    tags = _tags_of(entry)
+    modalities = _modalities_of(entry)
+    vision = _vision_of(entry, tags, modalities)
     return ModelInfo(
         id=model_id,
         name=str(entry.get("name") or entry.get("display_name") or model_id),
         realm=realm,
         max_output=_as_int(entry.get("maxOutputTokens") or entry.get("max_output_tokens") or entry.get("max_tokens")),
         rate=parse_rate(entry.get("credits") if "credits" in entry else entry.get("rate")),
-        tags=_tags_of(entry),
+        tags=tags,
         reasoning=_reasoning_of(entry),
         raw=entry if isinstance(entry, dict) else {},
+        vision=vision,
+        modalities=modalities,
+        vision_source="upstream" if vision is not None else "",
     )
 
 
@@ -256,12 +363,19 @@ def _to_dict(info: ModelInfo) -> Dict[str, Any]:
         payload["rate"] = info.rate
     if info.reasoning:
         payload["reasoning"] = dict(info.reasoning)
+    if info.vision is not None:
+        payload["vision"] = bool(info.vision)
+        if info.vision_source:
+            payload["vision_source"] = info.vision_source
+    if info.modalities:
+        payload["modalities"] = list(info.modalities)
     return payload
 
 
 def _from_dict(item: Dict[str, Any], realm: str) -> ModelInfo:
     rate = item.get("rate")
     reasoning = item.get("reasoning")
+    vision = item.get("vision")
     return ModelInfo(
         id=str(item.get("id") or ""),
         name=str(item.get("name") or ""),
@@ -270,6 +384,9 @@ def _from_dict(item: Dict[str, Any], realm: str) -> ModelInfo:
         rate=float(rate) if isinstance(rate, (int, float)) else None,
         tags=[str(tag) for tag in item.get("tags") or []],
         reasoning=dict(reasoning) if isinstance(reasoning, dict) else {},
+        vision=vision if isinstance(vision, bool) else None,
+        modalities=[str(part) for part in item.get("modalities") or []],
+        vision_source=str(item.get("vision_source") or ""),
     )
 
 
@@ -315,6 +432,26 @@ class ModelCatalog:
                 continue
             if tokens > 0:
                 self.context_lengths[str(key).strip()] = tokens
+        visions = self.cfg.get("models.vision", {}) or {}
+        # 配置只用来"补上游没说"的情况，也允许把上游说错的改回来：
+        # 显式的 true/false 都算数，写别的（或留空）就当没配。
+        self.vision_overrides: Dict[str, bool] = {}
+        if isinstance(visions, dict):
+            for key, value in visions.items():
+                name = str(key).strip()
+                if not name:
+                    continue
+                if isinstance(value, bool):
+                    self.vision_overrides[name] = value
+                elif isinstance(value, str) and value.strip().lower() in ("true", "yes", "1"):
+                    self.vision_overrides[name] = True
+                elif isinstance(value, str) and value.strip().lower() in ("false", "no", "0"):
+                    self.vision_overrides[name] = False
+        # 配置改过（面板保存）就要让已经加载的清单重新套一遍覆盖值，
+        # 否则改完"能不能看图"得重启才生效。
+        if hasattr(self, "_loaded"):
+            self._loaded.clear()
+        self.vision_heuristics = bool(self.cfg.get("models.vision_heuristics", True))
 
     def resolve_alias(self, model: str) -> str:
         """把客户端写的别名换成上游真名；没有别名就原样返回。"""
@@ -322,9 +459,18 @@ class ModelCatalog:
 
     def _apply_context(self, entries: List[ModelInfo]) -> None:
         for info in entries:
-            if info.context_length:
-                continue
-            info.context_length = self.context_lengths.get(info.id, 0)
+            if not info.context_length:
+                info.context_length = self.context_lengths.get(info.id, 0)
+            if info.id in self.vision_overrides:
+                info.vision = self.vision_overrides[info.id]
+                # 人说了算，但也要写清楚这个结论是人配的。
+                info.vision_source = "config"
+            elif info.vision is None and self.vision_heuristics and VISION_ID_RE.search(info.id or ""):
+                info.vision = True
+                info.vision_source = "id"
+            if info.vision is True and "image" not in info.modalities:
+                info.modalities = ["text", "image"] + [part for part in info.modalities
+                                                       if part not in ("text", "image")]
 
     # -- 磁盘缓存 -----------------------------------------------------------
     def _cache_path(self, realm: str) -> str:

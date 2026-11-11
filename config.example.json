@@ -133,6 +133,8 @@
     "default": "",
     "aliases": {},
     "context_lengths": {},
+    "vision": {},
+    "vision_heuristics": true,
     "min_refresh_seconds": 30
   },
   "prompt": {

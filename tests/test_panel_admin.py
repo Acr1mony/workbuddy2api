@@ -642,13 +642,14 @@ class TestObservability(ServerCase):
 class _FakeInfo(object):
     """只放 catalog_view 真正会读的字段，避免把 ModelInfo 的全套依赖拖进测试。"""
 
-    def __init__(self, model_id, name, realm, max_output=0, context_length=0, alias_of=""):
+    def __init__(self, model_id, name, realm, max_output=0, context_length=0, alias_of="", vision=None):
         self.id = model_id
         self.name = name
         self.realm = realm
         self.max_output = max_output
         self.context_length = context_length
         self.alias_of = alias_of
+        self.vision = vision
 
 
 class TestModelCatalog(ServerCase):
@@ -661,7 +662,7 @@ class TestModelCatalog(ServerCase):
                 _FakeInfo("hidden-one", "Hidden", "cn"),
             ],
             "global": [
-                _FakeInfo("glm-5.3", "GLM 5.3", "global", max_output=16000, context_length=200000),
+                _FakeInfo("glm-5.3", "GLM 5.3", "global", max_output=16000, context_length=200000, vision=True),
                 _FakeInfo("gpt-4o", "GPT-4o", "global", alias_of="deepseek-v4-flash"),
             ],
         }
@@ -700,6 +701,8 @@ class TestModelCatalog(ServerCase):
         self.assertEqual(rows["glm-5.3"]["max_output_tokens"], 16000)
         self.assertEqual(rows["glm-5.3"]["context_length"], 200000)
         self.assertEqual(rows["gpt-4o"]["alias_of"], "deepseek-v4-flash")
+        self.assertIs(rows["glm-5.3"]["supports_vision"], True)
+        self.assertNotIn("supports_vision", rows["deepseek-v4-flash"], "不知道就别写")
         self.assertNotIn("max_output_tokens", rows["deepseek-v4-flash"],
                          "0 表示不知道，不要编一个数字出来")
 

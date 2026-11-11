@@ -42,6 +42,8 @@ class ModelsEndpoint:
                     row["max_output_tokens"] = info.max_output
                 if info.context_length:
                     row["context_length"] = info.context_length
+                if info.vision is not None:
+                    row["supports_vision"] = bool(info.vision)
                 rows.append(row)
         rows.sort(key=lambda entry: (entry["realm"], entry["id"]))
         counts = {item: sum(1 for entry in rows if entry["realm"] == item) for item in realms}

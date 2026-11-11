@@ -37,7 +37,7 @@
     cli.py          命令行入口（serve / doctor / version / accounts）
 """
 
-VERSION = "1.10.1"
+VERSION = "1.10.2"
 __version__ = VERSION
 #: 面板上"跳到仓库"的地址；只在这里写一次，页面用 ``{{REPO}}`` 填。
 PROJECT_URL = "https://github.com/Acr1mony/workbuddy2api"

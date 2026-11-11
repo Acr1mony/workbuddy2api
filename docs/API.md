@@ -208,16 +208,32 @@ Codex CLI：`OPENAI_BASE_URL=http://127.0.0.1:8788/v1`、`OPENAI_API_KEY=sk-...`
 ### `GET /v1/models`
 
 ```json
-{"object": "list", "data": [{"id": "deepseek-v3", "object": "model", "created": 0, "owned_by": "workbuddy", "context_length": 65536, "max_output_tokens": 8192}]}
+{"object": "list", "data": [{"id": "deepseek-v3", "object": "model", "created": 1735689600, "owned_by": "workbuddy",
+  "context_length": 65536, "max_output_tokens": 8192,
+  "capabilities": {"chat": true, "stream": true, "tools": true, "reasoning": true, "vision": false}}]}
 ```
 
 列表来自上游 `/v3/config`（三层回落，缓存 1 小时，落盘一份给重启用），已过滤掉补全类/图像/视频模型。`models.hidden` 里配置的模型（支持 `prefix*`）不会出现。
 
 **列表同时按当前 API key 的 `models`/`excluded_models` 过滤**：看得见的就等于调得动的，客户端不必靠 400 才发现自己被限了模型。本地开放模式（没配任何 key）则全列。
 
-每条还带能力字段：`max_output_tokens`（上游给的输出预算）与 `context_length`/`context_window`（来自 `models.context_lengths` 配置；不知道就不编，字段直接不出现）。
+每条带的能力字段：
 
-`models.aliases` 里登记的名字也会出现在这个列表里，带 `alias_of` 指向真名；别名指向的模型不存在时它不出现。
+| 字段 | 含义 |
+|---|---|
+| `max_output_tokens` | 上游给的输出预算（推理+回答共享） |
+| `context_length` / `context_window` | 来自上游或 `models.context_lengths`；不知道就不出现 |
+| `capabilities` | `chat`/`stream`/`tools` 恒为 `true`（网关三种都原样转发）；`reasoning` 只在推理模型上出现 |
+| `capabilities.vision` + `supports_vision` | 能不能看图。两套拼写各有一半客户端在认，所以都给 |
+
+**视觉能力只报"真知道"的**：上游在标签（`vision`/`multimodal`）、`capabilities`、布尔字段（`supports_vision`…）、`input_modalities` 里说的都算；四处都没说就不写这两个字段——把不能看图的模型报成能看图，客户端会塞图片进来，然后上游回 `400 11135`，最后查不清是谁的错。上游说漏了或者你确定它说错了，在配置里补一句：
+
+```json
+"models": { "vision": { "glm-4.6v": true, "some-text-model": false } }
+```
+
+`models.aliases` 里登记的名字也会出现在这个列表里，带 `alias_of` 指向真名、能力字段继承真名；别名指向的模型不存在时它不出现。
+
 
 ### `GET /v1/models/{id}`
 
