@@ -15,11 +15,25 @@ GET  /status                人看的摘要：池状态、余额、最近错误
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any, Callable, Dict
 
 from .httpserver import BadRequest, Response, Router, error_response, json_response
 from .service import ServiceError
 from .upstream import UpstreamError
+
+
+def _error_headers(req: Any) -> Dict[str, str]:
+    """错误响应也要能对上号：客户端报障时只会给你它看到的那个 id。
+
+    成功路径在 `service` 里把 `request_id` 写进 `request.state`，这里读回来；
+    还没走到那一步的（比如鉴权就失败了）自然就没有这个头。
+    """
+    request_id = ""
+    try:
+        request_id = str((getattr(req, "state", None) or {}).get("request_id") or "")
+    except Exception:
+        request_id = ""
+    return {"X-Request-Id": request_id} if request_id else {}
 
 
 def guard(handler: Callable[..., Any]) -> Callable[..., Any]:
@@ -32,15 +46,17 @@ def guard(handler: Callable[..., Any]) -> Callable[..., Any]:
         try:
             return handler(req, **params)
         except ServiceError as exc:
-            headers = {}
+            headers = _error_headers(req)
             if getattr(exc, "retry_after", 0):
                 # 带上 Retry-After，客户端会自己等；不带的话它们会立刻重试把墙撞穿
                 headers["Retry-After"] = str(int(exc.retry_after))
             return error_response(exc.status, exc.message, exc.code, kind=exc.kind, headers=headers or None)
         except BadRequest as exc:
-            return error_response(exc.status, exc.message, exc.code, kind="invalid_request_error")
+            return error_response(exc.status, exc.message, exc.code, kind="invalid_request_error",
+                                  headers=_error_headers(req) or None)
         except UpstreamError as exc:
-            return error_response(503, str(exc), "upstream_unavailable", kind="api_error")
+            return error_response(503, str(exc), "upstream_unavailable", kind="api_error",
+                                  headers=_error_headers(req) or None)
         except (BrokenPipeError, ConnectionResetError):
             raise
         except Exception as exc:  # 仍然兜底，但要留下堆栈
@@ -63,18 +79,19 @@ def anthropic_guard(handler: Callable[..., Any]) -> Callable[..., Any]:
         try:
             return handler(req, **params)
         except ServiceError as exc:
-            return _anthropic_error(exc.status, exc.message, _anthropic_kind(exc), exc.retry_after)
+            return _anthropic_error(exc.status, exc.message, _anthropic_kind(exc), exc.retry_after,
+                                    req=req)
         except BadRequest as exc:
-            return _anthropic_error(exc.status, exc.message, "invalid_request_error")
+            return _anthropic_error(exc.status, exc.message, "invalid_request_error", req=req)
         except UpstreamError as exc:
-            return _anthropic_error(503, str(exc), "api_error")
+            return _anthropic_error(503, str(exc), "api_error", req=req)
         except (BrokenPipeError, ConnectionResetError):
             raise
         except Exception as exc:
             from .log import get_logger
 
             get_logger("routes").exception("handler %s failed", getattr(handler, "__name__", handler))
-            return _anthropic_error(500, f"internal error: {exc}", "api_error")
+            return _anthropic_error(500, f"internal error: {exc}", "api_error", req=req)
 
     return wrapper
 
@@ -88,8 +105,8 @@ def _anthropic_kind(exc: ServiceError) -> str:
     return mapping.get(exc.kind, "api_error")
 
 
-def _anthropic_error(status: int, message: str, kind: str, retry_after: float = 0.0) -> Response:
-    headers = {}
+def _anthropic_error(status: int, message: str, kind: str, retry_after: float = 0.0, req: Any = None) -> Response:
+    headers = _error_headers(req) if req is not None else {}
     if retry_after:
         headers["Retry-After"] = str(int(retry_after))
     return json_response(

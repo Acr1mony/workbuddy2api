@@ -138,7 +138,9 @@ def replay(
         sanitize = str(service.cfg.get("prompt.mode") or "") == "sanitize"
 
     prepared = _translate(service, body, realm, model, sanitize)
-    prepared["stream"] = False  # 回放只关心"上游答不答应"，不关心流式形状
+    # 上游只认流式（非流式会被 400 打回），所以这里保持 stream=true，
+    # 只在本地把帧聚合成完整回复——回放关心的是"上游答不答应"。
+    prepared["stream"] = True
     payload = json.dumps(prepared, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
     meta = identity.ChatMeta.for_request(body, "", session_hint="")
@@ -172,6 +174,10 @@ def replay(
             log.exception("回放记账失败（%s）", request_id)
         message = (aggregated.get("choices") or [{}])[0].get("message") or {}
         text = message.get("content") or ""
+        if not text and message.get("reasoning_content"):
+            # 预算小的回放常常"正文一个字都没有、token 全被思考吃掉"，
+            # 这时候空字符串会让人以为回放没成功，所以把原因写出来。
+            text = "（正文为空：%d 个 token 全花在思考上）" % len(message["reasoning_content"])
         return {
             "ok": True,
             "status": 200,
@@ -181,6 +187,8 @@ def replay(
             "account": account.uid,
             "attempts": attempts,
             "usage": usage,
+            "credit": usage.get("credit") or 0.0,
+            "elapsed_ms": int((time.time() - started) * 1000),
             "sample": str(text)[:2000],
         }
     finally:

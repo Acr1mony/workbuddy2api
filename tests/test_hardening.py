@@ -500,6 +500,20 @@ class ObservabilityTest(unittest.TestCase):
         return Request("POST", "/v1/chat/completions", {}, {}, json.dumps(body).encode(), ("1.2.3.4", 1))
 
     # -- 出口池 -------------------------------------------------------------
+    def test_error_response_carries_request_id(self):
+        from wb2api.routes_openai import guard
+        from wb2api.service import ServiceError
+
+        def boom(req):
+            req.state["request_id"] = "req_abc12345"
+            raise ServiceError("池里没有可用账号", 503, "no_account", "api_error", retry_after=42.0)
+
+        resp = guard(boom)(self.request())
+        headers = {k.lower(): v for k, v in resp.headers.items()}
+        # 客户端报障时只会给你它看到的那个 id：错误响应必须也带
+        self.assertEqual(headers.get("x-request-id"), "req_abc12345")
+        self.assertEqual(headers.get("retry-after"), "42")
+
     def test_proxy_from_pool_is_used_and_counted(self):
         from wb2api.config import Config as C
 

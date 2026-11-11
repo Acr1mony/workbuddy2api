@@ -115,7 +115,8 @@ class ReplayTest(ReplayBase):
         # 指纹三处都被最小改写（品牌保留是设计，见 test_preview_*）
         self.assertIn("helpful AI assistant", system)
         self.assertIn("whose URL is named in the runtime context.", system)
-        self.assertFalse(sent["stream"])
+        # 上游只吃流式：回放也必须 stream=true，只是想看聚合后的结果
+        self.assertTrue(sent["stream"])
         # 槽位必须还回去，否则几次回放就把池子锁死
         self.assertEqual(sum(a.in_flight for a in self.svc.store.list_accounts("cn")), 0)
 
